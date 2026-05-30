@@ -1217,6 +1217,21 @@ def cmd_download_direct(args):
 
 def cmd_migrate_structure(args):
     log.info("Migrating existing flat files to album structure...")
+    
+    music_dir = Path(CFG["music_dir"])
+    if music_dir.exists():
+        with db_connect() as db:
+            for f in music_dir.iterdir():
+                if f.is_dir() and not f.name.startswith("."):
+                    exists = db.execute("SELECT 1 FROM artists WHERE name COLLATE NOCASE = ?", (f.name,)).fetchone()
+                    if not exists:
+                        sid = f"local:{f.name}"
+                        db.execute(
+                            "INSERT INTO artists (spotify_id, name, source, active) VALUES (?, ?, 'local', 1)",
+                            (sid, f.name)
+                        )
+                        log.info("Auto-added local artist folder to DB: %s", f.name)
+
     if custom_dl:
         custom_dl.migrate_structure(Path(CFG["db_path"]), Path(CFG["music_dir"]))
         cmd_reconcile(args)

@@ -414,69 +414,57 @@ def download_track(download_url: str, output_path: Path, format_codec: str = "op
 
 def migrate_structure(db_path: Path, music_dir: Path):
     """
-    Scans the DB for songs that are either:
-      - listed as 'downloaded' with a flat file_path ({artist}/{title}.ext)
-      - physically present as flat files in the artist folder
-
-    Moves them to {artist}/{album}/{track:02d} - {title}.ext
-    and re-embeds metadata via enforce_primary_artist.
+    Scans the music directory for flat files (e.g. {artist}/{title}.ext),
+    reads their embedded tags, and moves them to {artist}/{album}/{title}.ext
     """
-    if not db_path.exists() or not music_dir.exists():
-        log.error("DB or music dir not found")
+    import mutagen
+    import shutil
+    
+    if not music_dir.exists():
+        log.error("Music dir not found")
         return
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-
-    songs = conn.execute(
-        """
-        SELECT s.spotify_id, s.title, s.track_number, s.status, s.file_path,
-               al.name AS album_name, ar.name AS artist_name
-        FROM songs s
-        JOIN albums al ON s.album_id = al.spotify_id
-        JOIN artists ar ON s.artist_id = ar.spotify_id
-        WHERE s.status IN ('downloaded', 'pending')
-        """
-    ).fetchall()
-
     migrated = 0
-    for s in songs:
-        artist_folder = music_dir / _clean_filename(s["artist_name"])
+    audio_exts = {".opus", ".mp3", ".m4a", ".flac", ".ogg", ".webm"}
 
-        # Try known flat paths for this track
-        candidates = [
-            artist_folder / f"{_clean_filename(s['title'])}.opus",
-            artist_folder / f"{_clean_filename(s['title'])}.mp3",
-            artist_folder / f"{_clean_filename(s['title'])}.m4a",
-        ]
-        if s["file_path"]:
-            fp = Path(s["file_path"])
-            if not fp.is_absolute():
-                fp = music_dir / fp
-            candidates.insert(0, fp)
-
-        src = next((p for p in candidates if p.exists()), None)
-        if not src:
+    for artist_folder in music_dir.iterdir():
+        if not artist_folder.is_dir():
             continue
 
-        # Build destination
-        album_folder = artist_folder / _clean_filename(s["album_name"])
-        album_folder.mkdir(parents=True, exist_ok=True)
-        dst = album_folder / f"{_clean_filename(s['title'])}{src.suffix}"
+        # Find audio files directly inside artist_folder (ignoring subdirectories which are albums)
+        for f in artist_folder.iterdir():
+            if not f.is_file() or f.suffix.lower() not in audio_exts:
+                continue
 
-        if src != dst:
-            shutil.move(str(src), str(dst))
-            log.info("Moved: %s → %s", src.relative_to(music_dir), dst.relative_to(music_dir))
-            migrated += 1
+            try:
+                # Fallbacks in case tags are missing
+                album = "Unknown Album"
+                title = f.stem
 
-        enforce_primary_artist(dst, s["artist_name"], s["title"], s["album_name"], s["track_number"])
+                # Read tags
+                try:
+                    audio = mutagen.File(f, easy=True)
+                    if audio:
+                        if audio.get("album"):
+                            album = audio.get("album")[0]
+                        if audio.get("title"):
+                            title = audio.get("title")[0]
+                except Exception as e:
+                    log.warning("Could not read tags for %s: %s", f.name, e)
 
-        rel = str(dst.relative_to(music_dir))
-        conn.execute(
-            "UPDATE songs SET file_path=?, status='downloaded' WHERE spotify_id=?",
-            (rel, s["spotify_id"]),
-        )
+                safe_album = _clean_filename(album)
+                safe_title = _clean_filename(title)
 
-    conn.commit()
-    conn.close()
-    log.info("migrate_structure: moved %d files into album folders.", migrated)
+                album_folder = artist_folder / safe_album
+                album_folder.mkdir(parents=True, exist_ok=True)
+                
+                dst = album_folder / f"{safe_title}{f.suffix}"
+
+                if f != dst:
+                    shutil.move(str(f), str(dst))
+                    log.info("Moved: %s → %s", f.name, dst.relative_to(music_dir))
+                    migrated += 1
+            except Exception as e:
+                log.error("Failed to move %s: %s", f.name, e)
+
+    log.info("migrate_structure: moved %d flat files into album folders.", migrated)
