@@ -1,5 +1,5 @@
 [Unit]
-Description=Run music-sync daily at 03:00
+Description=Run MusicaDet daily at 03:00
 
 [Timer]
 OnCalendar=*-*-* 03:00:00

@@ -1,11 +1,11 @@
 [Unit]
-Description=Audio Alchemist HUD - web dashboard for music-sync
+Description=MusicaDet HUD - web dashboard
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/music-sync
+WorkingDirectory=/opt/musicadet
 ExecStart=/usr/bin/python3 -m uvicorn hud:app --host 0.0.0.0 --port 8800
 Restart=on-failure
 RestartSec=5

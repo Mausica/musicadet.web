@@ -25,7 +25,7 @@ DEFAULTS = {
     "music_dir": "/mnt/storage_jellyfin/media/music",
     "sync_dir": str(BASE / "sync-data"),
     "db_path": str(BASE / "music.db"),
-    "log_dir": "/var/log/music-sync",
+    "log_dir": "/var/log/musicadet",
     "format": "mp3",
     "bitrate": "320k",
     "threads": 4,

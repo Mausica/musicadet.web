@@ -1,4 +1,4 @@
-# MusicaDet.web
+# MusicaDet
 
 Self-hosted Spotify → Jellyfin music sync with a web dashboard (HUD).
 
@@ -16,7 +16,8 @@ lyrics, and ID3 tags, and organizes files for Jellyfin:
 bash <(curl -fsSL https://raw.githubusercontent.com/Mausica/musicadet.web/main/install.sh)
 ```
 
-This clones or updates the repo, installs dependencies, and registers the global `music-sync` CLI.
+This clones or updates the repo (overwriting any local changes in `/opt/musicadet`),
+installs dependencies, and registers the global `musicadet` CLI.
 
 ## HUD web dashboard
 
@@ -33,22 +34,22 @@ After install: **http://SERVER_IP:8800**
 Works from anywhere after install:
 
 ```bash
-music-sync                              # full sync (playlists → scan albums → download)
-music-sync scan                         # discover artists from playlists
-music-sync scan-artists                 # scan artist albums into DB
-music-sync scan-artists --new-only
-music-sync artists-sync                 # download all active artists
-music-sync artists-sync --new-only
-music-sync reconcile                    # match files ↔ database
-music-sync fix-metadata                 # re-embed tags/cover/lyrics
-music-sync fix-metadata --artist "Name"
-music-sync list-albums
-music-sync add "Artist Name"
-music-sync add "https://open.spotify.com/artist/..."
-music-sync list
+musicadet                              # full sync (playlists → scan albums → download)
+musicadet scan                         # discover artists from playlists
+musicadet scan-artists                 # scan artist albums into DB
+musicadet scan-artists --new-only
+musicadet artists-sync                 # download all active artists
+musicadet artists-sync --new-only
+musicadet reconcile                    # match files ↔ database
+musicadet fix-metadata                 # re-embed tags/cover/lyrics
+musicadet fix-metadata --artist "Name"
+musicadet list-albums
+musicadet add "Artist Name"
+musicadet add "https://open.spotify.com/artist/..."
+musicadet list
 ```
 
-## Config (`config.json`)
+## Config (`/opt/musicadet/config.json`)
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -63,15 +64,17 @@ music-sync list
 ## Systemd
 
 ```bash
-systemctl status music-sync.timer       # daily auto sync
-systemctl start music-sync.service      # run sync now
-systemctl status music-sync-hud.service
-journalctl -u music-sync-hud.service -f
+systemctl status musicadet.timer       # daily auto sync
+systemctl start musicadet.service      # run sync now
+systemctl status musicadet-hud.service
+journalctl -u musicadet-hud.service -f
 ```
 
-## Migrating from old `spotify/` subfolder
+## Migrating from older installs
 
-If you previously used `/mnt/storage_jellyfin/media/music/spotify/`, either:
+If you previously used `/opt/music-sync` or `/mnt/storage_jellyfin/media/music/spotify/`:
 
-1. Change `music_dir` in Settings back to the old path, or
-2. Move files to the new root and run `music-sync reconcile`
+- `/opt/music-sync` is kept as a symlink to `/opt/musicadet` for compatibility
+- Old `music-sync` CLI is removed; use `musicadet` instead
+- Old systemd units (`music-sync.*`) are replaced by `musicadet.*`
+- Either keep your old `music_dir` in Settings, or move files and run `musicadet reconcile`

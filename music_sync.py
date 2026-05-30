@@ -8,14 +8,14 @@ music_sync.py — Automated music library manager for Jellyfin
 - Tracks per-album / per-song download status
 ─────────────────────────────────────────────────────────────
 Usage:
-  music-sync                              # Full sync (default)
-  music-sync scan                         # Scan playlists only
-  music-sync scan-artists                 # Scan artist albums into DB
-  music-sync artists-sync                 # Download/sync discographies
-  music-sync reconcile                    # Match files ↔ DB
-  music-sync fix-metadata [--artist NAME] # Re-embed tags/cover/lyrics
-  music-sync list-albums [artist]
-  music-sync add "Artist Name"
+  musicadet                              # Full sync (default)
+  musicadet scan                         # Scan playlists only
+  musicadet scan-artists                 # Scan artist albums into DB
+  musicadet artists-sync                 # Download/sync discographies
+  musicadet reconcile                    # Match files ↔ DB
+  musicadet fix-metadata [--artist NAME] # Re-embed tags/cover/lyrics
+  musicadet list-albums [artist]
+  musicadet add "Artist Name"
 """
 
 import hashlib
@@ -38,14 +38,23 @@ from typing import Optional
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-BASE = Path("/opt/music-sync") if Path("/opt/music-sync").exists() else _SCRIPT_DIR
+
+
+def _detect_base() -> Path:
+    for candidate in (Path("/opt/musicadet"), Path("/opt/music-sync"), _SCRIPT_DIR):
+        if candidate.exists() and (candidate / "config.json").exists():
+            return candidate
+    return _SCRIPT_DIR
+
+
+BASE = _detect_base()
 CFG_FILE = BASE / "config.json"
 
 DEFAULTS: dict = {
     "music_dir": "/mnt/storage_jellyfin/media/music",
     "sync_dir": str(BASE / "sync-data"),
     "db_path": str(BASE / "music.db"),
-    "log_dir": "/var/log/music-sync",
+    "log_dir": "/var/log/musicadet",
     "format": "mp3",
     "bitrate": "320k",
     "threads": 4,
@@ -95,7 +104,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-log = logging.getLogger("music-sync")
+log = logging.getLogger("musicadet")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -938,7 +947,7 @@ def cmd_full_sync(args):
     log.info("\n━" * 60)
     log.info("  SYNC COMPLETE — %d albums, %d songs downloaded, %d pending", albums, dl, pending)
     if no_cover:
-        log.info("  %d songs missing cover — run: music-sync fix-metadata", no_cover)
+        log.info("  %d songs missing cover — run: musicadet fix-metadata", no_cover)
     log.info("━" * 60)
 
 
@@ -953,20 +962,20 @@ def main():
     db_init()
 
     p = argparse.ArgumentParser(
-        prog="music-sync",
+        prog="musicadet",
         description="Automated Spotify→Jellyfin music library manager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  music-sync                              Full sync (scan + catalog + download)
-  music-sync scan                         Discover artists from playlists
-  music-sync scan-artists                 Scan albums/songs into DB
-  music-sync artists-sync                 Download all artist discographies
-  music-sync artists-sync --new-only
-  music-sync reconcile                    Match files to DB
-  music-sync fix-metadata --artist NAME   Re-embed tags/cover/lyrics
-  music-sync list-albums
-  music-sync add "THE MOTANS"
+  musicadet                              Full sync (scan + catalog + download)
+  musicadet scan                         Discover artists from playlists
+  musicadet scan-artists                 Scan albums/songs into DB
+  musicadet artists-sync                 Download all artist discographies
+  musicadet artists-sync --new-only
+  musicadet reconcile                    Match files to DB
+  musicadet fix-metadata --artist NAME   Re-embed tags/cover/lyrics
+  musicadet list-albums
+  musicadet add "THE MOTANS"
         """,
     )
 

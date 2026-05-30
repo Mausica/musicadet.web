@@ -1,8 +1,8 @@
 {
   "music_dir": "/mnt/storage_jellyfin/media/music",
-  "sync_dir": "/opt/music-sync/sync-data",
-  "db_path": "/opt/music-sync/music.db",
-  "log_dir": "/var/log/music-sync",
+  "sync_dir": "/opt/musicadet/sync-data",
+  "db_path": "/opt/musicadet/music.db",
+  "log_dir": "/var/log/musicadet",
   "format": "mp3",
   "bitrate": "320k",
   "threads": 4,

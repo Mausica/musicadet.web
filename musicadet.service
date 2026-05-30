@@ -1,12 +1,12 @@
 [Unit]
-Description=Music Sync - Spotify playlists + artist discographies via spotDL
+Description=MusicaDet - Spotify playlists and artist discographies via spotDL
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/opt/music-sync
-ExecStart=/usr/bin/python3 /opt/music-sync/music_sync.py
+WorkingDirectory=/opt/musicadet
+ExecStart=/usr/bin/python3 /opt/musicadet/music_sync.py
 User=root
 Nice=10
 IOSchedulingClass=best-effort

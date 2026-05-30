@@ -6,8 +6,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/Mausica/musicadet.web.git"
-REPO_DIR="/opt/musicadet"
-APP_DIR="/opt/music-sync"
+INSTALL_DIR="/opt/musicadet"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run as root (sudo -i)." >&2
@@ -18,26 +17,23 @@ echo "==> Installing prerequisites (git, curl)..."
 apt-get update -qq
 apt-get install -y -qq git curl ca-certificates >/dev/null
 
-if [[ -d "$REPO_DIR/.git" ]]; then
-  echo "==> Updating repo (git pull)..."
-  git -C "$REPO_DIR" pull --ff-only
+if [[ -d "$INSTALL_DIR/.git" ]]; then
+  echo "==> Updating repo..."
+  git -C "$INSTALL_DIR" fetch origin main
+  git -C "$INSTALL_DIR" reset --hard origin/main
+  git -C "$INSTALL_DIR" clean -fd
 else
-  echo "==> Cloning $REPO_URL into $REPO_DIR..."
-  git clone --depth 1 "$REPO_URL" "$REPO_DIR"
+  echo "==> Cloning into $INSTALL_DIR..."
+  git clone --depth 1 --branch main "$REPO_URL" "$INSTALL_DIR"
 fi
 
-echo "==> Linking $APP_DIR -> $REPO_DIR"
-rm -f "$APP_DIR" 2>/dev/null || true
-if [[ -d "$APP_DIR" && ! -L "$APP_DIR" ]]; then
-  echo "    Moving existing $APP_DIR to ${APP_DIR}.bak-$(date +%s)"
-  mv "$APP_DIR" "${APP_DIR}.bak-$(date +%s)"
-fi
-ln -sfn "$REPO_DIR" "$APP_DIR"
+# Backward-compatible symlink for older configs that reference /opt/music-sync
+ln -sfn "$INSTALL_DIR" /opt/music-sync
 
-echo "==> Running setup.sh..."
-cd "$APP_DIR"
+echo "==> Running setup..."
+cd "$INSTALL_DIR"
 chmod +x setup.sh
 bash setup.sh
 
 echo ""
-echo "Done. Use 'music-sync' from anywhere, or open the HUD (see setup output above)."
+echo "Done. Run 'musicadet' from anywhere, or open the HUD (see setup output above)."
