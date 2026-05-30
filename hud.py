@@ -30,7 +30,7 @@ DEFAULTS = {
     "format": "opus",
     "bitrate": "320k",
     "threads": 4,
-    "output_template": "{artist}/{title}.{output-ext}",
+    "output_template": "{artist}/{album}/{title}.{output-ext}",
     "playlist_save_timeout": 600,
     "playlist_save_retries": 3,
     "artist_save_timeout": 900,

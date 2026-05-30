@@ -1218,25 +1218,74 @@ def cmd_download_direct(args):
 def cmd_migrate_structure(args):
     log.info("Migrating existing flat files to album structure...")
     
-    music_dir = Path(CFG["music_dir"])
-    if music_dir.exists():
-        with db_connect() as db:
-            for f in music_dir.iterdir():
-                if f.is_dir() and not f.name.startswith("."):
-                    exists = db.execute("SELECT 1 FROM artists WHERE name COLLATE NOCASE = ?", (f.name,)).fetchone()
-                    if not exists:
-                        sid = f"local:{f.name}"
-                        db.execute(
-                            "INSERT INTO artists (spotify_id, name, source, active) VALUES (?, ?, 'local', 1)",
-                            (sid, f.name)
-                        )
-                        log.info("Auto-added local artist folder to DB: %s", f.name)
-
     if custom_dl:
         custom_dl.migrate_structure(Path(CFG["db_path"]), Path(CFG["music_dir"]))
-        cmd_reconcile(args)
     else:
         log.error("custom_dl module not available.")
+        return
+
+    log.info("Scanning all local folders and registering them into the database...")
+    music_dir = Path(CFG["music_dir"])
+    if music_dir.exists():
+        import mutagen
+        audio_exts = {".opus", ".mp3", ".m4a", ".flac", ".ogg", ".webm"}
+        with db_connect() as db:
+            for artist_dir in music_dir.iterdir():
+                if not artist_dir.is_dir() or artist_dir.name.startswith("."): continue
+                
+                # Register artist
+                ar_row = db.execute("SELECT spotify_id FROM artists WHERE name COLLATE NOCASE = ?", (artist_dir.name,)).fetchone()
+                if ar_row:
+                    artist_id = ar_row["spotify_id"]
+                else:
+                    artist_id = f"local:ar:{artist_dir.name}"
+                    db.execute("INSERT INTO artists (spotify_id, name, source, active) VALUES (?, ?, 'local', 1)", (artist_id, artist_dir.name))
+                    log.info("Auto-added local artist: %s", artist_dir.name)
+
+                # Iterate albums
+                for album_dir in artist_dir.iterdir():
+                    if not album_dir.is_dir(): continue
+                    
+                    # Register album
+                    al_row = db.execute("SELECT spotify_id FROM albums WHERE artist_id=? AND name COLLATE NOCASE = ?", (artist_id, album_dir.name)).fetchone()
+                    if al_row:
+                        album_id = al_row["spotify_id"]
+                    else:
+                        album_id = f"local:al:{artist_id}:{album_dir.name}"
+                        db.execute("INSERT INTO albums (spotify_id, artist_id, name) VALUES (?, ?, ?)", (album_id, artist_id, album_dir.name))
+
+                    # Iterate songs
+                    for song_file in album_dir.iterdir():
+                        if not song_file.is_file() or song_file.suffix.lower() not in audio_exts: continue
+                        
+                        # Use strictly relative paths using forward slashes for the DB
+                        rel_path = song_file.relative_to(music_dir).as_posix()
+                        
+                        s_row = db.execute("SELECT spotify_id FROM songs WHERE file_path=?", (rel_path,)).fetchone()
+                        if not s_row:
+                            title = song_file.stem
+                            try:
+                                audio = mutagen.File(song_file, easy=True)
+                                if audio and audio.get("title"):
+                                    title = audio.get("title")[0]
+                            except Exception:
+                                pass
+                            
+                            song_id = f"local:tr:{album_id}:{song_file.name}"
+                            db.execute(
+                                "INSERT OR IGNORE INTO songs (spotify_id, album_id, artist_id, title, status, file_path) VALUES (?, ?, ?, ?, 'downloaded', ?)",
+                                (song_id, album_id, artist_id, title, rel_path)
+                            )
+
+            # Update album counts
+            db.execute("""
+                UPDATE albums SET 
+                track_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id),
+                downloaded_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id AND status='downloaded')
+            """)
+            db.commit()
+
+    cmd_reconcile(args)
 
 
 def cmd_reconcile(args):
