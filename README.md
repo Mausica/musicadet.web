@@ -1,55 +1,77 @@
 # MusicaDet.web
 
-Self-hosted Spotify → Jellyfin music sync cu dashboard web (HUD) live.
+Self-hosted Spotify → Jellyfin music sync with a web dashboard (HUD).
 
-Descarcă discografii de artiști și playlist-uri Spotify cu **spotDL**, le ține
-ordonate pentru Jellyfin, evită descărcările duplicate (DB SQLite) și oferă un
-**HUD web** cu loguri live, statistici și editare bază de date artiști/playlist-uri.
+Discovers artists from Spotify playlists, scans their full album catalogs into SQLite,
+downloads discographies with **spotDL** as **MP3 320 kbps** with embedded cover art,
+lyrics, and ID3 tags, and organizes files for Jellyfin:
 
-## Instalare (one-liner, ca root)
+```
+/mnt/storage_jellyfin/media/music/ARTIST/ALBUM/track.mp3
+```
+
+## Install / update (one-liner, as root)
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Mausica/musicadet.web/main/install.sh)
 ```
 
-Ce face:
-1. clonează `Mausica/musicadet.web` în `/opt/musicadet`
-2. linkează `/opt/music-sync` -> `/opt/musicadet`
-3. instalează deps (ffmpeg, spotDL, FastAPI, Uvicorn)
-4. pornește timer-ul de sync + serviciul HUD
+This clones or updates the repo, installs dependencies, and registers the global `music-sync` CLI.
 
-## HUD web
+## HUD web dashboard
 
-După instalare: **http://IP_SERVER:8800**
+After install: **http://SERVER_IP:8800**
 
-- loguri live (WebSocket) din `music_sync.py` și spotDL
-- statistici (artiști, playlist-uri, melodii)
-- editare artiști & playlist-uri (persistă în DB + `config.json`)
-- declanșare manuală: scan / artists-sync / full sync
+- Dark minimal UI with live console (WebSocket)
+- Dashboard stats: artists, albums, songs, metadata gaps
+- **Library** tab: album download progress, per-song cover/lyrics status
+- **Settings** tab: music folder, format, bitrate, lyrics providers, timeouts
+- Manage artists & playlists; trigger scan / sync / reconcile / fix-metadata
 
-## Update
+## Global CLI
+
+Works from anywhere after install:
 
 ```bash
-bash /opt/music-sync/update.sh
+music-sync                              # full sync (playlists → scan albums → download)
+music-sync scan                         # discover artists from playlists
+music-sync scan-artists                 # scan artist albums into DB
+music-sync scan-artists --new-only
+music-sync artists-sync                 # download all active artists
+music-sync artists-sync --new-only
+music-sync reconcile                    # match files ↔ database
+music-sync fix-metadata                 # re-embed tags/cover/lyrics
+music-sync fix-metadata --artist "Name"
+music-sync list-albums
+music-sync add "Artist Name"
+music-sync add "https://open.spotify.com/artist/..."
+music-sync list
 ```
 
-## Comenzi utile
+## Config (`config.json`)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `music_dir` | `/mnt/storage_jellyfin/media/music` | Download root (editable in HUD Settings) |
+| `format` | `mp3` | Audio format |
+| `bitrate` | `320k` | MP3 bitrate |
+| `output_template` | `{artist}/{album}/{track-number} - {title}.{output-ext}` | Folder layout |
+| `lyrics_providers` | genius, musixmatch, azlyrics | Lyrics fallback chain |
+| `playlist_save_timeout` | `600` | Seconds for large playlist metadata fetch |
+| `hud_port` | `8800` | Web dashboard port |
+
+## Systemd
 
 ```bash
-python3 /opt/music-sync/music_sync.py add "THE MOTANS"
-python3 /opt/music-sync/music_sync.py scan
-python3 /opt/music-sync/music_sync.py artists-sync
-python3 /opt/music-sync/music_sync.py            # full sync
-python3 /opt/music-sync/music_sync.py list
-
-systemctl status music-sync.timer
+systemctl status music-sync.timer       # daily auto sync
+systemctl start music-sync.service      # run sync now
 systemctl status music-sync-hud.service
 journalctl -u music-sync-hud.service -f
 ```
 
-## Config
+## Migrating from old `spotify/` subfolder
 
-`config.json`:
-- `music_dir` — unde se salvează muzica (montată în Jellyfin)
-- `hud_port` — portul HUD (default 8800)
-- `playlists` — lista de playlist-uri urmărite
+If you previously used `/mnt/storage_jellyfin/media/music/spotify/`, either:
+
+1. Change `music_dir` in Settings back to the old path, or
+2. Move files to the new root and run `music-sync reconcile`

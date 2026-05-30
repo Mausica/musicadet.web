@@ -1,17 +1,22 @@
 {
-  "music_dir": "/mnt/storage_jellyfin/media/music/spotify",
+  "music_dir": "/mnt/storage_jellyfin/media/music",
   "sync_dir": "/opt/music-sync/sync-data",
-  "db_path":  "/opt/music-sync/music.db",
-  "log_dir":  "/var/log/music-sync",
-  "format":   "opus",
-  "bitrate":  "auto",
-  "threads":  4,
-  "output_template": "{album-artist}/{album}/{track-number} - {title}.{output-ext}",
+  "db_path": "/opt/music-sync/music.db",
+  "log_dir": "/var/log/music-sync",
+  "format": "mp3",
+  "bitrate": "320k",
+  "threads": 4,
+  "output_template": "{artist}/{album}/{track-number} - {title}.{output-ext}",
+  "playlist_save_timeout": 600,
+  "playlist_save_retries": 3,
+  "artist_save_timeout": 900,
+  "lyrics_providers": ["genius", "musixmatch", "azlyrics"],
+  "generate_lrc": false,
   "hud_port": 8800,
   "playlists": [
-    { "name": "Today's Top Hits",     "url": "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M" },
-    { "name": "Top 50 Romania",       "url": "https://open.spotify.com/playlist/37i9dQZEVXbNZbJ6TZelCq" },
-    { "name": "Top 50 Global",        "url": "https://open.spotify.com/playlist/37i9dQZEVXbMDoHDwVN2tF" },
-    { "name": "Top melodii Romania",  "url": "https://open.spotify.com/playlist/37i9dQZEVXbMeCoUmQDLUW" }
+    { "name": "Today's Top Hits", "url": "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M" },
+    { "name": "Top 50 Romania", "url": "https://open.spotify.com/playlist/37i9dQZEVXbNZbJ6TZelCq" },
+    { "name": "Top 50 Global", "url": "https://open.spotify.com/playlist/37i9dQZEVXbMDoHDwVN2tF" },
+    { "name": "Top melodii Romania", "url": "https://open.spotify.com/playlist/37i9dQZEVXbMeCoUmQDLUW" }
   ]
 }
