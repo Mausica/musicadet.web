@@ -12,8 +12,14 @@ apt-get install -y ffmpeg python3 python3-pip curl ca-certificates
 echo "==> Installing / upgrading spotDL..."
 pip3 install --upgrade --ignore-installed spotdl --break-system-packages
 
-echo "==> Installing Python deps (FastAPI, Uvicorn, mutagen)..."
-pip3 install --upgrade fastapi "uvicorn[standard]" mutagen --break-system-packages
+echo "==> Installing Python deps (FastAPI, Pydantic, Uvicorn, mutagen)..."
+# Pin compatible FastAPI + Pydantic v2 (spotDL can leave broken mixed versions)
+pip3 install --upgrade --ignore-installed \
+  -r "$INSTALL_DIR/requirements.txt" \
+  --break-system-packages
+
+echo "==> Verifying HUD imports..."
+python3 -c "from fastapi import FastAPI; import pydantic; print('fastapi OK, pydantic', pydantic.__version__)"
 
 echo "==> Reading config..."
 # Migrate legacy paths in config.json if present
@@ -32,13 +38,13 @@ mkdir -p "$INSTALL_DIR" "$SYNC_DIR" "$MUSIC_DIR" "$LOG_DIR"
 chmod 755 "$INSTALL_DIR"
 
 echo "==> Checking required files..."
-for f in music_sync.py config.json musicadet.service musicadet.timer hud.py musicadet-hud.service; do
+for f in music_sync.py config.json musicadet.service musicadet.timer hud.py musicadet-hud.service run-hud.sh requirements.txt; do
   if [[ ! -f "$INSTALL_DIR/$f" ]]; then
     echo "ERROR: missing $INSTALL_DIR/$f" >&2
     exit 1
   fi
 done
-chmod +x "$INSTALL_DIR/music_sync.py" || true
+chmod +x "$INSTALL_DIR/music_sync.py" "$INSTALL_DIR/run-hud.sh" || true
 
 echo "==> Installing global CLI: musicadet"
 cat > /usr/local/bin/musicadet <<'WRAPPER'
@@ -57,6 +63,13 @@ for old in music-sync.timer music-sync-hud.service music-sync.service; do
   rm -f "/etc/systemd/system/$old"
 done
 
+# Stop anything still bound to the HUD port
+HUD_PORT="$(grep -oP '"hud_port"\s*:\s*\K[0-9]+' "$INSTALL_DIR/config.json" 2>/dev/null || echo 8800)"
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k "${HUD_PORT}/tcp" 2>/dev/null || true
+  sleep 1
+fi
+
 echo "==> Installing systemd units..."
 install -m 644 "$INSTALL_DIR/musicadet.service"     /etc/systemd/system/musicadet.service
 install -m 644 "$INSTALL_DIR/musicadet.timer"       /etc/systemd/system/musicadet.timer
@@ -65,8 +78,15 @@ systemctl daemon-reload
 systemctl enable --now musicadet.timer
 systemctl enable musicadet-hud.service
 systemctl restart musicadet-hud.service
+sleep 2
 
-HUD_PORT="$(grep -oP '"hud_port"\s*:\s*\K[0-9]+' "$INSTALL_DIR/config.json" 2>/dev/null || echo 8800)"
+if curl -sf "http://127.0.0.1:${HUD_PORT}/" >/dev/null 2>&1; then
+  echo "==> HUD health check: OK (port $HUD_PORT)"
+else
+  echo "==> HUD health check: FAILED — recent logs:"
+  journalctl -u musicadet-hud.service -n 25 --no-pager || true
+fi
+
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 [[ -z "$SERVER_IP" ]] && SERVER_IP="<server-ip>"
 

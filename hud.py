@@ -174,7 +174,14 @@ app = FastAPI(title="MusicaDet HUD")
 
 @app.on_event("startup")
 async def _startup() -> None:
-    ensure_db()
+    try:
+        Path(load_cfg()["db_path"]).parent.mkdir(parents=True, exist_ok=True)
+        ensure_db()
+    except Exception as exc:
+        import logging
+        logging.basicConfig(level=logging.ERROR)
+        logging.error("HUD startup failed (database init): %s", exc)
+        raise
 
 
 class ArtistIn(BaseModel):

@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/musicadet
-ExecStart=/usr/bin/python3 -m uvicorn hud:app --host 0.0.0.0 --port 8800
+ExecStart=/opt/musicadet/run-hud.sh
 Restart=on-failure
 RestartSec=5
 User=root
