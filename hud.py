@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -261,7 +262,13 @@ def api_stats():
     }
 
 
+_track_count_cache = {"n": 0, "ts": 0}
+
+
 def count_tracks() -> int:
+    now = time.time()
+    if now - _track_count_cache["ts"] < 60:
+        return _track_count_cache["n"]
     music_dir = Path(load_cfg()["music_dir"])
     if not music_dir.exists():
         return 0
@@ -270,12 +277,13 @@ def count_tracks() -> int:
         for f in files:
             if Path(f).suffix.lower() in AUDIO_EXTS:
                 n += 1
+    _track_count_cache["n"] = n
+    _track_count_cache["ts"] = now
     return n
 
 
 @app.get("/api/artists")
 def api_artists(q: str = "", status: str = "all"):
-    ensure_db()
     sql = """
         SELECT a.spotify_id, a.name, a.source, a.active, a.sync_done, a.last_synced, a.added_at,
                a.albums_scanned_at,
@@ -306,7 +314,6 @@ def api_artists(q: str = "", status: str = "all"):
 
 @app.get("/api/albums")
 def api_albums(artist_id: str = "", status: str = "all", limit: int = 500):
-    ensure_db()
     sql = """
         SELECT al.spotify_id, al.artist_id, al.name, al.release_year,
                al.track_count, al.downloaded_count, al.last_scanned, ar.name AS artist_name
@@ -330,7 +337,6 @@ def api_albums(artist_id: str = "", status: str = "all", limit: int = 500):
 
 @app.get("/api/songs")
 def api_songs(album_id: str = "", artist_id: str = "", status: str = "all", limit: int = 500):
-    ensure_db()
     sql = """
         SELECT s.spotify_id, s.album_id, s.artist_id, s.title, s.track_number,
                s.status, s.file_path, s.has_cover, s.has_lyrics, s.has_core_tags,
@@ -386,7 +392,6 @@ def api_delete_artist(spotify_id: str):
 
 @app.get("/api/playlists")
 def api_playlists():
-    ensure_db()
     with db() as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT spotify_id, name, url, active, last_synced FROM playlists ORDER BY name COLLATE NOCASE"
@@ -525,67 +530,354 @@ HTML = r"""<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
-  :root{
-    --bg:#000;--bg2:#09090b;--card:rgba(255,255,255,.03);--line:rgba(255,255,255,.08);
-    --txt:#fafafa;--muted:#a1a1aa;--accent:#fff;--ok:#4ade80;--warn:#facc15;--bad:#f87171;
+  :root {
+    --bg: #0a0a0f;
+    --bg-card: rgba(255, 255, 255, 0.03);
+    --border-card: rgba(255, 255, 255, 0.06);
+    --primary: #8b5cf6;
+    --primary-grad: linear-gradient(135deg, #8b5cf6, #6366f1);
+    --accent: #a78bfa;
+    --success: #34d399;
+    --warning: #fbbf24;
+    --error: #f87171;
+    --txt: #f1f5f9;
+    --muted: #94a3b8;
   }
-  *{box-sizing:border-box}
-  body{margin:0;font:14px/1.5 Inter,system-ui,sans-serif;color:var(--txt);
-    background:radial-gradient(900px 500px at 50% -20%,rgba(255,255,255,.04),transparent 60%),var(--bg);min-height:100vh}
-  header{position:sticky;top:0;z-index:20;backdrop-filter:blur(12px);background:rgba(0,0,0,.75);
-    border-bottom:1px solid var(--line);padding:12px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-  .logo{font-weight:600;font-size:17px;color:var(--txt);letter-spacing:-.02em}
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--ok)}
-  .dot.busy{background:var(--warn);animation:pulse 1s infinite}
-  @keyframes pulse{50%{opacity:.4}}
-  .status{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}
-  nav{display:flex;gap:4px;margin-left:auto;flex-wrap:wrap}
-  nav button{background:transparent;border:1px solid transparent;color:var(--muted);padding:7px 12px;border-radius:8px;cursor:pointer;font:500 13px Inter,sans-serif}
-  nav button.active{color:var(--txt);background:rgba(255,255,255,.06);border-color:var(--line)}
-  nav button:hover{color:var(--txt)}
-  main{max-width:1200px;margin:0 auto;padding:20px}
-  .grid{display:grid;gap:12px}
-  .stats{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
-  .stat .n{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--txt)}
-  .stat .l{color:var(--muted);font-size:11px;margin-top:2px;text-transform:uppercase;letter-spacing:.04em}
-  .btn{border:1px solid var(--line);border-radius:8px;padding:8px 14px;font:600 13px Inter,sans-serif;cursor:pointer;color:#000;background:var(--accent)}
-  .btn:hover{background:#e4e4e7}
-  .btn.ghost{background:transparent;color:var(--txt);box-shadow:none}
-  .btn.ghost:hover{background:rgba(255,255,255,.06)}
-  .btn.sm{padding:5px 10px;font-size:12px;border-radius:6px}
-  .btn.danger{background:transparent;color:var(--bad);border-color:rgba(248,113,113,.3)}
-  .btn.danger:hover{background:rgba(248,113,113,.1)}
-  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-  input,select,textarea{background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--txt);padding:8px 10px;border-radius:8px;font:13px Inter,sans-serif;outline:none}
-  input:focus,select:focus,textarea:focus{border-color:rgba(255,255,255,.2)}
-  input{flex:1;min-width:140px}
-  label{font-size:12px;color:var(--muted);display:block;margin-bottom:4px}
-  .field{margin-bottom:12px}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
-  th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:500}
-  tr:hover td{background:rgba(255,255,255,.02)}
-  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:10px;font-weight:600}
-  .pill.on{background:rgba(74,222,128,.12);color:var(--ok)}
-  .pill.off{background:rgba(248,113,113,.12);color:var(--bad)}
-  .pill.done{background:rgba(255,255,255,.08);color:var(--txt)}
-  .pill.pend{background:rgba(250,204,21,.12);color:var(--warn)}
-  .meta-ok{color:var(--ok)}.meta-no{color:var(--muted)}
-  h2{margin:0 0 12px;font-size:16px;font-weight:600}
-  .muted{color:var(--muted)}
-  .console{background:#0a0a0a;border:1px solid var(--line);border-radius:10px;height:62vh;overflow:auto;padding:12px 14px;
-    font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
-  .hide{display:none}
-  .hint{color:var(--muted);font-size:11px;margin-top:6px}
-  .actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
-  .toast{position:fixed;bottom:16px;right:16px;background:var(--txt);color:#000;padding:10px 16px;border-radius:8px;font-weight:600;font-size:13px;z-index:50;opacity:0;transform:translateY(8px);transition:.2s}
-  .toast.show{opacity:1;transform:none}
-  .progress{font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted)}
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.6 'Inter', system-ui, -apple-system, sans-serif;
+    color: var(--txt);
+    background: radial-gradient(1000px 600px at 50% -10%, rgba(139, 92, 246, 0.15), transparent 70%), var(--bg);
+    min-height: 100vh;
+  }
+  header {
+    position: relative;
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    backdrop-filter: blur(20px);
+    background: rgba(10, 10, 15, 0.75);
+    border-bottom: 1px solid var(--border-card);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .header-gradient {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, #8b5cf6, #6366f1, #34d399);
+  }
+  .logo {
+    font-weight: 700;
+    font-size: 19px;
+    letter-spacing: -.02em;
+    background: linear-gradient(135deg, #a78bfa, #8b5cf6, #6366f1);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 8px var(--success);
+  }
+  .dot.busy {
+    background: var(--warning);
+    box-shadow: 0 0 8px var(--warning);
+    animation: pulse 1s infinite alternate;
+  }
+  @keyframes pulse {
+    0% { opacity: 0.3; transform: scale(0.9); }
+    100% { opacity: 1; transform: scale(1.1); }
+  }
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 12px;
+    background: rgba(255, 255, 255, 0.04);
+    padding: 4px 10px;
+    border-radius: 99px;
+    border: 1px solid var(--border-card);
+  }
+  nav {
+    display: flex;
+    gap: 6px;
+    margin-left: auto;
+    flex-wrap: wrap;
+  }
+  nav button {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--muted);
+    padding: 8px 14px;
+    border-radius: 10px;
+    cursor: pointer;
+    font: 500 13px 'Inter', sans-serif;
+    transition: all 0.2s ease;
+  }
+  nav button.active {
+    color: var(--txt);
+    background: rgba(255, 255, 255, 0.06);
+    border-color: var(--border-card);
+  }
+  nav button:hover {
+    color: var(--txt);
+    background: rgba(255, 255, 255, 0.03);
+  }
+  main {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px;
+  }
+  .grid {
+    display: grid;
+    gap: 16px;
+  }
+  .stats {
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: 14px;
+    padding: 20px;
+    transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  .card:hover {
+    border-color: rgba(139, 92, 246, 0.2);
+  }
+  .stat {
+    border-left: 3px solid var(--primary);
+  }
+  .stat:nth-child(2) { border-left-color: #6366f1; }
+  .stat:nth-child(3) { border-left-color: var(--accent); }
+  .stat:nth-child(4) { border-left-color: var(--success); }
+  .stat:nth-child(5) { border-left-color: var(--warning); }
+  .stat:nth-child(6) { border-left-color: var(--error); }
+  .stat:nth-child(7) { border-left-color: #f472b6; }
+  .stat:nth-child(8) { border-left-color: #60a5fa; }
+  .stat:nth-child(9) { border-left-color: #34d399; }
+  .stat:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 20px rgba(139, 92, 246, 0.08);
+  }
+  .stat .n {
+    font-size: 28px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--txt);
+  }
+  .stat .l {
+    color: var(--muted);
+    font-size: 11px;
+    margin-top: 4px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+  }
+  .btn {
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 10px 18px;
+    font: 600 13px 'Inter', sans-serif;
+    cursor: pointer;
+    color: #fff;
+    background: var(--primary-grad);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.2s ease;
+  }
+  .btn:hover {
+    transform: scale(1.02);
+    box-shadow: 0 4px 12px rgba(139, 92, 246, 0.25);
+  }
+  .btn.ghost {
+    background: transparent;
+    color: var(--txt);
+    border: 1px solid var(--border-card);
+  }
+  .btn.ghost:hover {
+    border-color: var(--primary);
+    background: rgba(139, 92, 246, 0.08);
+  }
+  .btn.sm {
+    padding: 6px 12px;
+    font-size: 12px;
+    border-radius: 8px;
+  }
+  .btn.danger {
+    background: transparent;
+    color: var(--error);
+    border: 1px solid rgba(248, 113, 113, 0.4);
+  }
+  .btn.danger:hover {
+    background: rgba(248, 113, 113, 0.15);
+    border-color: var(--error);
+    box-shadow: 0 4px 12px rgba(248, 113, 113, 0.2);
+  }
+  .row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  input, select, textarea {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-card);
+    color: var(--txt);
+    padding: 10px 14px;
+    border-radius: 10px;
+    font: 13px 'Inter', sans-serif;
+    outline: none;
+    transition: all 0.2s ease;
+  }
+  input:focus, select:focus, textarea:focus {
+    border-color: var(--primary);
+    background: rgba(255, 255, 255, 0.06);
+    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15);
+  }
+  input {
+    flex: 1;
+    min-width: 160px;
+  }
+  label {
+    font-size: 12px;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 6px;
+    font-weight: 500;
+  }
+  .field {
+    margin-bottom: 16px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border-card);
+  }
+  th {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    font-weight: 600;
+    border-bottom: none;
+  }
+  tr:hover td {
+    background: rgba(139, 92, 246, 0.02);
+  }
+  .pill {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 99px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .02em;
+  }
+  .pill.on {
+    background: rgba(52, 211, 153, 0.1);
+    color: var(--success);
+    box-shadow: 0 0 10px rgba(52, 211, 153, 0.05);
+  }
+  .pill.off {
+    background: rgba(248, 113, 113, 0.1);
+    color: var(--error);
+    box-shadow: 0 0 10px rgba(248, 113, 113, 0.05);
+  }
+  .pill.done {
+    background: rgba(139, 92, 246, 0.15);
+    color: var(--accent);
+    box-shadow: 0 0 10px rgba(139, 92, 246, 0.05);
+  }
+  .pill.pend {
+    background: rgba(251, 191, 36, 0.1);
+    color: var(--warning);
+  }
+  .meta-ok { color: var(--success); }
+  .meta-no { color: var(--muted); opacity: 0.5; }
+  h2 {
+    margin: 0 0 16px;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -.01em;
+  }
+  .muted { color: var(--muted); }
+  .console {
+    background: #050508;
+    border: 1px solid var(--border-card);
+    border-radius: 12px;
+    height: 60vh;
+    overflow: auto;
+    padding: 16px;
+    font: 13px/1.6 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .hide { display: none; }
+  .hint {
+    color: var(--muted);
+    font-size: 11px;
+    margin-top: 8px;
+  }
+  .actions {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+  }
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: var(--primary-grad);
+    color: #fff;
+    padding: 12px 20px;
+    border-radius: 10px;
+    font-weight: 600;
+    font-size: 13px;
+    z-index: 50;
+    opacity: 0;
+    transform: translateY(10px);
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 0 8px 30px rgba(139, 92, 246, 0.3);
+  }
+  .toast.show { opacity: 1; transform: none; }
+  .progress {
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .gradient-sep {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--border-card), transparent);
+    margin: 20px 0;
+  }
+  section:not(.hide) {
+    animation: fadeIn 0.25s ease forwards;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
 </style>
 </head>
 <body>
 <header>
+  <div class="header-gradient"></div>
   <div class="logo">MusicaDet</div>
   <div class="status"><span id="dot" class="dot"></span><span id="statusText">idle</span></div>
   <nav>
@@ -601,17 +893,18 @@ HTML = r"""<!doctype html>
 <main>
   <section id="dashboard">
     <div class="grid stats" id="statCards"></div>
-    <div class="card" style="margin-top:14px">
+    <div class="gradient-sep"></div>
+    <div class="card">
       <h2>Actions</h2>
       <div class="actions">
-        <button class="btn" onclick="action('full')">Full Sync</button>
-        <button class="btn ghost" onclick="action('scan')">Scan Playlists</button>
-        <button class="btn ghost" onclick="action('scan-artists')">Scan Albums</button>
-        <button class="btn ghost" onclick="action('artists-sync-new')">Sync New</button>
-        <button class="btn ghost" onclick="action('artists-sync')">Sync All</button>
-        <button class="btn ghost" onclick="action('reconcile')">Reconcile</button>
-        <button class="btn ghost" onclick="action('fix-metadata')">Fix Metadata</button>
-        <button class="btn danger" onclick="stop()">Stop</button>
+        <button class="btn" onclick="action('full')">⚡ Full Sync</button>
+        <button class="btn ghost" onclick="action('scan')">🔍 Scan Playlists</button>
+        <button class="btn ghost" onclick="action('scan-artists')">📀 Scan Albums</button>
+        <button class="btn ghost" onclick="action('artists-sync-new')">✨ Sync New</button>
+        <button class="btn ghost" onclick="action('artists-sync')">🔄 Sync All</button>
+        <button class="btn ghost" onclick="action('reconcile')">🔗 Reconcile</button>
+        <button class="btn ghost" onclick="action('fix-metadata')">🏷️ Fix Metadata</button>
+        <button class="btn danger" onclick="stop()">⛔ Stop</button>
       </div>
       <div class="hint">Music folder: <span id="musicDirHint" class="muted">—</span></div>
     </div>
@@ -619,7 +912,7 @@ HTML = r"""<!doctype html>
 
   <section id="library" class="hide">
     <div class="card">
-      <div class="row" style="margin-bottom:10px">
+      <div class="row" style="margin-bottom:14px">
         <select id="libArtist" onchange="loadLibrary()"><option value="">All artists</option></select>
         <select id="libStatus" onchange="loadLibrary()">
           <option value="all">All albums</option>
@@ -631,7 +924,7 @@ HTML = r"""<!doctype html>
       <table><thead><tr><th>Artist</th><th>Album</th><th>Progress</th><th></th></tr></thead>
       <tbody id="libRows"></tbody></table>
     </div>
-    <div class="card hide" id="songPanel" style="margin-top:12px">
+    <div class="card hide" id="songPanel" style="margin-top:16px">
       <h2 id="songPanelTitle">Songs</h2>
       <table><thead><tr><th>#</th><th>Title</th><th>Status</th><th>Cover</th><th>Lyrics</th></tr></thead>
       <tbody id="songRows"></tbody></table>
@@ -646,8 +939,8 @@ HTML = r"""<!doctype html>
         <button class="btn" onclick="addArtist()">Add</button>
       </div>
     </div>
-    <div class="card" style="margin-top:12px">
-      <div class="row" style="margin-bottom:10px">
+    <div class="card" style="margin-top:16px">
+      <div class="row" style="margin-bottom:14px">
         <input id="artistSearch" placeholder="Search..." oninput="loadArtists()"/>
         <select id="artistFilter" onchange="loadArtists()">
           <option value="all">All</option><option value="active">Active</option>
@@ -670,7 +963,7 @@ HTML = r"""<!doctype html>
         <button class="btn" onclick="addPlaylist()">Add</button>
       </div>
     </div>
-    <div class="card" style="margin-top:12px">
+    <div class="card" style="margin-top:16px">
       <table><thead><tr><th>Playlist</th><th>Status</th><th>Last scan</th><th></th></tr></thead>
       <tbody id="playlistRows"></tbody></table>
     </div>
@@ -678,7 +971,7 @@ HTML = r"""<!doctype html>
 
   <section id="tracks" class="hide">
     <div class="card">
-      <div class="row" style="margin-bottom:10px">
+      <div class="row" style="margin-bottom:14px">
         <input id="trackSearch" placeholder="Search files..." oninput="loadTracks()"/>
         <button class="btn ghost sm" onclick="loadTracks()">Refresh</button>
       </div>
@@ -694,7 +987,7 @@ HTML = r"""<!doctype html>
       <div class="field"><label>Music folder</label><input id="cfgMusicDir"/></div>
       <div class="row">
         <div class="field" style="flex:1"><label>Format</label>
-          <select id="cfgFormat"><option value="mp3">mp3</option><option value="opus">opus</option><option value="flac">flac</option></select>
+          <select id="cfgFormat" style="width:100%"><option value="mp3">mp3</option><option value="opus">opus</option><option value="flac">flac</option></select>
         </div>
         <div class="field" style="flex:1"><label>Bitrate</label><input id="cfgBitrate" placeholder="320k"/></div>
       </div>
@@ -704,8 +997,8 @@ HTML = r"""<!doctype html>
         <div class="field" style="flex:1"><label>Playlist timeout (s)</label><input id="cfgPlTimeout" type="number"/></div>
         <div class="field" style="flex:1"><label>Playlist retries</label><input id="cfgPlRetries" type="number"/></div>
       </div>
-      <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
-        <input type="checkbox" id="cfgLrc" style="flex:0"/> Generate .lrc sidecar files
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:16px;cursor:pointer">
+        <input type="checkbox" id="cfgLrc" style="flex:0;width:auto"/> Generate .lrc sidecar files
       </label>
       <button class="btn" onclick="saveSettings()">Save settings</button>
       <div class="hint">Changing HUD port requires restarting the service.</div>
@@ -714,9 +1007,9 @@ HTML = r"""<!doctype html>
 
   <section id="console" class="hide">
     <div class="card">
-      <div class="row" style="margin-bottom:8px">
+      <div class="row" style="margin-bottom:14px">
         <h2 style="margin:0">Live Console</h2>
-        <span class="muted" id="wsState">connecting...</span>
+        <span class="status-live" style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--success)"><span style="width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 6px var(--success)"></span><span id="wsState">connecting...</span></span>
         <button class="btn ghost sm" style="margin-left:auto" onclick="clearConsole()">Clear</button>
       </div>
       <div class="console" id="consoleOut"></div>
@@ -793,8 +1086,9 @@ async function loadLibrary(){
   const rows=await api(url);
   $('#libRows').innerHTML=rows.map(r=>{
     const pct=r.track_count?Math.round(100*r.downloaded_count/r.track_count):0;
+    const bar=`<div style="height:4px;background:rgba(139,92,246,.15);border-radius:99px;overflow:hidden;width:60px;display:inline-block;vertical-align:middle;margin-left:6px"><div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#8b5cf6,#34d399);border-radius:99px"></div></div>`;
     const pill=r.downloaded_count>=r.track_count&&r.track_count>0?'<span class="pill done">done</span>':'<span class="pill pend">'+pct+'%</span>';
-    return `<tr><td>${esc(r.artist_name)}</td><td>${esc(r.name)}</td><td class="progress">${r.downloaded_count}/${r.track_count} ${pill}</td>
+    return `<tr><td>${esc(r.artist_name)}</td><td>${esc(r.name)}</td><td class="progress">${r.downloaded_count}/${r.track_count} ${bar} ${pill}</td>
       <td><button class="btn ghost sm" onclick="showSongs('${r.spotify_id}','${esc(r.name)}')">Songs</button></td></tr>`;
   }).join('')||'<tr><td colspan=4 class="muted">No albums yet — run Scan Albums.</td></tr>';
 }
@@ -867,7 +1161,15 @@ function connectWS(){
   ws.onclose=()=>{$('#wsState').textContent='reconnecting...';setTimeout(connectWS,1500);};
   ws.onmessage=e=>{
     const out=$('#consoleOut');
-    const d=document.createElement('div');d.textContent=e.data;out.appendChild(d);
+    const d=document.createElement('div');
+    const text=e.data;
+    d.textContent=text;
+    if(/ERROR|✗|failed|error/i.test(text)) d.style.color='#f87171';
+    else if(/WARN|WARNING/i.test(text)) d.style.color='#fbbf24';
+    else if(/===/.test(text)) d.style.color='#8b5cf6';
+    else if(/✓|done|complete|ok/i.test(text)) d.style.color='#34d399';
+    else if(/\[\d+\/\d+\]/.test(text)) d.style.color='#a78bfa';
+    out.appendChild(d);
     while(out.childNodes.length>1200)out.removeChild(out.firstChild);
     if(autoscroll)out.scrollTop=out.scrollHeight;
   };
@@ -876,7 +1178,7 @@ $('#consoleOut').addEventListener('scroll',e=>{
   const el=e.target;autoscroll=(el.scrollHeight-el.scrollTop-el.clientHeight)<40;
 });
 function esc(s){return (s==null?'':s).toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-loadStats();connectWS();setInterval(loadStats,4000);
+loadStats();connectWS();setInterval(loadStats,15000);
 </script>
 </body>
 </html>

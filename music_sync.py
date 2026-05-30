@@ -26,6 +26,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import concurrent.futures
 import sys
 import tempfile
 import time
@@ -64,6 +65,8 @@ DEFAULTS: dict = {
     "artist_save_timeout": 900,
     "lyrics_providers": ["genius", "musixmatch", "azlyrics"],
     "generate_lrc": False,
+    "scan_concurrency": 4,
+    "sync_concurrency": 2,
     "playlists": [
         {"name": "Today's Top Hits", "url": "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"},
         {"name": "Top 50 Romania", "url": "https://open.spotify.com/playlist/37i9dQZEVXbNZbJ6TZelCq"},
@@ -383,10 +386,10 @@ def _extract_artist_from_song(song: dict) -> Optional[tuple[str, str]]:
     return sid, str(name)
 
 
-def _spotdl_base_args(out_tpl: str) -> list:
-    lyrics = CFG.get("lyrics_providers") or ["genius", "musixmatch", "azlyrics"]
+def _spotdl_flags(out_tpl: str) -> list:
+    """Return spotdl option flags (no command prefix, no --lyrics).
+    Callers must place positional args BEFORE --lyrics to avoid nargs='+' conflict."""
     args = [
-        "spotdl", "sync",
         "--output", out_tpl,
         "--format", str(CFG["format"]),
         "--bitrate", str(CFG["bitrate"]),
@@ -394,24 +397,33 @@ def _spotdl_base_args(out_tpl: str) -> list:
         "--log-level", "WARNING",
         "--overwrite", "metadata",
         "--force-update-metadata",
-        "--lyrics", *lyrics,
     ]
     if CFG.get("generate_lrc"):
         args.append("--generate-lrc")
     return args
 
 
+def _spotdl_lyrics_args() -> list:
+    """Return --lyrics flag + values. MUST be the LAST args in the command
+    since --lyrics uses nargs='+' and greedily consumes non-flag tokens."""
+    lyrics = CFG.get("lyrics_providers") or ["genius", "musixmatch", "azlyrics"]
+    return ["--lyrics"] + lyrics
+
+
 def spotdl_sync_artist(spotify_id: str, name: str, target: str) -> bool:
     sync_file = Path(CFG["sync_dir"]) / f"{spotify_id.replace(':', '_')}.spotdl"
     out_tpl = str(Path(CFG["music_dir"]) / CFG["output_template"])
-    base_args = _spotdl_base_args(out_tpl)
+    flags = _spotdl_flags(out_tpl)
+    lyrics_args = _spotdl_lyrics_args()
 
     is_new = not sync_file.exists()
     if is_new:
-        cmd = base_args + [target, "--save-file", str(sync_file)]
+        # Positional target MUST come right after 'sync' and BEFORE --lyrics
+        # because --lyrics uses nargs='+' and would consume the URL otherwise.
+        cmd = ["spotdl", "sync", target, "--save-file", str(sync_file)] + flags + lyrics_args
         log.info("    ↳ First run — downloading full discography")
     else:
-        cmd = base_args + [str(sync_file)]
+        cmd = ["spotdl", "sync", str(sync_file)] + flags + lyrics_args
         log.info("    ↳ Checking for new releases (incremental)")
 
     try:
@@ -432,12 +444,13 @@ def spotdl_fix_artist_metadata(spotify_id: str, name: str, target: str) -> bool:
     """Re-embed metadata for an artist via spotdl sync on existing .spotdl file."""
     sync_file = Path(CFG["sync_dir"]) / f"{spotify_id.replace(':', '_')}.spotdl"
     out_tpl = str(Path(CFG["music_dir"]) / CFG["output_template"])
-    base_args = _spotdl_base_args(out_tpl)
+    flags = _spotdl_flags(out_tpl)
+    lyrics_args = _spotdl_lyrics_args()
 
     if sync_file.exists():
-        cmd = base_args + [str(sync_file)]
+        cmd = ["spotdl", "sync", str(sync_file)] + flags + lyrics_args
     else:
-        cmd = base_args + [target, "--save-file", str(sync_file)]
+        cmd = ["spotdl", "sync", target, "--save-file", str(sync_file)] + flags + lyrics_args
 
     try:
         r = subprocess.run(cmd, timeout=7200)
@@ -551,10 +564,13 @@ def _build_file_index(music_dir: Path) -> tuple[dict, dict]:
     return by_full, by_album_title
 
 
-def reconcile_artist_downloads(artist_id: str, artist_name: str) -> dict:
+def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=None) -> dict:
     """Match filesystem files to DB songs. Returns stats dict."""
     music_dir = Path(CFG["music_dir"])
-    by_full, by_album_title = _build_file_index(music_dir)
+    if file_index is not None:
+        by_full, by_album_title = file_index
+    else:
+        by_full, by_album_title = _build_file_index(music_dir)
     stats = {"downloaded": 0, "cover": 0, "lyrics": 0, "pending": 0}
 
     with db_connect() as db:
@@ -783,10 +799,17 @@ def cmd_scan_artists(args):
         artists = db.execute(query + " ORDER BY name COLLATE NOCASE").fetchall()
 
     tag = " (new only)" if new_only else ""
-    log.info("Scanning artist catalogs%s: %d", tag, len(artists))
-    for i, a in enumerate(artists, 1):
-        log.info("[%d/%d] %s", i, len(artists), a["name"])
-        scan_artist_catalog(a)
+    workers = min(int(CFG.get("scan_concurrency", 4)), max(len(artists), 1))
+    log.info("Scanning artist catalogs%s: %d (×%d workers)", tag, len(artists), workers)
+    total = len(artists)
+
+    def _scan(i_a):
+        i, a = i_a
+        log.info("[%d/%d] %s", i, total, a["name"])
+        return scan_artist_catalog(a)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_scan, enumerate(artists, 1)))
     log.info("Artist catalog scan complete")
 
 
@@ -799,31 +822,34 @@ def cmd_artists_sync(args):
         artists = db.execute(query + " ORDER BY name COLLATE NOCASE").fetchall()
 
     tag = " (new only)" if new_only else ""
-    log.info("Artists to sync%s: %d", tag, len(artists))
-    ok = failed = 0
+    workers = min(int(CFG.get("sync_concurrency", 2)), max(len(artists), 1))
+    log.info("Artists to sync%s: %d (×%d workers)", tag, len(artists), workers)
+    total = len(artists)
 
-    for i, a in enumerate(artists, 1):
+    def _sync_one(i_a):
+        i, a = i_a
         sid, name = a["spotify_id"], a["name"]
-        log.info("[%d/%d] %s", i, len(artists), name)
+        log.info("[%d/%d] %s", i, total, name)
         target = _artist_target(sid, name)
         success = spotdl_sync_artist(sid, name, target)
-
         if success:
             stats = reconcile_artist_downloads(sid, name)
             log.info("    Metadata: %d/%d with cover, %d/%d with lyrics",
                      stats["cover"], stats["downloaded"],
                      stats["lyrics"], stats["downloaded"])
-
         with db_connect() as db:
             if success:
                 db.execute("""
                     UPDATE artists SET sync_done=1, last_synced=datetime('now')
                     WHERE spotify_id=?
                 """, (sid,))
-                ok += 1
-            else:
-                failed += 1
+        return success
 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_sync_one, enumerate(artists, 1)))
+
+    ok = sum(1 for r in results if r)
+    failed = sum(1 for r in results if not r)
     log.info("Artists sync done — ✓ %d  ✗ %d", ok, failed)
 
 
@@ -838,9 +864,10 @@ def cmd_reconcile(args):
         else:
             artists = db.execute("SELECT * FROM artists WHERE active=1").fetchall()
 
+    file_index = _build_file_index(Path(CFG["music_dir"]))
     for a in artists:
         log.info("Reconciling: %s", a["name"])
-        stats = reconcile_artist_downloads(a["spotify_id"], a["name"])
+        stats = reconcile_artist_downloads(a["spotify_id"], a["name"], file_index=file_index)
         log.info("  → %d downloaded, %d pending", stats["downloaded"], stats["pending"])
 
 
