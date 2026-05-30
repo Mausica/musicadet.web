@@ -34,6 +34,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+try:
+    import custom_dl
+except ImportError:
+    custom_dl = None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
@@ -56,17 +61,22 @@ DEFAULTS: dict = {
     "sync_dir": str(BASE / "sync-data"),
     "db_path": str(BASE / "music.db"),
     "log_dir": "/var/log/musicadet",
-    "format": "mp3",
+    "format": "opus",
     "bitrate": "320k",
     "threads": 4,
-    "output_template": "{artist}/{album}/{track-number} - {title}.{output-ext}",
+    # Legacy flat template kept for reference; new downloads use album structure
+    "output_template": "{artist}/{title}.{output-ext}",
+    # New: album-structured output  →  artist/album/NN - title.ext
+    "album_output_template": "{artist}/{album}/{track-number:02d} - {title}.{output-ext}",
+    "download_concurrency": 1,          # sequential — no rate-limit issues
     "playlist_save_timeout": 600,
     "playlist_save_retries": 3,
     "artist_save_timeout": 900,
     "lyrics_providers": ["genius", "musixmatch", "azlyrics"],
     "generate_lrc": False,
     "scan_concurrency": 4,
-    "sync_concurrency": 2,
+    "sync_concurrency": 1,              # sequential artist sync
+    "verified_artists": [],             # populated from config.json
     "playlists": [
         {"name": "Today's Top Hits", "url": "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"},
         {"name": "Top 50 Romania", "url": "https://open.spotify.com/playlist/37i9dQZEVXbNZbJ6TZelCq"},
@@ -599,7 +609,9 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
             if not found:
                 for key in [
                     (display_name.lower(), album_key, title_key),
+                    (display_name.lower(), "", title_key),
                     (artist_id.lower(), album_key, title_key),
+                    (artist_id.lower(), "", title_key),
                 ]:
                     if key in by_full:
                         found = by_full[key]
@@ -813,7 +825,130 @@ def cmd_scan_artists(args):
     log.info("Artist catalog scan complete")
 
 
+def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total: int) -> bool:
+    """
+    Core sequential download loop for one artist.
+
+    Pipeline per-track:
+      1. SpotDL gave us song metadata (album, track_number, yt_url if present).
+      2. Upsert into DB.
+      3. For each pending track → YtDlpDownloader.download_track().
+      4. Embed metadata via enforce_primary_artist.
+      5. After all tracks → check_and_complete_artist_albums (album completeness).
+    """
+    if not custom_dl:
+        log.error("custom_dl module not available — cannot download")
+        return False
+
+    music_dir = Path(CFG["music_dir"])
+    db_path = Path(CFG["db_path"])
+    fmt = CFG.get("format", "opus")
+
+    downloader = custom_dl.YtDlpDownloader(music_dir, fmt=fmt)
+
+    # Build a lookup: spotify_id → yt_url from spotdl JSON
+    # spotdl save stores the YouTube URL in the 'download_url' field
+    yt_url_map: dict = {}
+    for song in songs:
+        song_id = _song_id_from_dict(song)
+        yt_url = (
+            song.get("download_url")
+            or song.get("youtube_url")
+            or song.get("url")
+            or None
+        )
+        if song_id and yt_url and "youtube" in str(yt_url):
+            yt_url_map[song_id] = yt_url
+
+    # Fetch pending songs from DB for this artist
+    with db_connect() as db:
+        pending_rows = db.execute(
+            """
+            SELECT s.spotify_id, s.title, s.track_number, s.status, s.file_path,
+                   al.name AS album_name
+            FROM songs s
+            JOIN albums al ON s.album_id = al.spotify_id
+            WHERE s.artist_id = ? AND s.status != 'downloaded'
+            ORDER BY al.name, s.track_number
+            """,
+            (sid,),
+        ).fetchall()
+
+    log.info("[%d/%d] %s — %d tracks to download", index, total, name, len(pending_rows))
+
+    success = True
+    with db_connect() as db:
+        for s in pending_rows:
+            yt_url = yt_url_map.get(s["spotify_id"])
+            track_num = s["track_number"]
+            album_name = s["album_name"] or "Unknown Album"
+
+            # Check if file already exists on disk
+            safe_artist = custom_dl._clean_filename(name)
+            safe_album = custom_dl._clean_filename(album_name)
+            safe_title = custom_dl._clean_filename(s["title"])
+            trk = str(track_num).zfill(2) if track_num else "00"
+            expected = music_dir / safe_artist / safe_album / f"{trk} - {safe_title}.{fmt}"
+
+            if expected.exists():
+                rel = str(expected.relative_to(music_dir))
+                db.execute(
+                    "UPDATE songs SET status='downloaded', file_path=? WHERE spotify_id=?",
+                    (rel, s["spotify_id"]),
+                )
+                log.info("    ✓ Already on disk: %s", expected.name)
+                continue
+
+            # Download
+            result = downloader.download_track(
+                artist=name,
+                title=s["title"],
+                album=album_name,
+                track_number=track_num,
+                yt_url=yt_url,
+            )
+
+            if result and result.exists():
+                # Embed metadata
+                custom_dl.enforce_primary_artist(
+                    result, name, s["title"], album_name, track_num
+                )
+                rel = str(result.relative_to(music_dir))
+                db.execute(
+                    "UPDATE songs SET status='downloaded', file_path=?, updated_at=datetime('now') WHERE spotify_id=?",
+                    (rel, s["spotify_id"]),
+                )
+                log.info("    ✓ Downloaded: %s", result.name)
+            else:
+                db.execute(
+                    "UPDATE songs SET status='failed', last_error='yt-dlp search returned no result', updated_at=datetime('now') WHERE spotify_id=?",
+                    (s["spotify_id"],),
+                )
+                success = False
+
+    # ── Album completeness check ─────────────────────────────────────────────
+    log.info("  ↳ Checking album completeness for: %s", name)
+    reconcile_artist_downloads(sid, name)
+    fixed = custom_dl.check_and_complete_artist_albums(
+        db_path, music_dir, sid, name, downloader
+    )
+    if fixed:
+        log.info("  ↳ Downloaded %d missing album(s) for %s", fixed, name)
+        reconcile_artist_downloads(sid, name)
+
+    # Mark artist as synced if no failures
+    with db_connect() as db:
+        if success:
+            db.execute(
+                "UPDATE artists SET sync_done=1, last_synced=datetime('now') WHERE spotify_id=?",
+                (sid,),
+            )
+
+    return success
+
+
 def cmd_artists_sync(args):
+    """Sequential artist sync: SpotDL fetch → yt-dlp download → album completeness."""
     new_only = getattr(args, "new_only", False)
     with db_connect() as db:
         query = "SELECT * FROM artists WHERE active=1"
@@ -822,35 +957,271 @@ def cmd_artists_sync(args):
         artists = db.execute(query + " ORDER BY name COLLATE NOCASE").fetchall()
 
     tag = " (new only)" if new_only else ""
-    workers = min(int(CFG.get("sync_concurrency", 2)), max(len(artists), 1))
-    log.info("Artists to sync%s: %d (×%d workers)", tag, len(artists), workers)
+    log.info("Artists to sync%s: %d (sequential)", tag, len(artists))
     total = len(artists)
 
-    def _sync_one(i_a):
-        i, a = i_a
+    ok = failed = 0
+    for i, a in enumerate(artists, 1):
         sid, name = a["spotify_id"], a["name"]
-        log.info("[%d/%d] %s", i, total, name)
         target = _artist_target(sid, name)
-        success = spotdl_sync_artist(sid, name, target)
-        if success:
-            stats = reconcile_artist_downloads(sid, name)
-            log.info("    Metadata: %d/%d with cover, %d/%d with lyrics",
-                     stats["cover"], stats["downloaded"],
-                     stats["lyrics"], stats["downloaded"])
-        with db_connect() as db:
-            if success:
-                db.execute("""
-                    UPDATE artists SET sync_done=1, last_synced=datetime('now')
-                    WHERE spotify_id=?
-                """, (sid,))
-        return success
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(_sync_one, enumerate(artists, 1)))
+        # Step 1: SpotDL fetch → JSON
+        log.info("[%d/%d] Fetching Spotify metadata: %s", i, total, name)
+        songs = spotdl_save(target, timeout=int(CFG.get("artist_save_timeout", 900)))
+        if songs:
+            with db_connect() as db:
+                _upsert_artist_catalog(db, sid, songs)
+        else:
+            log.warning("  → No songs from SpotDL for %s — will still try DB pending", name)
+            songs = []
 
-    ok = sum(1 for r in results if r)
-    failed = sum(1 for r in results if not r)
+        # Step 2: Download pending tracks + album completeness check
+        result = _sync_artist_with_ytdlp(sid, name, songs, i, total)
+        if result:
+            ok += 1
+        else:
+            failed += 1
+
     log.info("Artists sync done — ✓ %d  ✗ %d", ok, failed)
+
+def cmd_sync_playlist(args):
+    """
+    Sync a single Spotify playlist URL end-to-end:
+      1. SpotDL saves the playlist → JSON (26 tracks, N artists).
+      2. For each track:  yt-dlp downloads it sequentially.
+      3. For each unique primary artist: album completeness check.
+
+    This is the "playlist-first" entry point — ideal for ad-hoc syncs
+    triggered from the web UI or CLI.
+    """
+    url = args.url.strip()
+    log.info("━" * 60)
+    log.info("  SYNC PLAYLIST — %s", url)
+    log.info("━" * 60)
+
+    if not custom_dl:
+        log.error("custom_dl module not available — cannot download")
+        return
+
+    music_dir = Path(CFG["music_dir"])
+    db_path = Path(CFG["db_path"])
+    fmt = CFG.get("format", "opus")
+    downloader = custom_dl.YtDlpDownloader(music_dir, fmt=fmt)
+
+    # ── Step 1: SpotDL fetch ─────────────────────────────────────────────────
+    log.info("\n▶ Step 1 — Fetching playlist metadata via SpotDL")
+    songs = spotdl_save(url, timeout=int(CFG.get("playlist_save_timeout", 600)))
+    if not songs:
+        log.error("SpotDL returned no tracks. Check the URL or network connection.")
+        return
+    log.info("  → %d tracks found in playlist", len(songs))
+
+    # ── Step 2: Upsert artists + albums + songs into DB ──────────────────────
+    log.info("\n▶ Step 2 — Updating database")
+    pl_id = _extract_id_from_url(url, "playlist")
+    artist_ids_found: set[tuple[str, str]] = set()   # (spotify_id, name)
+
+    with db_connect() as db:
+        for song in songs:
+            result = _extract_artist_from_song(song)
+            if not result:
+                continue
+            sid, name = result
+            db.execute(
+                """
+                INSERT INTO artists (spotify_id, name, source) VALUES (?,?,'playlist')
+                ON CONFLICT(spotify_id) DO UPDATE SET
+                    name = excluded.name,
+                    active = 1
+                """,
+                (sid, name),
+            )
+            artist_ids_found.add((sid, name))
+            if pl_id:
+                db.execute(
+                    "INSERT INTO playlist_artists VALUES (?,?) ON CONFLICT DO NOTHING",
+                    (pl_id, sid),
+                )
+            _upsert_artist_catalog(db, sid, songs)
+
+    # ── Step 3: Download tracks sequentially ─────────────────────────────────
+    log.info("\n▶ Step 3 — Downloading %d tracks (sequential)", len(songs))
+    ok = failed = 0
+    with db_connect() as db:
+        for idx, song in enumerate(songs, 1):
+            result = _extract_artist_from_song(song)
+            primary_artist = result[1] if result else "Unknown Artist"
+            title = _title_from_song(song)
+            album = _album_name_from_song(song)
+            track_num = _track_number_from_song(song)
+            song_id = _song_id_from_dict(song)
+
+            yt_url = (
+                song.get("download_url")
+                or song.get("youtube_url")
+                or None
+            )
+            if yt_url and "youtube" not in str(yt_url):
+                yt_url = None
+
+            log.info("[%d/%d] %s — %s", idx, len(songs), primary_artist, title)
+
+            # Check if already downloaded
+            if song_id:
+                row = db.execute(
+                    "SELECT status, file_path FROM songs WHERE spotify_id=?", (song_id,)
+                ).fetchone()
+                if row and row["status"] == "downloaded" and row["file_path"]:
+                    fp = Path(row["file_path"])
+                    if not fp.is_absolute():
+                        fp = music_dir / fp
+                    if fp.exists():
+                        log.info("    ✓ Already downloaded")
+                        ok += 1
+                        continue
+
+            path = downloader.download_track(
+                artist=primary_artist,
+                title=title,
+                album=album,
+                track_number=track_num,
+                yt_url=yt_url,
+            )
+
+            if path and path.exists():
+                custom_dl.enforce_primary_artist(path, primary_artist, title, album, track_num)
+                if song_id:
+                    rel = str(path.relative_to(music_dir))
+                    db.execute(
+                        "UPDATE songs SET status='downloaded', file_path=?, updated_at=datetime('now') WHERE spotify_id=?",
+                        (rel, song_id),
+                    )
+                ok += 1
+            else:
+                if song_id:
+                    db.execute(
+                        "UPDATE songs SET status='failed', last_error='yt-dlp no result', updated_at=datetime('now') WHERE spotify_id=?",
+                        (song_id,),
+                    )
+                failed += 1
+
+    log.info("  → Downloads: ✓ %d  ✗ %d", ok, failed)
+
+    # ── Step 4: Album completeness for each unique artist ────────────────────
+    log.info("\n▶ Step 4 — Checking album completeness for %d artist(s)", len(artist_ids_found))
+    for artist_sid, artist_name in sorted(artist_ids_found, key=lambda x: x[1]):
+        log.info("  Artist: %s", artist_name)
+        fixed = custom_dl.check_and_complete_artist_albums(
+            db_path, music_dir, artist_sid, artist_name, downloader
+        )
+        if fixed:
+            reconcile_artist_downloads(artist_sid, artist_name)
+
+    log.info("\n━" * 60)
+    log.info("  PLAYLIST SYNC COMPLETE — ✓ %d downloaded, ✗ %d failed", ok, failed)
+    log.info("━" * 60)
+
+
+def cmd_download_direct(args):
+    """
+    Directly download a Spotify or YT Music playlist/track into the folder structure.
+    Bypasses all database checks and album completion loops.
+    """
+    url = args.url.strip()
+    log.info("━" * 60)
+    log.info("  DIRECT DOWNLOAD — %s", url)
+    log.info("━" * 60)
+
+    if not custom_dl:
+        log.error("custom_dl module not available — cannot download")
+        return
+
+    music_dir = Path(CFG["music_dir"])
+    fmt = CFG.get("format", "opus")
+    downloader = custom_dl.YtDlpDownloader(music_dir, fmt=fmt)
+
+    # Auto-detect source
+    if "spotify.com" in url:
+        log.info("▶ Source: Spotify")
+        songs = spotdl_save(url, timeout=int(CFG.get("playlist_save_timeout", 600)))
+        if not songs:
+            log.error("SpotDL returned no tracks.")
+            return
+        
+        log.info("  → Found %d tracks. Downloading directly...", len(songs))
+        ok = failed = 0
+        for idx, song in enumerate(songs, 1):
+            result = _extract_artist_from_song(song)
+            primary_artist = result[1] if result else "Unknown Artist"
+            title = _title_from_song(song)
+            album = _album_name_from_song(song)
+            track_num = _track_number_from_song(song)
+            yt_url = song.get("download_url") or song.get("youtube_url")
+
+            log.info("[%d/%d] %s — %s", idx, len(songs), primary_artist, title)
+            path = downloader.download_track(
+                artist=primary_artist, title=title, album=album, track_number=track_num, yt_url=yt_url
+            )
+            if path and path.exists():
+                custom_dl.enforce_primary_artist(path, primary_artist, title, album, track_num)
+                ok += 1
+            else:
+                failed += 1
+        log.info("  → Downloads: ✓ %d  ✗ %d", ok, failed)
+
+    elif "youtube.com" in url or "youtu.be" in url:
+        log.info("▶ Source: YouTube / YouTube Music")
+        import yt_dlp
+        opts = {"extract_flat": True, "quiet": True, "no_warnings": True}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                entries = info.get("entries", [info]) if info else []
+        except Exception as e:
+            log.error("Failed to extract YouTube info: %s", e)
+            return
+
+        entries = [e for e in entries if e]
+        log.info("  → Found %d tracks. Downloading directly...", len(entries))
+        
+        ok = failed = 0
+        for idx, entry in enumerate(entries, 1):
+            title = entry.get("track") or entry.get("title", "Unknown Title")
+            artist = entry.get("artist") or entry.get("uploader", "Unknown Artist")
+            album = entry.get("album") or "Unknown Album"
+            track_num = None  # flat extraction usually doesn't give track numbers
+
+            # Strip "- Topic" from YouTube artist names
+            if artist.endswith(" - Topic"):
+                artist = artist.replace(" - Topic", "")
+
+            entry_url = entry.get("url") or entry.get("webpage_url")
+            if not entry_url and entry.get("id"):
+                entry_url = f"https://www.youtube.com/watch?v={entry['id']}"
+
+            log.info("[%d/%d] %s — %s", idx, len(entries), artist, title)
+            path = downloader.download_track(
+                artist=artist, title=title, album=album, track_number=track_num, yt_url=entry_url
+            )
+            if path and path.exists():
+                custom_dl.enforce_primary_artist(path, artist, title, album, track_num)
+                ok += 1
+            else:
+                failed += 1
+        log.info("  → Downloads: ✓ %d  ✗ %d", ok, failed)
+    else:
+        log.error("Unsupported URL format. Please provide a Spotify or YouTube link.")
+
+    log.info("━" * 60)
+
+
+def cmd_migrate_structure(args):
+    log.info("Migrating existing flat files to album structure...")
+    if custom_dl:
+        custom_dl.migrate_structure(Path(CFG["db_path"]), Path(CFG["music_dir"]))
+        cmd_reconcile(args)
+    else:
+        log.error("custom_dl module not available.")
 
 
 def cmd_reconcile(args):
@@ -994,13 +1365,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  musicadet                              Full sync (scan + catalog + download)
-  musicadet scan                         Discover artists from playlists
-  musicadet scan-artists                 Scan albums/songs into DB
-  musicadet artists-sync                 Download all artist discographies
+  musicadet                                        Full sync (scan + catalog + download)
+  musicadet scan                                   Discover artists from playlists
+  musicadet scan-artists                           Scan albums/songs into DB
+  musicadet artists-sync                           Download all artist discographies (sequential)
   musicadet artists-sync --new-only
-  musicadet reconcile                    Match files to DB
-  musicadet fix-metadata --artist NAME   Re-embed tags/cover/lyrics
+  musicadet sync-playlist <spotify_playlist_url>   Fetch playlist → download tracks → complete albums
+  musicadet download <url>                         Direct download from Spotify/YT (no DB check)
+  musicadet reconcile                              Match files to DB
+  musicadet migrate-structure                      Move flat files into album folders
+  musicadet fix-metadata --artist NAME             Re-embed tags
   musicadet list-albums
   musicadet add "THE MOTANS"
         """,
@@ -1013,11 +1387,27 @@ Examples:
     sa = sub.add_parser("scan-artists", help="Scan artist albums into DB")
     sa.add_argument("--new-only", action="store_true", help="Only artists not yet scanned")
 
-    as_ = sub.add_parser("artists-sync", help="Sync artist discographies")
+    as_ = sub.add_parser("artists-sync", help="Sync artist discographies (sequential yt-dlp)")
     as_.add_argument("--new-only", action="store_true", help="Only sync artists not yet downloaded")
+
+    # New: playlist-first sync command
+    sp = sub.add_parser(
+        "sync-playlist",
+        help="Fetch a Spotify playlist via SpotDL then download all tracks + check artist albums",
+    )
+    sp.add_argument("url", help="Spotify playlist URL")
+
+    # New: direct download command
+    dd = sub.add_parser(
+        "download",
+        help="Directly download a Spotify/YT playlist to local folders (no DB/album checks)",
+    )
+    dd.add_argument("url", help="Spotify or YouTube URL")
 
     rec = sub.add_parser("reconcile", help="Match filesystem files to DB")
     rec.add_argument("--artist", help="Limit to artist name/id")
+
+    sub.add_parser("migrate-structure", help="Move existing flat files to album folders and restrict to primary artist")
 
     fix = sub.add_parser("fix-metadata", help="Re-embed metadata for incomplete songs")
     fix.add_argument("--artist", help="Limit to artist name/id")
@@ -1042,19 +1432,22 @@ Examples:
     args = p.parse_args()
 
     routes = {
-        None:           cmd_full_sync,
-        "sync":         cmd_full_sync,
-        "scan":         cmd_scan,
-        "scan-artists": cmd_scan_artists,
-        "artists-sync": cmd_artists_sync,
-        "reconcile":    cmd_reconcile,
-        "fix-metadata": cmd_fix_metadata,
-        "list-albums":  cmd_list_albums,
-        "add":          cmd_add,
-        "import":       cmd_import,
-        "list":         cmd_list,
-        "disable":      cmd_disable,
-        "enable":       cmd_enable,
+        None:                cmd_full_sync,
+        "sync":              cmd_full_sync,
+        "scan":              cmd_scan,
+        "scan-artists":      cmd_scan_artists,
+        "artists-sync":      cmd_artists_sync,
+        "sync-playlist":     cmd_sync_playlist,
+        "download":          cmd_download_direct,
+        "reconcile":         cmd_reconcile,
+        "migrate-structure": cmd_migrate_structure,
+        "fix-metadata":      cmd_fix_metadata,
+        "list-albums":       cmd_list_albums,
+        "add":               cmd_add,
+        "import":            cmd_import,
+        "list":              cmd_list,
+        "disable":           cmd_disable,
+        "enable":            cmd_enable,
     }
 
     fn = routes.get(args.cmd)

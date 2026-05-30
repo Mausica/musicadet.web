@@ -38,7 +38,7 @@ mkdir -p "$INSTALL_DIR" "$SYNC_DIR" "$MUSIC_DIR" "$LOG_DIR"
 chmod 755 "$INSTALL_DIR"
 
 echo "==> Checking required files..."
-for f in music_sync.py config.json musicadet.service musicadet.timer hud.py musicadet-hud.service run-hud.sh requirements.txt; do
+for f in music_sync.py custom_dl.py config.json musicadet.service musicadet.timer hud.py musicadet-hud.service run-hud.sh requirements.txt; do
   if [[ ! -f "$INSTALL_DIR/$f" ]]; then
     echo "ERROR: missing $INSTALL_DIR/$f" >&2
     exit 1
@@ -106,6 +106,9 @@ echo "   musicadet scan                         # discover artists from playlist
 echo "   musicadet scan-artists                 # scan albums into DB"
 echo "   musicadet artists-sync                 # download discographies"
 echo "   musicadet artists-sync --new-only"
+echo "   musicadet sync-playlist <url>          # fetch playlist and download tracks"
+echo "   musicadet download <url>               # direct download to structure (no DB)"
+echo "   musicadet migrate-structure            # move flat files to album folders"
 echo "   musicadet reconcile"
 echo "   musicadet fix-metadata"
 echo "   musicadet list-albums"

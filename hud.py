@@ -27,10 +27,10 @@ DEFAULTS = {
     "sync_dir": str(BASE / "sync-data"),
     "db_path": str(BASE / "music.db"),
     "log_dir": "/var/log/musicadet",
-    "format": "mp3",
+    "format": "opus",
     "bitrate": "320k",
     "threads": 4,
-    "output_template": "{artist}/{album}/{track-number} - {title}.{output-ext}",
+    "output_template": "{artist}/{title}.{output-ext}",
     "playlist_save_timeout": 600,
     "playlist_save_retries": 3,
     "artist_save_timeout": 900,
@@ -474,13 +474,38 @@ ACTIONS = {
     "artists-sync": (["artists-sync"], "Sync all artists"),
     "artists-sync-new": (["artists-sync", "--new-only"], "Sync new artists"),
     "reconcile": (["reconcile"], "Reconcile files"),
+    "migrate-structure": (["migrate-structure"], "Migrate library structure"),
     "fix-metadata": (["fix-metadata"], "Fix metadata"),
     "full": ([], "Full sync"),
 }
 
 
 @app.post("/api/actions/{action}")
-async def api_action(action: str):
+async def api_action(action: str, request: Request):
+    if action == "sync-playlist":
+        try:
+            body = await request.json()
+            url = body.get("url", "")
+            if not url:
+                return JSONResponse({"error": "missing url"}, status_code=400)
+            label = "Sync playlist"
+            asyncio.create_task(bus.run([sys.executable, str(PY_SCRIPT), "sync-playlist", url], label))
+            return {"ok": True, "label": label}
+        except Exception:
+            return JSONResponse({"error": "invalid payload"}, status_code=400)
+
+    if action == "download":
+        try:
+            body = await request.json()
+            url = body.get("url", "")
+            if not url:
+                return JSONResponse({"error": "missing url"}, status_code=400)
+            label = "Direct download"
+            asyncio.create_task(bus.run([sys.executable, str(PY_SCRIPT), "download", url], label))
+            return {"ok": True, "label": label}
+        except Exception:
+            return JSONResponse({"error": "invalid payload"}, status_code=400)
+
     if action not in ACTIONS:
         return JSONResponse({"error": "unknown action"}, status_code=404)
     sub, label = ACTIONS[action]
@@ -904,10 +929,16 @@ HTML = r"""<!doctype html>
         <button class="btn ghost" onclick="action('artists-sync-new')">✨ Sync New</button>
         <button class="btn ghost" onclick="action('artists-sync')">🔄 Sync All</button>
         <button class="btn ghost" onclick="action('reconcile')">🔗 Reconcile</button>
+        <button class="btn ghost" onclick="action('migrate-structure')">📁 Migrate Structure</button>
         <button class="btn ghost" onclick="action('fix-metadata')">🏷️ Fix Metadata</button>
         <button class="btn danger" onclick="stop()">⛔ Stop</button>
       </div>
-      <div class="hint">Music folder: <span id="musicDirHint" class="muted">—</span></div>
+      <div class="gradient-sep"></div>
+      <div class="row">
+        <input id="directDownloadUrl" placeholder="Direct Download (Spotify/YT URL) - no DB checks" style="flex:1"/>
+        <button class="btn ghost" onclick="downloadDirect()">⬇️ Download directly</button>
+      </div>
+      <div class="hint" style="margin-top:12px">Music folder: <span id="musicDirHint" class="muted">—</span></div>
     </div>
   </section>
 
@@ -965,7 +996,7 @@ HTML = r"""<!doctype html>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
-      <table><thead><tr><th>Playlist</th><th>Status</th><th>Last scan</th><th></th></tr></thead>
+      <table><thead><tr><th>Playlist</th><th>Status</th><th>Last scan</th><th>Actions</th></tr></thead>
       <tbody id="playlistRows"></tbody></table>
     </div>
   </section>
@@ -1131,6 +1162,7 @@ async function loadPlaylists(){
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
     return `<tr><td><a href="${esc(r.url)}" target="_blank">${esc(r.name)}</a></td><td>${act}</td><td class="muted">${(r.last_synced||'-').slice(0,10)}</td>
       <td class="row" style="border:none">
+        <button class="btn ghost sm" onclick="syncPl('${r.url}')">Sync</button>
         <button class="btn ghost sm" onclick="togglePl('${r.spotify_id}')">${r.active?'Off':'On'}</button>
         <button class="btn danger sm" onclick="delPl('${r.spotify_id}')">×</button>
       </td></tr>`;
@@ -1142,6 +1174,11 @@ async function addPlaylist(){
   if(r.error){toast(r.error);return;}
   $('#plName').value='';$('#plUrl').value='';loadPlaylists();toast('Added');
 }
+async function syncPl(url){
+  const r=await api('/api/actions/sync-playlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+  if(r.error){toast(r.error);return;}
+  toast('Started: '+r.label);showConsole();
+}
 async function togglePl(id){await api(`/api/playlists/${id}/toggle`,{method:'POST'});loadPlaylists();}
 async function delPl(id){if(!confirm('Remove?'))return;await api(`/api/playlists/${id}`,{method:'DELETE'});loadPlaylists();}
 async function loadTracks(){
@@ -1152,6 +1189,13 @@ async function loadTracks(){
   $('#trackHint').textContent=rows.length+' files shown';
 }
 async function action(a){const r=await api('/api/actions/'+a,{method:'POST'});toast('Started: '+(r.label||a));showConsole();}
+async function downloadDirect(){
+  const url=$('#directDownloadUrl').value.trim();if(!url)return;
+  const r=await api('/api/actions/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+  if(r.error){toast(r.error);return;}
+  $('#directDownloadUrl').value='';
+  toast('Started: '+r.label);showConsole();
+}
 async function stop(){await api('/api/stop',{method:'POST'});toast('Stop requested');}
 function showConsole(){document.querySelector('nav button[data-tab="console"]').click();}
 function clearConsole(){$('#consoleOut').innerHTML='';}
