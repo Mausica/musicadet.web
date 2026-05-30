@@ -1,0 +1,16 @@
+[Unit]
+Description=Music Sync - Spotify playlists + artist discographies via spotDL
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/music-sync
+ExecStart=/usr/bin/python3 /opt/music-sync/music_sync.py
+User=root
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=21600

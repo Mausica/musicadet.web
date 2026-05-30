@@ -1,0 +1,5 @@
+music.db
+music.db-wal
+music.db-shm
+sync-data/*.spotdl
+__pycache__/

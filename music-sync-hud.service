@@ -1,0 +1,17 @@
+[Unit]
+Description=Audio Alchemist HUD - web dashboard for music-sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/music-sync
+ExecStart=/usr/bin/python3 -m uvicorn hud:app --host 0.0.0.0 --port 8800
+Restart=on-failure
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

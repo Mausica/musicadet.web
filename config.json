@@ -1,0 +1,17 @@
+{
+  "music_dir": "/mnt/storage_jellyfin/media/music/spotify",
+  "sync_dir": "/opt/music-sync/sync-data",
+  "db_path":  "/opt/music-sync/music.db",
+  "log_dir":  "/var/log/music-sync",
+  "format":   "opus",
+  "bitrate":  "auto",
+  "threads":  4,
+  "output_template": "{album-artist}/{album}/{track-number} - {title}.{output-ext}",
+  "hud_port": 8800,
+  "playlists": [
+    { "name": "Today's Top Hits",     "url": "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M" },
+    { "name": "Top 50 Romania",       "url": "https://open.spotify.com/playlist/37i9dQZEVXbNZbJ6TZelCq" },
+    { "name": "Top 50 Global",        "url": "https://open.spotify.com/playlist/37i9dQZEVXbMDoHDwVN2tF" },
+    { "name": "Top melodii Romania",  "url": "https://open.spotify.com/playlist/37i9dQZEVXbMeCoUmQDLUW" }
+  ]
+}
