@@ -17,14 +17,26 @@ echo "==> Installing prerequisites (git, curl)..."
 apt-get update -qq
 apt-get install -y -qq git curl ca-certificates >/dev/null
 
-if [[ -d "$INSTALL_DIR/.git" ]]; then
-  echo "==> Updating repo..."
+update_repo() {
+  echo "==> Updating repo in $INSTALL_DIR (discarding local changes)..."
   git -C "$INSTALL_DIR" fetch origin main
   git -C "$INSTALL_DIR" reset --hard origin/main
   git -C "$INSTALL_DIR" clean -fd
-else
-  echo "==> Cloning into $INSTALL_DIR..."
+}
+
+fresh_clone() {
+  echo "==> Cloning fresh copy into $INSTALL_DIR..."
+  rm -rf "$INSTALL_DIR"
   git clone --depth 1 --branch main "$REPO_URL" "$INSTALL_DIR"
+}
+
+if [[ -d "$INSTALL_DIR/.git" ]]; then
+  if ! update_repo; then
+    echo "==> Update failed — re-cloning..."
+    fresh_clone
+  fi
+else
+  fresh_clone
 fi
 
 # Backward-compatible symlink for older configs that reference /opt/music-sync
