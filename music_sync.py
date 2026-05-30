@@ -1066,6 +1066,10 @@ def cmd_sync_playlist(args):
 
             log.info("[%d/%d] %s — %s", idx, len(songs), primary_artist, title)
 
+            # Detect Singles
+            if _clean_filename(album).lower() == _clean_filename(title).lower() or not album:
+                album = "Singles"
+
             # Check if already downloaded
             if song_id:
                 row = db.execute(
@@ -1074,11 +1078,13 @@ def cmd_sync_playlist(args):
                 if row and row["status"] == "downloaded" and row["file_path"]:
                     fp = Path(row["file_path"])
                     if not fp.is_absolute():
-                        fp = music_dir / fp
+                        fp = Path(CFG["music_dir"]) / fp
                     if fp.exists():
                         log.info("    ✓ Already downloaded")
                         ok += 1
                         continue
+
+            log.info("[%d/%d] %s — %s", idx, len(songs), primary_artist, title)
 
             path = downloader.download_track(
                 artist=primary_artist,
@@ -1158,6 +1164,9 @@ def cmd_download_direct(args):
             track_num = _track_number_from_song(song)
             yt_url = song.get("download_url") or song.get("youtube_url")
 
+            if _clean_filename(album).lower() == _clean_filename(title).lower() or not album:
+                album = "Singles"
+
             log.info("[%d/%d] %s — %s", idx, len(songs), primary_artist, title)
             path = downloader.download_track(
                 artist=primary_artist, title=title, album=album, track_number=track_num, yt_url=yt_url
@@ -1190,6 +1199,9 @@ def cmd_download_direct(args):
             artist = entry.get("artist") or entry.get("uploader", "Unknown Artist")
             album = entry.get("album") or "Unknown Album"
             track_num = None  # flat extraction usually doesn't give track numbers
+
+            if _clean_filename(album).lower() == _clean_filename(title).lower() or album == "Unknown Album":
+                album = "Singles"
 
             # Strip "- Topic" from YouTube artist names
             if artist.endswith(" - Topic"):

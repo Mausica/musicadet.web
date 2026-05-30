@@ -431,8 +431,8 @@ def migrate_structure(db_path: Path, music_dir: Path):
         if not artist_folder.is_dir():
             continue
 
-        # Find audio files directly inside artist_folder (ignoring subdirectories which are albums)
-        for f in artist_folder.iterdir():
+        # Find ALL audio files inside artist_folder recursively
+        for f in artist_folder.rglob("*"):
             if not f.is_file() or f.suffix.lower() not in audio_exts:
                 continue
 
@@ -455,6 +455,19 @@ def migrate_structure(db_path: Path, music_dir: Path):
                 safe_album = _clean_filename(album)
                 safe_title = _clean_filename(title)
 
+                # Group singles/unknowns together to prevent thousands of 1-song album folders
+                if safe_album.lower() == safe_title.lower() or safe_album in ("Unknown Album", ""):
+                    safe_album = "Singles"
+                    
+                    # Update the tag inside the file so other players know it's a Single
+                    try:
+                        audio = mutagen.File(f, easy=True)
+                        if audio:
+                            audio["album"] = "Singles"
+                            audio.save()
+                    except Exception:
+                        pass
+
                 album_folder = artist_folder / safe_album
                 album_folder.mkdir(parents=True, exist_ok=True)
                 
@@ -464,6 +477,15 @@ def migrate_structure(db_path: Path, music_dir: Path):
                     shutil.move(str(f), str(dst))
                     log.info("Moved: %s → %s", f.name, dst.relative_to(music_dir))
                     migrated += 1
+                    
+                    # Clean up old empty folder if this was a 1-song album folder
+                    old_parent = f.parent
+                    if old_parent != artist_folder and not any(old_parent.iterdir()):
+                        try:
+                            old_parent.rmdir()
+                        except OSError:
+                            pass
+
             except Exception as e:
                 log.error("Failed to move %s: %s", f.name, e)
 
