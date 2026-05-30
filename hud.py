@@ -531,25 +531,34 @@ HTML = r"""<!doctype html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
   :root {
-    --bg: #0a0a0f;
-    --bg-card: rgba(255, 255, 255, 0.03);
-    --border-card: rgba(255, 255, 255, 0.06);
-    --primary: #8b5cf6;
-    --primary-grad: linear-gradient(135deg, #8b5cf6, #6366f1);
-    --accent: #a78bfa;
-    --success: #34d399;
-    --warning: #fbbf24;
+    --bg: #000000;
+    --bg-card: rgba(255, 255, 255, 0.02);
+    --border-card: rgba(255, 255, 255, 0.08);
+    --primary: #ffffff;
+    --primary-grad: #ffffff;
+    --accent: #a1a1aa;
+    --success: #4ade80;
+    --warning: #facc15;
     --error: #f87171;
-    --txt: #f1f5f9;
-    --muted: #94a3b8;
+    --txt: #fafafa;
+    --muted: #a1a1aa;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
     font: 14px/1.6 'Inter', system-ui, -apple-system, sans-serif;
     color: var(--txt);
-    background: radial-gradient(1000px 600px at 50% -10%, rgba(139, 92, 246, 0.15), transparent 70%), var(--bg);
+    background: radial-gradient(1000px 600px at 50% -10%, rgba(255, 255, 255, 0.03), transparent 70%), var(--bg);
     min-height: 100vh;
+  }
+  a {
+    color: var(--txt);
+    text-decoration: none;
+    transition: color 0.2s ease;
+  }
+  a:hover {
+    color: #ffffff;
+    text-decoration: underline;
   }
   header {
     position: relative;
@@ -557,7 +566,7 @@ HTML = r"""<!doctype html>
     top: 0;
     z-index: 20;
     backdrop-filter: blur(20px);
-    background: rgba(10, 10, 15, 0.75);
+    background: rgba(0, 0, 0, 0.85);
     border-bottom: 1px solid var(--border-card);
     padding: 16px 24px;
     display: flex;
@@ -570,16 +579,14 @@ HTML = r"""<!doctype html>
     top: 0;
     left: 0;
     right: 0;
-    height: 3px;
-    background: linear-gradient(90deg, #8b5cf6, #6366f1, #34d399);
+    height: 1px;
+    background: var(--border-card);
   }
   .logo {
     font-weight: 700;
     font-size: 19px;
     letter-spacing: -.02em;
-    background: linear-gradient(135deg, #a78bfa, #8b5cf6, #6366f1);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    color: #ffffff;
   }
   .dot {
     width: 8px;
@@ -653,22 +660,15 @@ HTML = r"""<!doctype html>
     transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
   }
   .card:hover {
-    border-color: rgba(139, 92, 246, 0.2);
+    border-color: rgba(255, 255, 255, 0.2);
   }
   .stat {
-    border-left: 3px solid var(--primary);
+    border-left: 3px solid var(--border-card);
   }
-  .stat:nth-child(2) { border-left-color: #6366f1; }
-  .stat:nth-child(3) { border-left-color: var(--accent); }
-  .stat:nth-child(4) { border-left-color: var(--success); }
-  .stat:nth-child(5) { border-left-color: var(--warning); }
-  .stat:nth-child(6) { border-left-color: var(--error); }
-  .stat:nth-child(7) { border-left-color: #f472b6; }
-  .stat:nth-child(8) { border-left-color: #60a5fa; }
-  .stat:nth-child(9) { border-left-color: #34d399; }
   .stat:hover {
+    border-left-color: var(--primary);
     transform: translateY(-2px);
-    box-shadow: 0 4px 20px rgba(139, 92, 246, 0.08);
+    box-shadow: 0 4px 20px rgba(255, 255, 255, 0.02);
   }
   .stat .n {
     font-size: 28px;
@@ -689,7 +689,7 @@ HTML = r"""<!doctype html>
     padding: 10px 18px;
     font: 600 13px 'Inter', sans-serif;
     cursor: pointer;
-    color: #fff;
+    color: #000000;
     background: var(--primary-grad);
     display: inline-flex;
     align-items: center;
@@ -698,7 +698,8 @@ HTML = r"""<!doctype html>
   }
   .btn:hover {
     transform: scale(1.02);
-    box-shadow: 0 4px 12px rgba(139, 92, 246, 0.25);
+    background: #e4e4e7;
+    box-shadow: 0 4px 12px rgba(255, 255, 255, 0.15);
   }
   .btn.ghost {
     background: transparent;
@@ -707,7 +708,7 @@ HTML = r"""<!doctype html>
   }
   .btn.ghost:hover {
     border-color: var(--primary);
-    background: rgba(139, 92, 246, 0.08);
+    background: rgba(255, 255, 255, 0.06);
   }
   .btn.sm {
     padding: 6px 12px;
@@ -743,7 +744,7 @@ HTML = r"""<!doctype html>
   input:focus, select:focus, textarea:focus {
     border-color: var(--primary);
     background: rgba(255, 255, 255, 0.06);
-    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15);
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.1);
   }
   input {
     flex: 1;
@@ -778,7 +779,7 @@ HTML = r"""<!doctype html>
     border-bottom: none;
   }
   tr:hover td {
-    background: rgba(139, 92, 246, 0.02);
+    background: rgba(255, 255, 255, 0.02);
   }
   .pill {
     display: inline-block;
@@ -800,9 +801,9 @@ HTML = r"""<!doctype html>
     box-shadow: 0 0 10px rgba(248, 113, 113, 0.05);
   }
   .pill.done {
-    background: rgba(139, 92, 246, 0.15);
-    color: var(--accent);
-    box-shadow: 0 0 10px rgba(139, 92, 246, 0.05);
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--txt);
+    box-shadow: none;
   }
   .pill.pend {
     background: rgba(251, 191, 36, 0.1);
@@ -843,8 +844,8 @@ HTML = r"""<!doctype html>
     position: fixed;
     bottom: 20px;
     right: 20px;
-    background: var(--primary-grad);
-    color: #fff;
+    background: var(--txt);
+    color: #000000;
     padding: 12px 20px;
     border-radius: 10px;
     font-weight: 600;
@@ -853,7 +854,7 @@ HTML = r"""<!doctype html>
     opacity: 0;
     transform: translateY(10px);
     transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-    box-shadow: 0 8px 30px rgba(139, 92, 246, 0.3);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
   }
   .toast.show { opacity: 1; transform: none; }
   .progress {
@@ -863,7 +864,7 @@ HTML = r"""<!doctype html>
   }
   .gradient-sep {
     height: 1px;
-    background: linear-gradient(90deg, transparent, var(--border-card), transparent);
+    background: var(--border-card);
     margin: 20px 0;
   }
   section:not(.hide) {
@@ -1086,7 +1087,7 @@ async function loadLibrary(){
   const rows=await api(url);
   $('#libRows').innerHTML=rows.map(r=>{
     const pct=r.track_count?Math.round(100*r.downloaded_count/r.track_count):0;
-    const bar=`<div style="height:4px;background:rgba(139,92,246,.15);border-radius:99px;overflow:hidden;width:60px;display:inline-block;vertical-align:middle;margin-left:6px"><div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#8b5cf6,#34d399);border-radius:99px"></div></div>`;
+    const bar=`<div style="height:4px;background:rgba(255,255,255,.1);border-radius:99px;overflow:hidden;width:60px;display:inline-block;vertical-align:middle;margin-left:6px"><div style="height:100%;width:${pct}%;background:#ffffff;border-radius:99px"></div></div>`;
     const pill=r.downloaded_count>=r.track_count&&r.track_count>0?'<span class="pill done">done</span>':'<span class="pill pend">'+pct+'%</span>';
     return `<tr><td>${esc(r.artist_name)}</td><td>${esc(r.name)}</td><td class="progress">${r.downloaded_count}/${r.track_count} ${bar} ${pill}</td>
       <td><button class="btn ghost sm" onclick="showSongs('${r.spotify_id}','${esc(r.name)}')">Songs</button></td></tr>`;
@@ -1166,9 +1167,9 @@ function connectWS(){
     d.textContent=text;
     if(/ERROR|✗|failed|error/i.test(text)) d.style.color='#f87171';
     else if(/WARN|WARNING/i.test(text)) d.style.color='#fbbf24';
-    else if(/===/.test(text)) d.style.color='#8b5cf6';
+    else if(/===/.test(text)) d.style.color='#ffffff';
     else if(/✓|done|complete|ok/i.test(text)) d.style.color='#34d399';
-    else if(/\[\d+\/\d+\]/.test(text)) d.style.color='#a78bfa';
+    else if(/\[\d+\/\d+\]/.test(text)) d.style.color='#ffffff';
     out.appendChild(d);
     while(out.childNodes.length>1200)out.removeChild(out.firstChild);
     if(autoscroll)out.scrollTop=out.scrollHeight;
