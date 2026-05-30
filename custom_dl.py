@@ -208,9 +208,8 @@ class YtDlpDownloader:
         album_folder = artist_folder / _clean_filename(album) if album else artist_folder
         album_folder.mkdir(parents=True, exist_ok=True)
 
-        trk = str(track_number).zfill(2) if track_number else "00"
         safe_title = _clean_filename(title)
-        out_path = album_folder / f"{trk} - {safe_title}.{self.fmt}"
+        out_path = album_folder / f"{safe_title}.{self.fmt}"
 
         if out_path.exists():
             log.info("    ↳ Already exists: %s", out_path.name)
@@ -239,7 +238,7 @@ class YtDlpDownloader:
             return None
 
         # yt-dlp might have written a slightly different extension; locate the file
-        actual = self._find_downloaded(album_folder, safe_title, trk)
+        actual = self._find_downloaded(album_folder, safe_title)
         if actual is None:
             log.warning("    ✗ File not found after download: %s", out_path)
             return None
@@ -250,15 +249,11 @@ class YtDlpDownloader:
 
         return out_path
 
-    def _find_downloaded(self, folder: Path, safe_title: str, trk: str) -> Optional[Path]:
+    def _find_downloaded(self, folder: Path, safe_title: str) -> Optional[Path]:
         """Locate the file yt-dlp wrote (may be .webm, .m4a before conversion)."""
         audio_exts = {".opus", ".webm", ".m4a", ".mp3", ".ogg"}
         for f in folder.iterdir():
             if f.suffix.lower() in audio_exts and safe_title.lower() in f.stem.lower():
-                return f
-        # Try by track prefix
-        for f in folder.iterdir():
-            if f.stem.startswith(trk) and f.suffix.lower() in audio_exts:
                 return f
         return None
 
@@ -467,8 +462,7 @@ def migrate_structure(db_path: Path, music_dir: Path):
         # Build destination
         album_folder = artist_folder / _clean_filename(s["album_name"])
         album_folder.mkdir(parents=True, exist_ok=True)
-        trk = str(s["track_number"]).zfill(2) if s["track_number"] else "00"
-        dst = album_folder / f"{trk} - {_clean_filename(s['title'])}{src.suffix}"
+        dst = album_folder / f"{_clean_filename(s['title'])}{src.suffix}"
 
         if src != dst:
             shutil.move(str(src), str(dst))

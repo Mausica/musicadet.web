@@ -923,20 +923,20 @@ HTML = r"""<!doctype html>
     <div class="card">
       <h2>Actions</h2>
       <div class="actions">
-        <button class="btn" onclick="action('full')">⚡ Full Sync</button>
-        <button class="btn ghost" onclick="action('scan')">🔍 Scan Playlists</button>
-        <button class="btn ghost" onclick="action('scan-artists')">📀 Scan Albums</button>
-        <button class="btn ghost" onclick="action('artists-sync-new')">✨ Sync New</button>
-        <button class="btn ghost" onclick="action('artists-sync')">🔄 Sync All</button>
-        <button class="btn ghost" onclick="action('reconcile')">🔗 Reconcile</button>
-        <button class="btn ghost" onclick="action('migrate-structure')">📁 Migrate Structure</button>
-        <button class="btn ghost" onclick="action('fix-metadata')">🏷️ Fix Metadata</button>
-        <button class="btn danger" onclick="stop()">⛔ Stop</button>
+        <button class="btn" onclick="action('full')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg> Full Sync</button>
+        <button class="btn ghost" onclick="action('scan')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg> Scan Playlists</button>
+        <button class="btn ghost" onclick="action('scan-artists')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="3"></circle></svg> Scan Albums</button>
+        <button class="btn ghost" onclick="action('artists-sync-new')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></svg> Sync New</button>
+        <button class="btn ghost" onclick="action('artists-sync')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg> Sync All</button>
+        <button class="btn ghost" onclick="action('reconcile')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg> Reconcile</button>
+        <button class="btn ghost" onclick="action('migrate-structure')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Migrate Structure</button>
+        <button class="btn ghost" onclick="action('fix-metadata')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg> Fix Metadata</button>
+        <button class="btn danger" onclick="stop()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"></polygon><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg> Stop</button>
       </div>
       <div class="gradient-sep"></div>
       <div class="row">
         <input id="directDownloadUrl" placeholder="Direct Download (Spotify/YT URL) - no DB checks" style="flex:1"/>
-        <button class="btn ghost" onclick="downloadDirect()">⬇️ Download directly</button>
+        <button class="btn ghost" onclick="downloadDirect()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download directly</button>
       </div>
       <div class="hint" style="margin-top:12px">Music folder: <span id="musicDirHint" class="muted">—</span></div>
     </div>
