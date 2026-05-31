@@ -673,10 +673,9 @@ def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
         log.info("  → Skipping local artist catalog scan: %s", name)
         return 0, 0
 
-    target = _artist_target(sid, name)
-    timeout = int(CFG.get("artist_save_timeout", 900))
-
-    songs = spotdl_save(target, timeout=timeout)
+    import ytm_scanner
+    songs = ytm_scanner.scan_artist(name)
+    
     if not songs:
         log.warning("  → No songs returned for %s", name)
         return 0, 0
@@ -895,6 +894,11 @@ def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total:
         yt_url = yt_url_map.get(s["spotify_id"])
         track_num = s["track_number"]
         album_name = s["album_name"] or "Unknown Album"
+        
+        # If spotify_id is 11 chars (YouTube videoId) and doesn't contain colon, use it directly
+        s_id = s["spotify_id"]
+        if len(s_id) == 11 and ":" not in s_id:
+            yt_url = f"https://music.youtube.com/watch?v={s_id}"
 
         # Check if file already exists on disk
         safe_artist = custom_dl._clean_filename(name)
@@ -983,23 +987,8 @@ def cmd_artists_sync(args):
     for i, a in enumerate(artists, 1):
         sid, name = a["spotify_id"], a["name"]
 
-        if sid.startswith("local:"):
-            log.info("[%d/%d] Skipping SpotDL fetch for local artist: %s", i, total, name)
-            songs = []
-        else:
-            target = _artist_target(sid, name)
-            # Step 1: SpotDL fetch → JSON
-            log.info("[%d/%d] Fetching Spotify metadata: %s", i, total, name)
-            songs = spotdl_save(target, timeout=int(CFG.get("artist_save_timeout", 900)))
-            if songs:
-                with db_connect() as db:
-                    _upsert_artist_catalog(db, sid, songs)
-            else:
-                log.warning("  → No songs from SpotDL for %s — will still try DB pending", name)
-                songs = []
-
         # Step 2: Download pending tracks + album completeness check
-        result = _sync_artist_with_ytdlp(sid, name, songs, i, total)
+        result = _sync_artist_with_ytdlp(sid, name, [], i, total)
         if result:
             ok += 1
         else:
