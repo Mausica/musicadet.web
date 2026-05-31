@@ -487,20 +487,29 @@ def api_track_info(path: str):
             if hasattr(audio, "info") and audio.info:
                 info["bitrate"] = getattr(audio.info, "bitrate", 0)
                 info["length"] = getattr(audio.info, "length", 0)
+            
+            # Calculate bitrate manually if Mutagen failed to provide it
+            if not info["bitrate"] and info["length"] > 0:
+                import os
+                size_bytes = os.path.getsize(full_path)
+                info["bitrate"] = int((size_bytes * 8) / info["length"])
+                
             if audio.tags:
                 tags = audio.tags
                 if full_path.suffix.lower() == ".opus":
                     info["title"] = tags.get("title", [info["title"]])[0]
                     info["artist"] = tags.get("artist", [""])[0]
                     info["album"] = tags.get("album", [""])[0]
-                    info["year"] = tags.get("date", [""])[0]
+                    year_str = tags.get("date", [""])[0]
+                    info["year"] = year_str[:4] if year_str else ""
                     info["genre"] = tags.get("genre", [""])[0]
                     info["has_cover"] = "metadata_block_picture" in tags
                 elif full_path.suffix.lower() == ".mp3":
                     info["title"] = str(tags.get("TIT2", info["title"]))
                     info["artist"] = str(tags.get("TPE1", ""))
                     info["album"] = str(tags.get("TALB", ""))
-                    info["year"] = str(tags.get("TDRC", ""))
+                    year_str = str(tags.get("TDRC", ""))
+                    info["year"] = year_str[:4] if year_str else ""
                     info["genre"] = str(tags.get("TCON", ""))
                     info["has_cover"] = any(k.startswith("APIC") for k in tags)
     except Exception:
@@ -1182,7 +1191,7 @@ HTML = r"""<!doctype html>
     <div class="modal-body" style="display:flex; gap:24px;">
       <img id="tmCover" src="" style="width:200px; height:200px; object-fit:cover; border-radius:12px; background:#111; border: 1px solid var(--border-card);" />
       <div style="flex:1;">
-        <h2 id="tmTitle" style="margin-top:0; font-size:28px; line-height:1.1; margin-bottom:16px; font-family: 'Brush Script MT', cursive, sans-serif; background: linear-gradient(135deg, #fff 0%, #a1a1aa 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;"></h2>
+        <h2 id="tmTitle" style="margin-top:0; font-size:22px; font-weight:800; line-height:1.3; margin-bottom:16px; font-family: 'Inter', sans-serif; background: linear-gradient(135deg, #fff 0%, #a1a1aa 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; text-overflow:ellipsis;"></h2>
         <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Artist</label><div id="tmArtist" class="val" style="font-family:'Inter', sans-serif"></div></div>
         <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Album</label><div id="tmAlbum" class="val" style="font-family:'Inter', sans-serif"></div></div>
         <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Genre</label><div id="tmGenre" class="val" style="font-family:'Inter', sans-serif"></div></div>

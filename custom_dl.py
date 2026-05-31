@@ -68,12 +68,49 @@ def _fetch_itunes_cover(artist: str, title: str) -> tuple[Optional[bytes], Optio
                 img_url = result.get("artworkUrl100", "").replace("100x100bb.jpg", "600x600bb.jpg")
                 year = result.get("releaseDate", "")[:4] if "releaseDate" in result else None
                 genre = result.get("primaryGenreName")
+                if genre and genre.lower() in ("music", "music videos", "music video"):
+                    genre = None
                 if img_url:
                     with urllib.request.urlopen(img_url, timeout=5) as ir:
                         return ir.read(), year, genre
                 return None, year, genre
     except Exception as e:
         log.debug("iTunes metadata fetch failed for %s - %s: %s", artist, title, e)
+    return None, None, None
+
+def _fetch_youtube_metadata(artist: str, title: str) -> tuple[Optional[bytes], Optional[str], Optional[str]]:
+    if yt_dlp is None:
+        return None, None, None
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            query = f"ytsearch1:{artist} {title} audio"
+            info = ydl.extract_info(query, download=False)
+            if info and info.get("entries"):
+                entry = info["entries"][0]
+                img_data = None
+                thumbnails = entry.get("thumbnails", [])
+                if thumbnails:
+                    best = sorted(thumbnails, key=lambda t: t.get("width", 0) or 0, reverse=True)[0]
+                    img_url = best.get("url")
+                    if img_url:
+                        import urllib.request
+                        try:
+                            req = urllib.request.Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(req, timeout=5) as ir:
+                                img_data = ir.read()
+                        except: pass
+                
+                # YouTube stores upload_date as YYYYMMDD
+                year = entry.get("upload_date", "")[:4] if entry.get("upload_date") else None
+                genre = None # extract_flat doesn't usually provide reliable genres
+                return img_data, year, genre
+    except Exception as e:
+        log.debug("YouTube metadata fetch failed for %s - %s: %s", artist, title, e)
     return None, None, None
 
 def enforce_primary_artist(
@@ -105,6 +142,11 @@ def enforce_primary_artist(
             
             if fetch_cover and "metadata_block_picture" not in audio:
                 img_data, year, genre = _fetch_itunes_cover(primary_artist, title)
+                if not img_data:
+                    y_img, y_year, y_genre = _fetch_youtube_metadata(primary_artist, title)
+                    img_data = img_data or y_img
+                    year = year or y_year
+                    genre = genre or y_genre
                 if year:
                     audio["date"] = [str(year)]
                 if genre:
@@ -137,6 +179,11 @@ def enforce_primary_artist(
             
             if fetch_cover and not audio.getall("APIC"):
                 img_data, year, genre = _fetch_itunes_cover(primary_artist, title)
+                if not img_data:
+                    y_img, y_year, y_genre = _fetch_youtube_metadata(primary_artist, title)
+                    img_data = img_data or y_img
+                    year = year or y_year
+                    genre = genre or y_genre
                 if year:
                     from mutagen.id3 import TDRC
                     audio.add(TDRC(encoding=3, text=str(year)))
