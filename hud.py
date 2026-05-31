@@ -204,6 +204,14 @@ class ArtistIn(BaseModel):
     entry: str
 
 
+class BulkArtistsIn(BaseModel):
+    ids: list[str] = []
+    action: str
+    q: str = ""
+    status: str = "all"
+    limit: Optional[int] = None
+
+
 class PlaylistIn(BaseModel):
     name: str
     url: str
@@ -352,13 +360,22 @@ def api_artist_names():
         ]
 
 
+_ARTIST_SORT = {
+    "name": "a.name COLLATE NOCASE",
+    "songs_desc": "songs_total DESC, a.name COLLATE NOCASE",
+    "songs_asc": "songs_total ASC, a.name COLLATE NOCASE",
+}
+
+
 @app.get("/api/artists")
 def api_artists(
     q: str = "",
     status: str = "all",
+    sort: str = "name",
     offset: int = Query(0, ge=0),
     limit: int = Query(80, ge=1, le=500),
 ):
+    order_by = _ARTIST_SORT.get(sort, _ARTIST_SORT["name"])
     where, params = _artist_filters(q, status)
     clause = " WHERE " + " AND ".join(where) if where else ""
     base_from = f"""
@@ -381,7 +398,7 @@ def api_artists(
                COALESCE(sc.songs_dl, 0) AS songs_dl,
                COALESCE(sc.songs_total, 0) AS songs_total
         {base_from}
-        ORDER BY a.name COLLATE NOCASE
+        ORDER BY {order_by}
         LIMIT ? OFFSET ?
     """
     count_sql = f"SELECT COUNT(*) {base_from}"
@@ -389,7 +406,7 @@ def api_artists(
         total = conn.execute(count_sql, params).fetchone()[0]
         rows = [dict(r) for r in conn.execute(sql, params + [limit, offset]).fetchall()]
     _cap_artist_song_counts(rows)
-    return {"items": rows, "total": total}
+    return {"items": rows, "total": total, "sort": sort}
 
 
 @app.get("/api/albums")
@@ -451,6 +468,88 @@ def api_songs(album_id: str = "", artist_id: str = "", status: str = "all", limi
     params.append(limit)
     with db() as conn:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+@app.get("/api/db/summary")
+def api_db_summary():
+    with db() as conn:
+        def one(sql: str, params: tuple = ()) -> int:
+            return conn.execute(sql, params).fetchone()[0]
+
+        incomplete = one(
+            "SELECT COUNT(*) FROM albums WHERE track_count > 0 AND downloaded_count < track_count"
+        )
+        return {
+            "artists_total": one("SELECT COUNT(*) FROM artists WHERE active >= 0"),
+            "artists_active": one("SELECT COUNT(*) FROM artists WHERE active = 1"),
+            "artists_disabled": one("SELECT COUNT(*) FROM artists WHERE active = 0"),
+            "artists_pending_sync": one(
+                "SELECT COUNT(*) FROM artists WHERE active = 1 AND sync_done = 0"
+            ),
+            "artists_romanian": one("SELECT COUNT(*) FROM artists WHERE is_romanian = 1"),
+            "albums_total": one("SELECT COUNT(*) FROM albums"),
+            "albums_incomplete": incomplete,
+            "songs_total": one("SELECT COUNT(*) FROM songs"),
+            "songs_pending": one("SELECT COUNT(*) FROM songs WHERE status = 'pending'"),
+            "songs_failed": one("SELECT COUNT(*) FROM songs WHERE status = 'failed'"),
+            "playlists_active": one("SELECT COUNT(*) FROM playlists WHERE active = 1"),
+        }
+
+
+@app.post("/api/artists/bulk")
+def api_bulk_artists(body: BulkArtistsIn):
+    allowed = {"enable", "disable", "ro_on", "ro_off", "limit"}
+    if body.action not in allowed:
+        return JSONResponse({"error": "invalid action"}, status_code=400)
+
+    with db() as conn:
+        if body.ids:
+            target_ids = list(dict.fromkeys(body.ids))
+        else:
+            where, params = _artist_filters(body.q, body.status)
+            clause = " WHERE " + " AND ".join(where) if where else ""
+            target_ids = [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT spotify_id FROM artists a{clause}", params
+                ).fetchall()
+            ]
+        if not target_ids:
+            return {"ok": True, "updated": 0}
+
+        placeholders = ",".join("?" * len(target_ids))
+        if body.action == "enable":
+            conn.execute(
+                f"UPDATE artists SET active=1 WHERE spotify_id IN ({placeholders})",
+                target_ids,
+            )
+        elif body.action == "disable":
+            conn.execute(
+                f"UPDATE artists SET active=0 WHERE spotify_id IN ({placeholders})",
+                target_ids,
+            )
+        elif body.action == "ro_on":
+            conn.execute(
+                f"UPDATE artists SET is_romanian=1, romanian_manual=1 WHERE spotify_id IN ({placeholders})",
+                target_ids,
+            )
+        elif body.action == "ro_off":
+            conn.execute(
+                f"UPDATE artists SET is_romanian=0, romanian_manual=1 WHERE spotify_id IN ({placeholders})",
+                target_ids,
+            )
+        elif body.action == "limit":
+            if body.limit is None:
+                conn.execute(
+                    f"UPDATE artists SET max_downloads=NULL WHERE spotify_id IN ({placeholders})",
+                    target_ids,
+                )
+            else:
+                conn.execute(
+                    f"UPDATE artists SET max_downloads=? WHERE spotify_id IN ({placeholders})",
+                    [int(body.limit)] + target_ids,
+                )
+    return {"ok": True, "updated": len(target_ids)}
 
 
 @app.post("/api/artists")
@@ -625,7 +724,10 @@ def api_tracks(
     q: str = "",
     offset: int = Query(0, ge=0),
     limit: int = Query(80, ge=1, le=500),
+    refresh: bool = False,
 ):
+    if refresh:
+        _tracks_index_cache["ts"] = 0.0
     needle = q.lower().strip()
     items = _tracks_index()
     if needle:
@@ -1352,6 +1454,38 @@ HTML = r"""<!doctype html>
     color: var(--muted);
     margin-left: 8px;
   }
+  .db-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-card);
+    border-radius: 10px;
+  }
+  .db-summary b { color: var(--txt); font-weight: 600; }
+  .bulk-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    background: rgba(0, 87, 183, 0.08);
+    border: 1px solid rgba(0, 87, 183, 0.35);
+    border-radius: 10px;
+  }
+  .bulk-bar .bulk-count {
+    font-size: 12px;
+    font-weight: 600;
+    margin-right: 8px;
+    color: #9ec5ff;
+  }
+  .chk-col { width: 32px; text-align: center; }
+  input.art-chk { width: auto; min-width: 0; padding: 0; margin: 0; cursor: pointer; }
   .hint {
     color: var(--muted);
     font-size: 11px;
@@ -1535,6 +1669,27 @@ HTML = r"""<!doctype html>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
+      <div id="dbSummary" class="db-summary muted">Loading database stats…</div>
+      <div id="artistBulkBar" class="bulk-bar hide">
+        <span class="bulk-count" id="bulkCount">0 selected</span>
+        <button type="button" class="btn ghost sm" onclick="bulkArtists('enable')">Enable</button>
+        <button type="button" class="btn ghost sm" onclick="bulkArtists('disable')">Disable</button>
+        <button type="button" class="btn-ro sm" onclick="bulkArtists('ro_on')">RO on</button>
+        <button type="button" class="btn ghost sm" onclick="bulkArtists('ro_off')">RO off</button>
+        <select id="bulkLimit" class="sm" style="width:90px;padding:4px 6px;font-size:12px">
+          <option value="">Limit…</option>
+          <option value="global">Global</option>
+          <option value="10">Max 10</option>
+          <option value="50">Max 50</option>
+          <option value="100">Max 100</option>
+          <option value="150">Max 150</option>
+          <option value="0">Unlimited</option>
+        </select>
+        <button type="button" class="btn ghost sm" onclick="bulkArtists('limit')">Apply limit</button>
+        <button type="button" class="btn ghost sm" onclick="bulkArtists('enable',true)" title="All artists matching search + filter">Filter → Enable</button>
+        <button type="button" class="btn ghost sm" onclick="bulkArtists('disable',true)">Filter → Disable</button>
+        <button type="button" class="btn ghost sm" onclick="clearArtistSelection()">Clear</button>
+      </div>
       <div class="row" style="margin-bottom:14px">
         <input id="artistSearch" placeholder="Search..." oninput="debouncedLoadArtists()"/>
         <div class="filter-chips" id="artistFilterChips" role="group" aria-label="Filter artists">
@@ -1546,11 +1701,18 @@ HTML = r"""<!doctype html>
           <button type="button" class="chip" data-value="synced">Synced</button>
           <button type="button" class="chip" data-value="disabled">Disabled</button>
         </div>
+        <select id="artistSort" onchange="loadArtists()" title="Sort artists" style="min-width:130px">
+          <option value="name">Name A–Z</option>
+          <option value="songs_desc">Songs ↓ most first</option>
+          <option value="songs_asc">Songs ↑ fewest first</option>
+        </select>
         <button class="btn ghost sm" onclick="loadArtists()">Refresh</button>
         <button type="button" class="btn-ro" onclick="action('mark-romanian')" title="Auto-detect Romanian artists (list + MusicBrainz). Manual RO flags are kept.">RO</button>
       </div>
       <div style="overflow-x:auto;">
-      <table class="table"><thead><tr><th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th>Actions</th></tr></thead>
+      <table class="table"><thead><tr>
+        <th class="chk-col"><input type="checkbox" class="art-chk" id="artSelectPage" title="Select this page" onchange="toggleSelectPage(this.checked)"/></th>
+        <th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody id="artistRows"></tbody></table>
       </div>
       <div class="row" style="margin-top:12px; justify-content:space-between;">
@@ -1582,11 +1744,17 @@ HTML = r"""<!doctype html>
     <div class="card">
       <div class="row" style="margin-bottom:14px">
         <input id="trackSearch" placeholder="Search files..." oninput="debouncedLoadTracks()"/>
-        <button class="btn ghost sm" onclick="loadTracks()">Refresh</button>
+        <button type="button" class="btn ghost sm" onclick="loadTracks(true)">Refresh</button>
+        <button type="button" class="btn ghost sm" onclick="loadTracks(true,true)" title="Rescan music folder">Rescan</button>
       </div>
       <div style="overflow-x:auto;">
       <table class="table"><thead><tr><th>Artist</th><th>Album</th><th>File</th><th></th></tr></thead>
       <tbody id="trackRows"></tbody></table>
+      </div>
+      <div class="row" style="margin-top:12px; justify-content:space-between;">
+        <button type="button" class="btn ghost sm" onclick="trackPrev()">← Prev</button>
+        <span id="trackPageInfo" class="muted">Page 1</span>
+        <button type="button" class="btn ghost sm" onclick="trackNext()">Next →</button>
       </div>
       <div class="hint" id="trackHint"></div>
     </div>
@@ -1671,10 +1839,13 @@ HTML = r"""<!doctype html>
 <script>
 const $=s=>document.querySelector(s);
 const CHUNK=80;
+const TRACK_PAGE=100;
 let autoscroll=true;
 let artistsLoadGen=0, libLoadGen=0, tracksLoadGen=0;
 let artistTotal=0, libTotal=0, trackTotal=0;
+let trackPage=0;
 let curPl=[];
+let selectedArtists=new Set();
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
 function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
 function skeletonRows(cols,n=10){return Array.from({length:n},()=>'<tr class="skeleton-row">'+Array.from({length:cols},()=>'<td><span class="skel"></span></td>').join('')+'</tr>').join('');}
@@ -1711,7 +1882,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   b.classList.add('active');
   ['dashboard','library','artists','playlists','tracks','settings','console'].forEach(id=>$('#'+id).classList.add('hide'));
   $('#'+b.dataset.tab).classList.remove('hide');
-  if(b.dataset.tab==='artists')loadArtists();
+  if(b.dataset.tab==='artists'){loadDbSummary();loadArtists();}
   if(b.dataset.tab==='playlists')loadPlaylists();
   if(b.dataset.tab==='tracks')loadTracks();
   if(b.dataset.tab==='library'){loadLibArtists();loadLibrary();}
@@ -1846,13 +2017,73 @@ document.getElementById('artistFilterChips')?.addEventListener('click', e => {
 const debouncedLoadArtists=debounce(()=>loadArtists(),280);
 function artistsBaseUrl(){
   const q=encodeURIComponent($('#artistSearch').value||'');
-  return `/api/artists?q=${q}&status=${artistFilter}`;
+  const sort=encodeURIComponent($('#artistSort')?.value||'name');
+  return `/api/artists?q=${q}&status=${artistFilter}&sort=${sort}`;
+}
+async function loadDbSummary(){
+  try{
+    const s=await api('/api/db/summary');
+    $('#dbSummary').innerHTML=[
+      ['Artists',`<b>${s.artists_active}</b> active · <b>${s.artists_disabled}</b> off · <b>${s.artists_pending_sync}</b> pending sync`],
+      ['RO',`<b>${s.artists_romanian}</b> Romanian`],
+      ['Albums',`<b>${s.albums_incomplete}</b> incomplete / <b>${s.albums_total}</b> total`],
+      ['Songs',`<b>${s.songs_pending}</b> pending · <b>${s.songs_failed}</b> failed / <b>${s.songs_total}</b> total`],
+    ].map(([k,v])=>`<span>${k}: ${v}</span>`).join('');
+  }catch(e){$('#dbSummary').textContent='Stats unavailable';}
+}
+function updateBulkBar(){
+  const n=selectedArtists.size;
+  $('#bulkCount').textContent=n?`${n} selected`:'0 selected';
+  $('#artistBulkBar').classList.toggle('hide',n===0);
+}
+function toggleArtistSelect(id,on){
+  if(on)selectedArtists.add(id);else selectedArtists.delete(id);
+  updateBulkBar();
+}
+function toggleSelectPage(on){
+  const start=artPage*100,end=start+100;
+  curArt.slice(start,end).forEach(a=>{
+    if(on)selectedArtists.add(a.spotify_id);else selectedArtists.delete(a.spotify_id);
+  });
+  renderArtists();updateBulkBar();
+}
+function clearArtistSelection(){
+  selectedArtists.clear();
+  const cb=$('#artSelectPage');if(cb)cb.checked=false;
+  updateBulkBar();renderArtists();
+}
+async function bulkArtists(action,useFilter=false){
+  let body={action};
+  if(action==='limit'){
+    const v=$('#bulkLimit').value;
+    if(!v){toast('Pick a limit first');return;}
+    body.limit=v==='global'?null:parseInt(v,10);
+  }
+  if(useFilter){
+    const label=artistFilter==='all'?'all artists':`filter “${artistFilter}”`;
+    const q=$('#artistSearch').value.trim();
+    const extra=q?` matching “${q}”`:'';
+    if(!confirm(`Apply “${action}” to ${label}${extra}?`))return;
+    body.q=q;body.status=artistFilter;body.ids=[];
+  }else{
+    body.ids=[...selectedArtists];
+    if(!body.ids.length){toast('Select artists first (checkboxes)');return;}
+    if(!confirm(`Apply “${action}” to ${body.ids.length} selected artist(s)?`))return;
+  }
+  try{
+    const r=await api('/api/artists/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast(`Updated ${r.updated} artist(s)`);
+    clearArtistSelection();
+    loadDbSummary();
+    loadArtists();
+  }catch(e){toast('Bulk update failed');}
 }
 async function loadArtists(){
   const gen=++artistsLoadGen;
   artPage=0;
   curArt=[];
   artistTotal=0;
+  const cb=$('#artSelectPage');if(cb)cb.checked=false;
   $('#artistRows').innerHTML=skeletonRows(5);
   $('#artPageInfo').innerHTML='Loading<span class="loading-hint">…</span>';
   try{
@@ -1865,7 +2096,7 @@ async function loadArtists(){
       curArt=items;artistTotal=total;renderArtists();
     },curArt,curArt.length);
   }catch(e){
-    if(gen===artistsLoadGen)$('#artistRows').innerHTML='<tr><td colspan=5 class="muted">Load failed.</td></tr>';
+    if(gen===artistsLoadGen)$('#artistRows').innerHTML='<tr><td colspan=6 class="muted">Load failed.</td></tr>';
   }
 }
 function renderArtists(){
@@ -1881,11 +2112,13 @@ function renderArtists(){
     const roCls = r.is_romanian ? 'on' : '';
     const roTitle = r.is_romanian ? 'Clear Romanian flag' : 'Mark as Romanian';
     const rowCls = r.is_romanian ? 'row-ro' : '';
-    return `<tr class="${rowCls}" data-aid="${r.spotify_id}"><td><button type="button" class="ro-toggle ${roCls}" title="${roTitle}" onclick="setRomanian('${r.spotify_id}', ${r.is_romanian?0:1})">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
+    const sel=selectedArtists.has(r.spotify_id)?'checked':'';
+    return `<tr class="${rowCls}" data-aid="${r.spotify_id}"><td class="chk-col"><input type="checkbox" class="art-chk" ${sel} onchange="toggleArtistSelect('${r.spotify_id}',this.checked)"/></td><td><button type="button" class="ro-toggle ${roCls}" title="${roTitle}" onclick="setRomanian('${r.spotify_id}', ${r.is_romanian?0:1})">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
       <td>
         <div style="display:flex; gap:6px; align-items:center;">
           <select class="sm" style="width:85px; padding: 2px 4px; border: 1px solid var(--border-card); background: #111; color: var(--txt); border-radius: 4px;" onchange="setArtistLimit('${r.spotify_id}', this.value)" title="Max Downloads">
             <option value="" ${r.max_downloads==null?'selected':''}>Global</option>
+            <option value="10" ${r.max_downloads===10?'selected':''}>10</option>
             <option value="50" ${r.max_downloads===50?'selected':''}>50</option>
             <option value="100" ${r.max_downloads===100?'selected':''}>100</option>
             <option value="150" ${r.max_downloads===150?'selected':''}>150</option>
@@ -1895,7 +2128,8 @@ function renderArtists(){
           <button class="btn danger sm" onclick="delArtist('${r.spotify_id}')">×</button>
         </div>
       </td></tr>`;
-  }).join('')||'<tr><td colspan=5 class="muted">No artists yet.</td></tr>';
+  }).join('')||'<tr><td colspan=6 class="muted">No artists yet.</td></tr>';
+  updateBulkBar();
 }
 async function addArtist(){
   const v=$('#artistEntry').value.trim();if(!v)return;
@@ -1984,32 +2218,37 @@ async function togglePl(id){
 }
 async function delPl(id){if(!confirm('Remove?'))return;await api(`/api/playlists/${id}`,{method:'DELETE'});loadPlaylists();}
 let curTracks=[];
-function tracksBaseUrl(){
+function tracksBaseUrl(refresh=false){
   const q=encodeURIComponent($('#trackSearch').value||'');
-  return `/api/tracks?q=${q}`;
+  const r=refresh?'&refresh=1':'';
+  return `/api/tracks?q=${q}${r}`;
 }
-async function loadTracks(){
+async function loadTracks(reset=true,refreshIndex=false){
+  if(reset)trackPage=0;
   const gen=++tracksLoadGen;
   curTracks=[];
-  trackTotal=0;
   $('#trackRows').innerHTML=skeletonRows(4);
-  $('#trackHint').textContent='Loading…';
+  $('#trackPageInfo').innerHTML='Loading<span class="loading-hint">…</span>';
+  $('#trackHint').textContent='';
   try{
-    const first=await api(`${tracksBaseUrl()}&offset=0&limit=${CHUNK}`);
+    const off=trackPage*TRACK_PAGE;
+    const page=await api(`${tracksBaseUrl(refreshIndex)}&offset=${off}&limit=${TRACK_PAGE}`);
     if(gen!==tracksLoadGen)return;
-    curTracks=first.items||[];
-    trackTotal=first.total??curTracks.length;
+    curTracks=page.items||[];
+    trackTotal=page.total??0;
     renderTracks();
-    fetchAllChunks(tracksBaseUrl(),()=>gen!==tracksLoadGen,(items,total)=>{
-      curTracks=items;trackTotal=total;renderTracks();
-    },curTracks,curTracks.length);
   }catch(e){
     if(gen===tracksLoadGen)$('#trackRows').innerHTML='<tr><td colspan=4 class="muted">Load failed.</td></tr>';
   }
 }
-const debouncedLoadTracks=debounce(()=>loadTracks(),320);
+const debouncedLoadTracks=debounce(()=>loadTracks(true),320);
+function trackPrev(){if(trackPage>0){trackPage--;loadTracks(false);}}
+function trackNext(){
+  if((trackPage+1)*TRACK_PAGE<trackTotal){trackPage++;loadTracks(false);}
+}
 function renderTracks(){
-  const tail=curTracks.length<trackTotal?` (${curTracks.length}/${trackTotal} loaded)`:'';
+  const pages=Math.max(1,Math.ceil(trackTotal/TRACK_PAGE));
+  $('#trackPageInfo').textContent=`Page ${trackPage+1} of ${pages} (${trackTotal} files)`;
   $('#trackRows').innerHTML=curTracks.map(r=>`<tr><td>${esc(r.artist)}</td><td class="muted">${esc(r.album)}</td><td>${esc(r.title)}</td>
     <td style="text-align:right; white-space:nowrap;">
       <div style="display:inline-flex; gap:6px; justify-content:flex-end; align-items:center;">
@@ -2018,7 +2257,7 @@ function renderTracks(){
       </div>
     </td></tr>`).join('')
     ||'<tr><td colspan=4 class="muted">No files found.</td></tr>';
-  $('#trackHint').textContent=(trackTotal||curTracks.length)+' files'+(tail?' — still indexing…':'');
+  $('#trackHint').textContent=trackTotal?`${trackTotal} files on disk (100 per page)`:'No audio files in music folder';
 }
 async function showTrackInfo(path) {
   $('#tmCover').src=''; $('#tmTitle').textContent='Loading...';
