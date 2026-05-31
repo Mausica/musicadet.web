@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
@@ -118,6 +118,13 @@ def ensure_db() -> None:
             conn.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
         if "romanian_manual" not in cols:
             conn.execute("ALTER TABLE artists ADD COLUMN romanian_manual INTEGER DEFAULT 0")
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
+            CREATE INDEX IF NOT EXISTS idx_songs_artist_status ON songs(artist_id, status);
+            CREATE INDEX IF NOT EXISTS idx_artists_active_name ON artists(active, name);
+            """
+        )
         for pl in load_cfg().get("playlists", []):
             pid = _extract_id(pl.get("url", ""), "playlist")
             if pid:
@@ -305,16 +312,7 @@ def count_tracks() -> int:
     return n
 
 
-@app.get("/api/artists")
-def api_artists(q: str = "", status: str = "all"):
-    sql = """
-        SELECT a.spotify_id, a.name, a.source, a.active, a.sync_done, a.last_synced, a.added_at,
-               a.albums_scanned_at, a.max_downloads, a.is_romanian,
-               (SELECT COUNT(*) FROM albums WHERE artist_id=a.spotify_id) AS album_count,
-               (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id AND status='downloaded') AS songs_dl,
-               (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id) AS songs_total
-        FROM artists a
-    """
+def _artist_filters(q: str, status: str) -> tuple[list[str], list]:
     where, params = ["a.active >= 0"], []
     if q:
         where.append("a.name LIKE ?")
@@ -329,13 +327,11 @@ def api_artists(q: str = "", status: str = "all"):
         where.append("a.sync_done=1")
     if q2 := {"romanian": "a.is_romanian=1", "international": "a.is_romanian=0"}.get(status):
         where.append(q2)
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY a.name COLLATE NOCASE LIMIT 2000"
+    return where, params
+
+
+def _cap_artist_song_counts(rows: list[dict]) -> None:
     global_max = int(load_cfg().get("max_downloads_per_artist", 0))
-    with db() as conn:
-        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
-        
     for r in rows:
         max_dl = r["max_downloads"] if r["max_downloads"] is not None else global_max
         if max_dl > 0:
@@ -343,15 +339,67 @@ def api_artists(q: str = "", status: str = "all"):
             allowed_pending = max(0, max_dl - r["songs_dl"])
             capped_pending = min(pd, allowed_pending)
             r["songs_total"] = r["songs_dl"] + capped_pending
-            
-    return rows
+
+
+@app.get("/api/artists/names")
+def api_artist_names():
+    with db() as conn:
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT spotify_id, name FROM artists WHERE active=1 ORDER BY name COLLATE NOCASE"
+            ).fetchall()
+        ]
+
+
+@app.get("/api/artists")
+def api_artists(
+    q: str = "",
+    status: str = "all",
+    offset: int = Query(0, ge=0),
+    limit: int = Query(80, ge=1, le=500),
+):
+    where, params = _artist_filters(q, status)
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    base_from = f"""
+        FROM artists a
+        LEFT JOIN (
+            SELECT artist_id, COUNT(*) AS album_count FROM albums GROUP BY artist_id
+        ) ac ON ac.artist_id = a.spotify_id
+        LEFT JOIN (
+            SELECT artist_id,
+                   SUM(CASE WHEN status='downloaded' THEN 1 ELSE 0 END) AS songs_dl,
+                   COUNT(*) AS songs_total
+            FROM songs GROUP BY artist_id
+        ) sc ON sc.artist_id = a.spotify_id
+        {clause}
+    """
+    sql = f"""
+        SELECT a.spotify_id, a.name, a.source, a.active, a.sync_done, a.last_synced, a.added_at,
+               a.albums_scanned_at, a.max_downloads, a.is_romanian,
+               COALESCE(ac.album_count, 0) AS album_count,
+               COALESCE(sc.songs_dl, 0) AS songs_dl,
+               COALESCE(sc.songs_total, 0) AS songs_total
+        {base_from}
+        ORDER BY a.name COLLATE NOCASE
+        LIMIT ? OFFSET ?
+    """
+    count_sql = f"SELECT COUNT(*) {base_from}"
+    with db() as conn:
+        total = conn.execute(count_sql, params).fetchone()[0]
+        rows = [dict(r) for r in conn.execute(sql, params + [limit, offset]).fetchall()]
+    _cap_artist_song_counts(rows)
+    return {"items": rows, "total": total}
 
 
 @app.get("/api/albums")
-def api_albums(artist_id: str = "", status: str = "all", limit: int = 500):
-    sql = """
-        SELECT al.spotify_id, al.artist_id, al.name, al.release_year,
-               al.track_count, al.downloaded_count, al.last_scanned, ar.name AS artist_name
+def api_albums(
+    artist_id: str = "",
+    status: str = "all",
+    offset: int = Query(0, ge=0),
+    limit: int = Query(80, ge=1, le=500),
+):
+    sql_base = """
         FROM albums al JOIN artists ar ON ar.spotify_id = al.artist_id
     """
     where, params = [], []
@@ -362,12 +410,19 @@ def api_albums(artist_id: str = "", status: str = "all", limit: int = 500):
         where.append("al.downloaded_count >= al.track_count AND al.track_count > 0")
     elif status == "pending":
         where.append("al.downloaded_count < al.track_count")
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY ar.name, al.name LIMIT ?"
-    params.append(limit)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    sel = f"""
+        SELECT al.spotify_id, al.artist_id, al.name, al.release_year,
+               al.track_count, al.downloaded_count, al.last_scanned, ar.name AS artist_name
+        {sql_base}{clause}
+        ORDER BY ar.name, al.name
+        LIMIT ? OFFSET ?
+    """
+    count_sql = f"SELECT COUNT(*) {sql_base}{clause}"
     with db() as conn:
-        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        total = conn.execute(count_sql, params).fetchone()[0]
+        rows = [dict(r) for r in conn.execute(sel, params + [limit, offset]).fetchall()]
+    return {"items": rows, "total": total}
 
 
 @app.get("/api/songs")
@@ -537,18 +592,21 @@ def api_delete_playlist(spotify_id: str):
     return {"ok": True}
 
 
-@app.get("/api/tracks")
-def api_tracks(q: str = "", limit: int = 300):
+_tracks_index_cache: dict = {"items": [], "ts": 0.0}
+
+
+def _tracks_index() -> list[dict]:
+    now = time.time()
+    if now - _tracks_index_cache["ts"] < 60 and _tracks_index_cache["items"]:
+        return _tracks_index_cache["items"]
     music_dir = Path(load_cfg()["music_dir"])
-    out = []
+    out: list[dict] = []
     if music_dir.exists():
         for root, _dirs, files in os.walk(music_dir):
             for f in files:
                 if Path(f).suffix.lower() not in AUDIO_EXTS:
                     continue
                 rel = os.path.relpath(os.path.join(root, f), music_dir)
-                if q and q.lower() not in rel.lower():
-                    continue
                 parts = rel.split(os.sep)
                 out.append({
                     "path": rel,
@@ -556,12 +614,25 @@ def api_tracks(q: str = "", limit: int = 300):
                     "album": parts[1] if len(parts) > 2 else "",
                     "title": parts[-1],
                 })
-                if len(out) >= limit:
-                    break
-            if len(out) >= limit:
-                break
     out.sort(key=lambda t: t["path"].lower())
+    _tracks_index_cache["items"] = out
+    _tracks_index_cache["ts"] = now
     return out
+
+
+@app.get("/api/tracks")
+def api_tracks(
+    q: str = "",
+    offset: int = Query(0, ge=0),
+    limit: int = Query(80, ge=1, le=500),
+):
+    needle = q.lower().strip()
+    items = _tracks_index()
+    if needle:
+        items = [t for t in items if needle in t["path"].lower()]
+    total = len(items)
+    page = items[offset : offset + limit]
+    return {"items": page, "total": total, "index_age": int(time.time() - _tracks_index_cache["ts"])}
 
 
 @app.get("/api/track/info")
@@ -1250,6 +1321,37 @@ HTML = r"""<!doctype html>
     word-break: break-word;
   }
   .hide { display: none !important; }
+  .skeleton-row td { padding: 10px 14px; }
+  .skel {
+    display: block;
+    height: 14px;
+    width: 72%;
+    border-radius: 4px;
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.04) 0%,
+      rgba(255, 255, 255, 0.1) 50%,
+      rgba(255, 255, 255, 0.04) 100%
+    );
+    background-size: 200% 100%;
+    animation: skel-shimmer 1.1s ease-in-out infinite;
+  }
+  @keyframes skel-shimmer {
+    0% { background-position: 100% 0; }
+    100% { background-position: -100% 0; }
+  }
+  tr.row-flash td {
+    animation: row-flash 0.45s ease;
+  }
+  @keyframes row-flash {
+    0% { background: rgba(255, 255, 255, 0.12); }
+    100% { background: transparent; }
+  }
+  .loading-hint {
+    font-size: 11px;
+    color: var(--muted);
+    margin-left: 8px;
+  }
   .hint {
     color: var(--muted);
     font-size: 11px;
@@ -1434,7 +1536,7 @@ HTML = r"""<!doctype html>
     </div>
     <div class="card" style="margin-top:16px">
       <div class="row" style="margin-bottom:14px">
-        <input id="artistSearch" placeholder="Search..." oninput="loadArtists()"/>
+        <input id="artistSearch" placeholder="Search..." oninput="debouncedLoadArtists()"/>
         <div class="filter-chips" id="artistFilterChips" role="group" aria-label="Filter artists">
           <button type="button" class="chip active" data-value="all">All</button>
           <button type="button" class="chip chip-ro" data-value="romanian">Romanian</button>
@@ -1479,7 +1581,7 @@ HTML = r"""<!doctype html>
   <section id="tracks" class="hide">
     <div class="card">
       <div class="row" style="margin-bottom:14px">
-        <input id="trackSearch" placeholder="Search files..." oninput="loadTracks()"/>
+        <input id="trackSearch" placeholder="Search files..." oninput="debouncedLoadTracks()"/>
         <button class="btn ghost sm" onclick="loadTracks()">Refresh</button>
       </div>
       <div style="overflow-x:auto;">
@@ -1568,8 +1670,42 @@ HTML = r"""<!doctype html>
 
 <script>
 const $=s=>document.querySelector(s);
+const CHUNK=80;
 let autoscroll=true;
+let artistsLoadGen=0, libLoadGen=0, tracksLoadGen=0;
+let artistTotal=0, libTotal=0, trackTotal=0;
+let curPl=[];
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
+function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
+function skeletonRows(cols,n=10){return Array.from({length:n},()=>'<tr class="skeleton-row">'+Array.from({length:cols},()=>'<td><span class="skel"></span></td>').join('')+'</tr>').join('');}
+async function api(path,opts={},signal){
+  const r=await fetch(path,{...opts,signal});
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  return r.json();
+}
+function esc(s){return (s==null?'':s).toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function artistById(id){return curArt.find(a=>a.spotify_id===id);}
+function flashArtistRow(id){
+  const tr=document.querySelector(`tr[data-aid="${id}"]`);
+  if(tr){tr.classList.remove('row-flash');void tr.offsetWidth;tr.classList.add('row-flash');}
+}
+async function fetchAllChunks(baseUrl,isStale,onChunk,seed=[],startAt=0){
+  let items=seed.slice(),offset=startAt,total=null;
+  while(true){
+    if(isStale())return items;
+    const sep=baseUrl.includes('?')?'&':'?';
+    const page=await api(`${baseUrl}${sep}offset=${offset}&limit=${CHUNK}`);
+    if(isStale())return items;
+    if(!page.items)break;
+    total=page.total??page.items.length;
+    items=items.concat(page.items);
+    offset=items.length;
+    onChunk(items,total);
+    if(items.length>=total||page.items.length<CHUNK)break;
+    await new Promise(r=>setTimeout(r,0));
+  }
+  return items;
+}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');
@@ -1581,7 +1717,6 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   if(b.dataset.tab==='library'){loadLibArtists();loadLibrary();}
   if(b.dataset.tab==='settings')loadSettings();
 });
-async function api(path,opts){const r=await fetch(path,opts);return r.json();}
 async function loadStats(){
   const s=await api('/api/stats');
   const total_songs = s.songs_downloaded + s.songs_pending;
@@ -1640,25 +1775,45 @@ async function saveSettings(){
   loadStats();
 }
 async function loadLibArtists(){
-  const rows=await api('/api/artists?status=active');
+  const rows=await api('/api/artists/names');
   const sel=$('#libArtist');
   const cur=sel.value;
   sel.innerHTML='<option value="">All artists</option>'+rows.map(r=>`<option value="${r.spotify_id}">${esc(r.name)}</option>`).join('');
   if(cur)sel.value=cur;
 }
 let curLib = [], libPage = 0;
-async function loadLibrary(){
+function libBaseUrl(){
   const aid=$('#libArtist').value,st=$('#libStatus').value;
-  let url=`/api/albums?status=${st}&limit=10000`;
+  let url=`/api/albums?status=${st}`;
   if(aid)url+=`&artist_id=${encodeURIComponent(aid)}`;
-  curLib=await api(url);
+  return url;
+}
+async function loadLibrary(){
+  const gen=++libLoadGen;
   libPage=0;
-  renderLibrary();
+  curLib=[];
+  libTotal=0;
+  $('#libRows').innerHTML=skeletonRows(4);
+  $('#libPageInfo').innerHTML='Loading<span class="loading-hint">…</span>';
+  try{
+    const first=await api(`${libBaseUrl()}&offset=0&limit=${CHUNK}`);
+    if(gen!==libLoadGen)return;
+    curLib=first.items||[];
+    libTotal=first.total??curLib.length;
+    renderLibrary();
+    fetchAllChunks(libBaseUrl(),()=>gen!==libLoadGen,(items,total)=>{
+      curLib=items;libTotal=total;renderLibrary();
+    },curLib,curLib.length);
+  }catch(e){
+    if(gen===libLoadGen)$('#libRows').innerHTML='<tr><td colspan=4 class="muted">Load failed.</td></tr>';
+  }
 }
 function renderLibrary(){
   const start=libPage*100, end=start+100;
   const pageRows=curLib.slice(start,end);
-  $('#libPageInfo').textContent=`Page ${libPage+1} of ${Math.ceil(curLib.length/100)||1} (${curLib.length} total)`;
+  const loaded=curLib.length;
+  const tail=loaded<libTotal?` · loading ${loaded}/${libTotal}`:'';
+  $('#libPageInfo').textContent=`Page ${libPage+1} of ${Math.ceil(Math.max(loaded,1)/100)||1} (${libTotal||loaded} total)${tail}`;
   $('#libRows').innerHTML=pageRows.map(r=>{
     const pct=r.track_count?Math.round(100*r.downloaded_count/r.track_count):0;
     const bar=`<div style="height:4px;background:rgba(255,255,255,.1);border-radius:99px;overflow:hidden;width:60px;display:inline-block;vertical-align:middle;margin-left:6px"><div style="height:100%;width:${pct}%;background:#ffffff;border-radius:99px"></div></div>`;
@@ -1668,9 +1823,11 @@ function renderLibrary(){
   }).join('')||'<tr><td colspan=4 class="muted">No albums yet — run Scan Albums.</td></tr>';
 }
 async function showSongs(albumId,albumName){
-  const rows=await api(`/api/songs?album_id=${encodeURIComponent(albumId)}`);
   $('#songPanelTitle').textContent='Songs — '+albumName;
   $('#songPanel').classList.remove('hide');
+  $('#songRows').innerHTML=skeletonRows(5,6);
+  const res=await api(`/api/songs?album_id=${encodeURIComponent(albumId)}`);
+  const rows=Array.isArray(res)?res:(res.items||[]);
   const meta=v=>v?'<span class="meta-ok">✓</span>':'<span class="meta-no">—</span>';
   $('#songRows').innerHTML=rows.map(r=>{
     const st=r.status==='downloaded'?'<span class="pill done">ok</span>':'<span class="pill pend">'+r.status+'</span>';
@@ -1686,16 +1843,37 @@ document.getElementById('artistFilterChips')?.addEventListener('click', e => {
     c.classList.toggle('active', c === chip));
   loadArtists();
 });
-async function loadArtists(){
+const debouncedLoadArtists=debounce(()=>loadArtists(),280);
+function artistsBaseUrl(){
   const q=encodeURIComponent($('#artistSearch').value||'');
-  curArt=await api(`/api/artists?q=${q}&status=${artistFilter}`);
+  return `/api/artists?q=${q}&status=${artistFilter}`;
+}
+async function loadArtists(){
+  const gen=++artistsLoadGen;
   artPage=0;
-  renderArtists();
+  curArt=[];
+  artistTotal=0;
+  $('#artistRows').innerHTML=skeletonRows(5);
+  $('#artPageInfo').innerHTML='Loading<span class="loading-hint">…</span>';
+  try{
+    const first=await api(`${artistsBaseUrl()}&offset=0&limit=${CHUNK}`);
+    if(gen!==artistsLoadGen)return;
+    curArt=first.items||[];
+    artistTotal=first.total??curArt.length;
+    renderArtists();
+    fetchAllChunks(artistsBaseUrl(),()=>gen!==artistsLoadGen,(items,total)=>{
+      curArt=items;artistTotal=total;renderArtists();
+    },curArt,curArt.length);
+  }catch(e){
+    if(gen===artistsLoadGen)$('#artistRows').innerHTML='<tr><td colspan=5 class="muted">Load failed.</td></tr>';
+  }
 }
 function renderArtists(){
   const start=artPage*100, end=start+100;
   const pageRows=curArt.slice(start,end);
-  $('#artPageInfo').textContent=`Page ${artPage+1} of ${Math.ceil(curArt.length/100)||1} (${curArt.length} total)`;
+  const loaded=curArt.length;
+  const tail=loaded<artistTotal?` · loading ${loaded}/${artistTotal}`:'';
+  $('#artPageInfo').textContent=`Page ${artPage+1} of ${Math.ceil(Math.max(loaded,1)/100)||1} (${artistTotal||loaded} total)${tail}`;
   $('#artistRows').innerHTML=pageRows.map(r=>{
     const sync=r.sync_done?'<span class="pill done">synced</span>':'<span class="pill pend">pending</span>';
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
@@ -1703,7 +1881,7 @@ function renderArtists(){
     const roCls = r.is_romanian ? 'on' : '';
     const roTitle = r.is_romanian ? 'Clear Romanian flag' : 'Mark as Romanian';
     const rowCls = r.is_romanian ? 'row-ro' : '';
-    return `<tr class="${rowCls}"><td><button type="button" class="ro-toggle ${roCls}" title="${roTitle}" onclick="setRomanian('${r.spotify_id}', ${r.is_romanian?0:1})">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
+    return `<tr class="${rowCls}" data-aid="${r.spotify_id}"><td><button type="button" class="ro-toggle ${roCls}" title="${roTitle}" onclick="setRomanian('${r.spotify_id}', ${r.is_romanian?0:1})">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
       <td>
         <div style="display:flex; gap:6px; align-items:center;">
           <select class="sm" style="width:85px; padding: 2px 4px; border: 1px solid var(--border-card); background: #111; color: var(--txt); border-radius: 4px;" onchange="setArtistLimit('${r.spotify_id}', this.value)" title="Max Downloads">
@@ -1724,17 +1902,40 @@ async function addArtist(){
   await api('/api/artists',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry:v})});
   $('#artistEntry').value='';toast('Adding — see console');showConsole();
 }
-async function toggleArtist(id){await api(`/api/artists/${id}/toggle`,{method:'POST'});loadArtists();}
+async function toggleArtist(id){
+  const a=artistById(id);if(!a)return;
+  const prev=a.active;
+  a.active=prev?0:1;
+  renderArtists();flashArtistRow(id);
+  try{
+    const r=await api(`/api/artists/${id}/toggle`,{method:'POST'});
+    a.active=r.active?1:0;
+    renderArtists();
+  }catch(e){a.active=prev;renderArtists();toast('Update failed');}
+}
 async function setRomanian(id, val){
-  await api(`/api/artists/${id}/ro`,{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({is_romanian: !!val}),
-  });
-  loadArtists();
+  const a=artistById(id);if(!a)return;
+  const prev=!!a.is_romanian;
+  a.is_romanian=val?1:0;
+  renderArtists();flashArtistRow(id);
+  try{
+    const r=await api(`/api/artists/${id}/ro`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({is_romanian:!!val}),
+    });
+    a.is_romanian=r.is_romanian?1:0;
+    renderArtists();
+  }catch(e){a.is_romanian=prev?1:0;renderArtists();toast('Update failed');}
 }
 async function setArtistLimit(id, limit){
-  await api(`/api/artists/${id}/limit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:limit})});
+  const a=artistById(id);if(!a)return;
+  const prev=a.max_downloads;
+  a.max_downloads=limit===''?null:parseInt(limit,10);
+  renderArtists();flashArtistRow(id);
+  try{
+    await api(`/api/artists/${id}/limit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:limit})});
+  }catch(e){a.max_downloads=prev;renderArtists();toast('Update failed');}
 }
 async function delArtist(id){
   if(!confirm('Remove artist from database?'))return;
@@ -1742,9 +1943,8 @@ async function delArtist(id){
   await api(`/api/artists/${id}?delete_files=${delFiles}`,{method:'DELETE'});
   loadArtists();
 }
-async function loadPlaylists(){
-  const rows=await api('/api/playlists');
-  $('#playlistRows').innerHTML=rows.map(r=>{
+function renderPlaylists(){
+  $('#playlistRows').innerHTML=curPl.map(r=>{
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
     return `<tr><td><a href="${esc(r.url)}" target="_blank">${esc(r.name)}</a></td><td>${act}</td><td class="muted">${(r.last_synced||'-').slice(0,10)}</td>
       <td>
@@ -1755,6 +1955,10 @@ async function loadPlaylists(){
         </div>
       </td></tr>`;
   }).join('')||'<tr><td colspan=4 class="muted">No playlists.</td></tr>';
+}
+async function loadPlaylists(){
+  curPl=await api('/api/playlists');
+  renderPlaylists();
 }
 async function addPlaylist(){
   const name=$('#plName').value.trim(),url=$('#plUrl').value.trim();if(!url)return;
@@ -1767,12 +1971,46 @@ async function syncPl(url){
   if(r.error){toast(r.error);return;}
   toast('Started: '+r.label);showConsole();
 }
-async function togglePl(id){await api(`/api/playlists/${id}/toggle`,{method:'POST'});loadPlaylists();}
+async function togglePl(id){
+  const p=curPl.find(x=>x.spotify_id===id);if(!p)return;
+  const prev=p.active;
+  p.active=prev?0:1;
+  renderPlaylists();
+  try{
+    const r=await api(`/api/playlists/${id}/toggle`,{method:'POST'});
+    p.active=r.active?1:0;
+    renderPlaylists();
+  }catch(e){p.active=prev;renderPlaylists();toast('Update failed');}
+}
 async function delPl(id){if(!confirm('Remove?'))return;await api(`/api/playlists/${id}`,{method:'DELETE'});loadPlaylists();}
-async function loadTracks(){
+let curTracks=[];
+function tracksBaseUrl(){
   const q=encodeURIComponent($('#trackSearch').value||'');
-  const rows=await api(`/api/tracks?q=${q}&limit=300`);
-  $('#trackRows').innerHTML=rows.map(r=>`<tr><td>${esc(r.artist)}</td><td class="muted">${esc(r.album)}</td><td>${esc(r.title)}</td>
+  return `/api/tracks?q=${q}`;
+}
+async function loadTracks(){
+  const gen=++tracksLoadGen;
+  curTracks=[];
+  trackTotal=0;
+  $('#trackRows').innerHTML=skeletonRows(4);
+  $('#trackHint').textContent='Loading…';
+  try{
+    const first=await api(`${tracksBaseUrl()}&offset=0&limit=${CHUNK}`);
+    if(gen!==tracksLoadGen)return;
+    curTracks=first.items||[];
+    trackTotal=first.total??curTracks.length;
+    renderTracks();
+    fetchAllChunks(tracksBaseUrl(),()=>gen!==tracksLoadGen,(items,total)=>{
+      curTracks=items;trackTotal=total;renderTracks();
+    },curTracks,curTracks.length);
+  }catch(e){
+    if(gen===tracksLoadGen)$('#trackRows').innerHTML='<tr><td colspan=4 class="muted">Load failed.</td></tr>';
+  }
+}
+const debouncedLoadTracks=debounce(()=>loadTracks(),320);
+function renderTracks(){
+  const tail=curTracks.length<trackTotal?` (${curTracks.length}/${trackTotal} loaded)`:'';
+  $('#trackRows').innerHTML=curTracks.map(r=>`<tr><td>${esc(r.artist)}</td><td class="muted">${esc(r.album)}</td><td>${esc(r.title)}</td>
     <td style="text-align:right; white-space:nowrap;">
       <div style="display:inline-flex; gap:6px; justify-content:flex-end; align-items:center;">
         <a class="btn ghost sm" href="/api/track/download?path=${encodeURIComponent(r.path)}" download title="Download"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></a>
@@ -1780,7 +2018,7 @@ async function loadTracks(){
       </div>
     </td></tr>`).join('')
     ||'<tr><td colspan=4 class="muted">No files found.</td></tr>';
-  $('#trackHint').textContent=rows.length+' files shown';
+  $('#trackHint').textContent=(trackTotal||curTracks.length)+' files'+(tail?' — still indexing…':'');
 }
 async function showTrackInfo(path) {
   $('#tmCover').src=''; $('#tmTitle').textContent='Loading...';
@@ -1844,7 +2082,6 @@ function connectWS(){
 $('#consoleOut').addEventListener('scroll',e=>{
   const el=e.target;autoscroll=(el.scrollHeight-el.scrollTop-el.clientHeight)<40;
 });
-function esc(s){return (s==null?'':s).toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 loadStats();connectWS();setInterval(loadStats,15000);
 </script>
 </body>
