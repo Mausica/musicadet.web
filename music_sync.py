@@ -138,6 +138,10 @@ def _migrate_columns(db: sqlite3.Connection) -> None:
     if "albums_scanned_at" not in artist_cols:
         db.execute("ALTER TABLE artists ADD COLUMN albums_scanned_at TEXT")
 
+    song_cols = {r[1] for r in db.execute("PRAGMA table_info(songs)")}
+    if "youtube_url" not in song_cols:
+        db.execute("ALTER TABLE songs ADD COLUMN youtube_url TEXT")
+
 
 def db_init():
     """Create / migrate the database schema."""
@@ -251,6 +255,29 @@ def _song_id_from_dict(song: dict) -> Optional[str]:
     if "/track/" in url:
         return _extract_id_from_url(url, "track")
     return None
+
+
+def cmd_clean_ytm(args):
+    """Removes all pending tracks and albums that were added by the YouTube Music scanner."""
+    with db_connect() as db:
+        # Delete albums that came entirely from YTM (their IDs start with MPREb_)
+        cur1 = db.execute("DELETE FROM albums WHERE spotify_id LIKE 'MPREb_%'")
+        # Delete songs added by YTM that attached to existing Spotify albums. 
+        # YTM songs have exactly 11 chars (videoId) or start with 'trk:'
+        cur2 = db.execute(
+            "DELETE FROM songs WHERE status != 'downloaded' AND "
+            "(length(spotify_id) = 11 OR spotify_id LIKE 'trk:%')"
+        )
+        
+        # Reset the albums_scanned_at so Spotify scanner can rescan them properly
+        db.execute("UPDATE artists SET albums_scanned_at = NULL WHERE active = 1")
+        
+        db.commit()
+        
+    log.info("Cleanup complete:")
+    log.info("  - Removed %d YouTube Music albums (and their tracks)", cur1.rowcount)
+    log.info("  - Removed %d pending YouTube Music tracks from Spotify albums", cur2.rowcount)
+    log.info("  - Reset artist scan status. You can now re-run 'Scan artist albums' with the Spotify scanner.")
 
 
 def _album_id_from_song(song: dict, artist_id: str) -> str:
@@ -531,6 +558,9 @@ def _upsert_artist_catalog(db: sqlite3.Connection, artist_id: str, songs: list) 
 
             title = _title_from_song(song)
             track_num = _track_number_from_song(song)
+            yt_url = song.get("download_url") or song.get("youtube_url") or song.get("url")
+            if yt_url and "youtube" not in str(yt_url):
+                yt_url = None
 
             existing = db.execute(
                 "SELECT status, file_path FROM songs WHERE spotify_id=?", (song_id,)
@@ -548,14 +578,15 @@ def _upsert_artist_catalog(db: sqlite3.Connection, artist_id: str, songs: list) 
                     continue
 
             cur = db.execute("""
-                INSERT INTO songs (spotify_id, album_id, artist_id, title, track_number, status, updated_at)
-                VALUES (?,?,?,?,?,'pending',?)
+                INSERT INTO songs (spotify_id, album_id, artist_id, title, track_number, status, youtube_url, updated_at)
+                VALUES (?,?,?,?,?,'pending',?,?)
                 ON CONFLICT(spotify_id) DO UPDATE SET
                     album_id=excluded.album_id,
                     title=excluded.title,
                     track_number=excluded.track_number,
+                    youtube_url=COALESCE(excluded.youtube_url, songs.youtube_url),
                     updated_at=excluded.updated_at
-            """, (song_id, final_album_id, artist_id, title, track_num, now))
+            """, (song_id, final_album_id, artist_id, title, track_num, yt_url, now))
             if cur.rowcount == 1:
                 new_songs += 1
             elif existing and existing["status"] != "downloaded":
@@ -689,8 +720,14 @@ def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
         log.info("  → Skipping local artist catalog scan: %s", name)
         return 0, 0
 
-    import ytm_scanner
-    songs = ytm_scanner.scan_artist(name)
+    scanner_type = CFG.get("artist_scanner", "spotify")
+    if scanner_type == "ytmusic":
+        import ytm_scanner
+        songs = ytm_scanner.scan_artist(name)
+    else:
+        target = _artist_target(sid, name)
+        timeout = int(CFG.get("artist_save_timeout", 900))
+        songs = spotdl_save(target, timeout=timeout)
     
     if not songs:
         log.warning("  → No songs returned for %s", name)
@@ -893,7 +930,7 @@ def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total:
     with db_connect() as db:
         pending_rows = db.execute(
             """
-            SELECT s.spotify_id, s.title, s.track_number, s.status, s.file_path,
+            SELECT s.spotify_id, s.title, s.track_number, s.status, s.file_path, s.youtube_url,
                    al.name AS album_name
             FROM songs s
             JOIN albums al ON s.album_id = al.spotify_id
@@ -907,7 +944,6 @@ def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total:
 
     success = True
     for s in pending_rows:
-        yt_url = yt_url_map.get(s["spotify_id"])
         track_num = s["track_number"]
         album_name = s["album_name"] or "Unknown Album"
         
@@ -915,6 +951,8 @@ def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total:
         s_id = s["spotify_id"]
         if len(s_id) == 11 and ":" not in s_id:
             yt_url = f"https://music.youtube.com/watch?v={s_id}"
+        else:
+            yt_url = s["youtube_url"]
 
         # Check if file already exists on disk
         safe_artist = custom_dl._clean_filename(name)
@@ -1538,56 +1576,58 @@ Examples:
         """,
     )
 
-    sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("sync", help="Full pipeline — default command")
-    sub.add_parser("scan", help="Scan playlists, discover artists")
+    subparsers = p.add_subparsers(dest="cmd")
+    subparsers.add_parser("sync", help="Full pipeline — default command")
+    subparsers.add_parser("scan", help="Scan playlists, discover artists")
 
-    sa = sub.add_parser("scan-artists", help="Scan artist albums into DB")
+    sa = subparsers.add_parser("scan-artists", help="Scan artist albums into DB")
     sa.add_argument("--new-only", action="store_true", help="Only artists not yet scanned")
 
-    as_ = sub.add_parser("artists-sync", help="Sync artist discographies (sequential yt-dlp)")
+    as_ = subparsers.add_parser("artists-sync", help="Sync artist discographies (sequential yt-dlp)")
     as_.add_argument("--new-only", action="store_true", help="Only sync artists not yet downloaded")
 
-    sub.add_parser("download-pending", help="Directly download all pending tracks without SpotDL fetches")
+    subparsers.add_parser("download-pending", help="Directly download all pending tracks without SpotDL fetches")
 
     # New: playlist-first sync command
-    sp = sub.add_parser(
+    sp = subparsers.add_parser(
         "sync-playlist",
         help="Fetch a Spotify playlist via SpotDL then download all tracks + check artist albums",
     )
     sp.add_argument("url", help="Spotify playlist URL")
 
     # New: direct download command
-    dd = sub.add_parser(
+    dd = subparsers.add_parser(
         "download",
         help="Directly download a Spotify/YT playlist to local folders (no DB/album checks)",
     )
     dd.add_argument("url", help="Spotify or YouTube URL")
 
-    rec = sub.add_parser("reconcile", help="Match filesystem files to DB")
+    rec = subparsers.add_parser("reconcile", help="Match filesystem files to DB")
     rec.add_argument("--artist", help="Limit to artist name/id")
 
-    sub.add_parser("migrate-structure", help="Move existing flat files to album folders and restrict to primary artist")
+    subparsers.add_parser("migrate-structure", help="Move existing flat files to album folders and restrict to primary artist")
 
-    fix = sub.add_parser("fix-metadata", help="Re-embed metadata for incomplete songs")
+    fix = subparsers.add_parser("fix-metadata", help="Re-embed metadata for incomplete songs")
     fix.add_argument("--artist", help="Limit to artist name/id")
 
-    la = sub.add_parser("list-albums", help="Show album download progress")
+    la = subparsers.add_parser("list-albums", help="Show album download progress")
     la.add_argument("artist", nargs="?", help="Filter by artist name")
 
-    add_ = sub.add_parser("add", help="Add an artist by URL or name")
+    add_ = subparsers.add_parser("add", help="Add an artist by URL or name")
     add_.add_argument("artist")
 
-    imp_ = sub.add_parser("import", help="Bulk import artists from a text file")
+    imp_ = subparsers.add_parser("import", help="Bulk import artists from a text file")
     imp_.add_argument("file")
 
-    sub.add_parser("list", help="List all artists in the DB")
+    subparsers.add_parser("list", help="List all artists in the DB")
 
-    dis_ = sub.add_parser("disable", help="Disable an artist")
+    dis_ = subparsers.add_parser("disable", help="Disable an artist")
     dis_.add_argument("artist")
 
-    en_ = sub.add_parser("enable", help="Re-enable a disabled artist")
+    en_ = subparsers.add_parser("enable", help="Re-enable a disabled artist")
     en_.add_argument("artist")
+
+    sub = subparsers.add_parser("clean-ytm", help="Wipe all pending YouTube Music data to revert to Spotify scanner")
 
     args = p.parse_args()
 
@@ -1609,6 +1649,7 @@ Examples:
         "list":              cmd_list,
         "disable":           cmd_disable,
         "enable":            cmd_enable,
+        "clean-ytm":         cmd_clean_ytm,
     }
 
     fn = routes.get(args.cmd)

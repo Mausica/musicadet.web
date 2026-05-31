@@ -32,6 +32,7 @@ DEFAULTS = {
     "threads": 4,
     "output_template": "{artist}/{album}/{track-number} - {title}.{output-ext}",
     "download_format": "original",
+    "artist_scanner": "spotify",
     "playlist_save_timeout": 600,
     "playlist_save_retries": 3,
     "artist_save_timeout": 900,
@@ -43,7 +44,7 @@ DEFAULTS = {
 
 CONFIG_KEYS = [
     "music_dir", "sync_dir", "db_path", "log_dir", "format", "download_format", "bitrate", "threads",
-    "output_template", "playlist_save_timeout", "playlist_save_retries",
+    "output_template", "artist_scanner", "playlist_save_timeout", "playlist_save_retries",
     "artist_save_timeout", "lyrics_providers", "generate_lrc", "hud_port",
 ]
 
@@ -1200,6 +1201,7 @@ HTML = r"""<!doctype html>
         <button class="btn ghost" onclick="action('reconcile')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg> Reconcile</button>
         <button class="btn ghost" onclick="action('migrate-structure')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Migrate Structure</button>
         <button class="btn ghost" onclick="action('fix-metadata')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg> Fix Metadata</button>
+        <button class="btn ghost danger-text" onclick="action('clean-ytm')" style="color: #ff4b4b;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg> Clean YTM</button>
         <button class="btn danger" onclick="stop()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"></polygon><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg> Stop</button>
       </div>
       <div class="gradient-sep"></div>
@@ -1316,6 +1318,13 @@ HTML = r"""<!doctype html>
           <select id="cfgThreads" style="width:100%"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="8">8</option></select>
         </div>
       </div>
+      <div class="field">
+        <label>Artist Scanner Engine</label>
+        <select id="cfgScanner" style="width:100%">
+          <option value="spotify">Spotify (Precise but slow)</option>
+          <option value="ytmusic">YouTube Music (Fast but includes remixes/EPs)</option>
+        </select>
+      </div>
       <div class="field"><label>Output template</label><input id="cfgTemplate" placeholder="{artist}/{album}/{track_number} - {title}.{output-ext}"/></div>
       <div class="field"><label>Lyrics providers (comma-separated)</label><input id="cfgLyrics" placeholder="genius,musixmatch,azlyrics"/></div>
       <div class="row">
@@ -1400,6 +1409,7 @@ async function loadSettings(){
   $('#cfgMusicDir').value=c.music_dir||'';
   $('#cfgFormat').value=c.format||'mp3';
   $('#cfgDlFormat').value=c.download_format||'original';
+  $('#cfgScanner').value=c.artist_scanner||'spotify';
   $('#cfgBitrate').value=c.bitrate||'320k';
   $('#cfgTemplate').value=c.output_template||'{artist}/{album}/{track-number} - {title}.{output-ext}';
   $('#cfgLyrics').value=(c.lyrics_providers||[]).join(',');
@@ -1413,6 +1423,7 @@ async function saveSettings(){
     music_dir:$('#cfgMusicDir').value.trim(),
     format:$('#cfgFormat').value,
     download_format:$('#cfgDlFormat').value,
+    artist_scanner:$('#cfgScanner').value,
     bitrate:$('#cfgBitrate').value.trim(),
     threads:parseInt($('#cfgThreads').value)||4,
     output_template:$('#cfgTemplate').value.trim(),
