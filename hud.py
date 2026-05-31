@@ -30,7 +30,7 @@ DEFAULTS = {
     "format": "opus",
     "bitrate": "320k",
     "threads": 4,
-    "output_template": "{artist}/{album}/{title}.{output-ext}",
+    "output_template": "{artist}/{album}/{track_number} - {title}.{output-ext}",
     "download_format": "original",
     "playlist_save_timeout": 600,
     "playlist_save_retries": 3,
@@ -199,6 +199,7 @@ class ConfigIn(BaseModel):
     music_dir: Optional[str] = None
     sync_dir: Optional[str] = None
     format: Optional[str] = None
+    download_format: Optional[str] = None
     bitrate: Optional[str] = None
     threads: Optional[int] = None
     output_template: Optional[str] = None
@@ -954,6 +955,36 @@ HTML = r"""<!doctype html>
     padding: 12px 14px;
     border-bottom: 1px solid var(--border-card);
   }
+  
+  /* Toggle Switch */
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 24px;
+    flex-shrink: 0;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-color: #3f3f46;
+    transition: .3s;
+    border-radius: 24px;
+  }
+  .slider:before {
+    position: absolute;
+    content: "";
+    height: 18px; width: 18px;
+    left: 3px; bottom: 3px;
+    background-color: white;
+    transition: .3s;
+    border-radius: 50%;
+  }
+  input:checked + .slider { background-color: var(--primary); }
+  input:checked + .slider:before { transform: translateX(20px); }
+  
   th {
     color: var(--muted);
     font-size: 11px;
@@ -1233,15 +1264,18 @@ HTML = r"""<!doctype html>
           <select id="cfgThreads" style="width:100%"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="8">8</option></select>
         </div>
       </div>
-      <div class="field"><label>Output template</label><input id="cfgTemplate"/></div>
+      <div class="field"><label>Output template</label><input id="cfgTemplate" placeholder="{artist}/{album}/{track_number} - {title}.{output-ext}"/></div>
       <div class="field"><label>Lyrics providers (comma-separated)</label><input id="cfgLyrics" placeholder="genius,musixmatch,azlyrics"/></div>
       <div class="row">
         <div class="field" style="flex:1"><label>Playlist timeout (s)</label><input id="cfgPlTimeout" type="number"/></div>
         <div class="field" style="flex:1"><label>Playlist retries</label><input id="cfgPlRetries" type="number"/></div>
       </div>
-      <label style="display:flex; align-items:center; gap:10px; margin-bottom:24px; cursor:pointer;">
-        <input type="checkbox" id="cfgLrc" style="width:18px; height:18px; margin:0; flex-shrink:0;"/>
-        <span style="font-size:14px; font-weight:500; color:var(--txt)">Generate .lrc sidecar files</span>
+      <label style="display:flex; align-items:center; gap:12px; margin-bottom:24px; cursor:pointer;">
+        <div class="switch">
+          <input type="checkbox" id="cfgLrc">
+          <span class="slider"></span>
+        </div>
+        <span style="font-size:14px; font-weight:500; color:var(--txt)">Generate .lrc sidecar files (Synchronized Lyrics)</span>
       </label>
       <button class="btn" onclick="saveSettings()" style="padding:12px 24px; font-size:14px;">Save settings</button>
       <div class="hint" style="margin-top:12px">Changing HUD port requires restarting the service.</div>
