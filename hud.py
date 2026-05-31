@@ -928,6 +928,7 @@ HTML = r"""<!doctype html>
         <button class="btn ghost" onclick="action('scan-artists')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="3"></circle></svg> Scan Albums</button>
         <button class="btn ghost" onclick="action('artists-sync-new')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></svg> Sync New</button>
         <button class="btn ghost" onclick="action('artists-sync')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg> Sync All</button>
+        <button class="btn ghost" onclick="action('download-pending')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download Pending</button>
         <button class="btn ghost" onclick="action('reconcile')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg> Reconcile</button>
         <button class="btn ghost" onclick="action('migrate-structure')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Migrate Structure</button>
         <button class="btn ghost" onclick="action('fix-metadata')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg> Fix Metadata</button>
@@ -953,8 +954,15 @@ HTML = r"""<!doctype html>
         </select>
         <button class="btn ghost sm" onclick="loadLibrary()">Refresh</button>
       </div>
-      <table><thead><tr><th>Artist</th><th>Album</th><th>Progress</th><th></th></tr></thead>
+      <div style="overflow-x:auto;">
+      <table class="table"><thead><tr><th>Artist</th><th>Album</th><th>Progress</th><th>Action</th></tr></thead>
       <tbody id="libRows"></tbody></table>
+      </div>
+      <div class="row" style="margin-top:12px; justify-content:space-between;">
+        <button class="btn ghost sm" onclick="libPage=Math.max(0,libPage-1);renderLibrary()">← Prev</button>
+        <span id="libPageInfo" class="muted">Page 1</span>
+        <button class="btn ghost sm" onclick="libPage++;renderLibrary()">Next →</button>
+      </div>
     </div>
     <div class="card hide" id="songPanel" style="margin-top:16px">
       <h2 id="songPanelTitle">Songs</h2>
@@ -981,8 +989,15 @@ HTML = r"""<!doctype html>
         </select>
         <button class="btn ghost sm" onclick="loadArtists()">Refresh</button>
       </div>
-      <table><thead><tr><th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th></th></tr></thead>
+      <div style="overflow-x:auto;">
+      <table class="table"><thead><tr><th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody id="artistRows"></tbody></table>
+      </div>
+      <div class="row" style="margin-top:12px; justify-content:space-between;">
+        <button class="btn ghost sm" onclick="artPage=Math.max(0,artPage-1);renderArtists()">← Prev</button>
+        <span id="artPageInfo" class="muted">Page 1</span>
+        <button class="btn ghost sm" onclick="artPage++;renderArtists()">Next →</button>
+      </div>
     </div>
   </section>
 
@@ -1111,12 +1126,20 @@ async function loadLibArtists(){
   sel.innerHTML='<option value="">All artists</option>'+rows.map(r=>`<option value="${r.spotify_id}">${esc(r.name)}</option>`).join('');
   if(cur)sel.value=cur;
 }
+let curLib = [], libPage = 0;
 async function loadLibrary(){
   const aid=$('#libArtist').value,st=$('#libStatus').value;
-  let url=`/api/albums?status=${st}&limit=300`;
+  let url=`/api/albums?status=${st}&limit=10000`;
   if(aid)url+=`&artist_id=${encodeURIComponent(aid)}`;
-  const rows=await api(url);
-  $('#libRows').innerHTML=rows.map(r=>{
+  curLib=await api(url);
+  libPage=0;
+  renderLibrary();
+}
+function renderLibrary(){
+  const start=libPage*100, end=start+100;
+  const pageRows=curLib.slice(start,end);
+  $('#libPageInfo').textContent=`Page ${libPage+1} of ${Math.ceil(curLib.length/100)||1} (${curLib.length} total)`;
+  $('#libRows').innerHTML=pageRows.map(r=>{
     const pct=r.track_count?Math.round(100*r.downloaded_count/r.track_count):0;
     const bar=`<div style="height:4px;background:rgba(255,255,255,.1);border-radius:99px;overflow:hidden;width:60px;display:inline-block;vertical-align:middle;margin-left:6px"><div style="height:100%;width:${pct}%;background:#ffffff;border-radius:99px"></div></div>`;
     const pill=r.downloaded_count>=r.track_count&&r.track_count>0?'<span class="pill done">done</span>':'<span class="pill pend">'+pct+'%</span>';
@@ -1134,11 +1157,19 @@ async function showSongs(albumId,albumName){
     return `<tr><td class="muted">${r.track_number||''}</td><td>${esc(r.title)}</td><td>${st}</td><td>${meta(r.has_cover)}</td><td>${meta(r.has_lyrics)}</td></tr>`;
   }).join('')||'<tr><td colspan=5 class="muted">No songs.</td></tr>';
 }
+let curArt = [], artPage = 0;
 async function loadArtists(){
   const q=encodeURIComponent($('#artistSearch').value||'');
   const st=$('#artistFilter').value;
-  const rows=await api(`/api/artists?q=${q}&status=${st}`);
-  $('#artistRows').innerHTML=rows.map(r=>{
+  curArt=await api(`/api/artists?q=${q}&status=${st}`);
+  artPage=0;
+  renderArtists();
+}
+function renderArtists(){
+  const start=artPage*100, end=start+100;
+  const pageRows=curArt.slice(start,end);
+  $('#artPageInfo').textContent=`Page ${artPage+1} of ${Math.ceil(curArt.length/100)||1} (${curArt.length} total)`;
+  $('#artistRows').innerHTML=pageRows.map(r=>{
     const sync=r.sync_done?'<span class="pill done">synced</span>':'<span class="pill pend">pending</span>';
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
     const prog=(r.songs_dl||0)+'/'+(r.songs_total||0);

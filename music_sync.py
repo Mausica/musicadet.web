@@ -659,6 +659,11 @@ def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
     """Scan one artist's discography into albums/songs tables."""
     sid = artist_row["spotify_id"]
     name = artist_row["name"]
+    
+    if sid.startswith("local:"):
+        log.info("  → Skipping local artist catalog scan: %s", name)
+        return 0, 0
+
     target = _artist_target(sid, name)
     timeout = int(CFG.get("artist_save_timeout", 900))
 
@@ -963,17 +968,21 @@ def cmd_artists_sync(args):
     ok = failed = 0
     for i, a in enumerate(artists, 1):
         sid, name = a["spotify_id"], a["name"]
-        target = _artist_target(sid, name)
 
-        # Step 1: SpotDL fetch → JSON
-        log.info("[%d/%d] Fetching Spotify metadata: %s", i, total, name)
-        songs = spotdl_save(target, timeout=int(CFG.get("artist_save_timeout", 900)))
-        if songs:
-            with db_connect() as db:
-                _upsert_artist_catalog(db, sid, songs)
-        else:
-            log.warning("  → No songs from SpotDL for %s — will still try DB pending", name)
+        if sid.startswith("local:"):
+            log.info("[%d/%d] Skipping SpotDL fetch for local artist: %s", i, total, name)
             songs = []
+        else:
+            target = _artist_target(sid, name)
+            # Step 1: SpotDL fetch → JSON
+            log.info("[%d/%d] Fetching Spotify metadata: %s", i, total, name)
+            songs = spotdl_save(target, timeout=int(CFG.get("artist_save_timeout", 900)))
+            if songs:
+                with db_connect() as db:
+                    _upsert_artist_catalog(db, sid, songs)
+            else:
+                log.warning("  → No songs from SpotDL for %s — will still try DB pending", name)
+                songs = []
 
         # Step 2: Download pending tracks + album completeness check
         result = _sync_artist_with_ytdlp(sid, name, songs, i, total)
@@ -983,6 +992,37 @@ def cmd_artists_sync(args):
             failed += 1
 
     log.info("Artists sync done — ✓ %d  ✗ %d", ok, failed)
+
+def cmd_download_pending(args):
+    """Bypasses SpotDL entirely and just downloads pending songs currently in the DB."""
+    with db_connect() as db:
+        # Get artists that actually have pending songs
+        artists = db.execute("""
+            SELECT DISTINCT a.spotify_id, a.name 
+            FROM artists a 
+            JOIN songs s ON s.artist_id = a.spotify_id 
+            WHERE a.active=1 AND s.status != 'downloaded'
+            ORDER BY a.name COLLATE NOCASE
+        """).fetchall()
+
+    workers = min(int(CFG.get("scan_concurrency", 4)), max(len(artists), 1))
+    log.info("Artists with pending tracks: %d (×%d workers)", len(artists), workers)
+    total = len(artists)
+
+    def _dl_worker(i_a):
+        i, a = i_a
+        sid, name = a["spotify_id"], a["name"]
+        return _sync_artist_with_ytdlp(sid, name, [], i, total)
+
+    ok = failed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_dl_worker, enumerate(artists, 1)))
+        
+    for res in results:
+        if res: ok += 1
+        else: failed += 1
+
+    log.info("Download pending complete — ✓ %d  ✗ %d", ok, failed)
 
 def cmd_sync_playlist(args):
     """
@@ -1339,6 +1379,8 @@ def cmd_fix_metadata(args):
         return
 
     for a in artists:
+        if a["spotify_id"].startswith("local:"):
+            continue
         log.info("Fixing metadata: %s", a["name"])
         target = _artist_target(a["spotify_id"], a["name"])
         if spotdl_fix_artist_metadata(a["spotify_id"], a["name"], target):
@@ -1466,6 +1508,8 @@ Examples:
     as_ = sub.add_parser("artists-sync", help="Sync artist discographies (sequential yt-dlp)")
     as_.add_argument("--new-only", action="store_true", help="Only sync artists not yet downloaded")
 
+    sub.add_parser("download-pending", help="Directly download all pending tracks without SpotDL fetches")
+
     # New: playlist-first sync command
     sp = sub.add_parser(
         "sync-playlist",
@@ -1513,6 +1557,7 @@ Examples:
         "scan":              cmd_scan,
         "scan-artists":      cmd_scan_artists,
         "artists-sync":      cmd_artists_sync,
+        "download-pending":  cmd_download_pending,
         "sync-playlist":     cmd_sync_playlist,
         "download":          cmd_download_direct,
         "reconcile":         cmd_reconcile,
