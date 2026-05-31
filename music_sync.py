@@ -458,8 +458,8 @@ def cmd_deduplicate(args):
                         log.info("    Moving files from '%s' to '%s'", dup_folder.name, canonical_folder.name)
                         _merge_folders(dup_folder, canonical_folder)
                         
-                    # Delete duplicate artist
-                    db.execute("DELETE FROM artists WHERE spotify_id = ?", (dup_id,))
+                    # Soft-delete duplicate artist so it is permanently blacklisted
+                    db.execute("UPDATE artists SET active=-1 WHERE spotify_id = ?", (dup_id,))
                     
                 # Update canonical name
                 db.execute("UPDATE artists SET name = ?, active = 1 WHERE spotify_id = ?", (canonical_name, canonical_id))
@@ -1392,6 +1392,32 @@ def cmd_artists_sync(args):
 
     log.info("Artists sync done — ✓ %d  ✗ %d", ok, failed)
 
+def _get_top_songs_for_artist(artist_name: str, limit: int) -> set:
+    try:
+        from ytmusicapi import YTMusic
+        import ytm_scanner
+        ytm = YTMusic()
+        results = ytm.search(artist_name, filter="artists", limit=3)
+        if not results: return set()
+        
+        browse_id = None
+        for r in results:
+            if ytm_scanner._artist_matches(artist_name, r.get("artist", "")):
+                browse_id = r["browseId"]
+                break
+        if not browse_id:
+            browse_id = results[0]["browseId"]
+            
+        artist_data = ytm.get_artist(browse_id)
+        top_titles = set()
+        if "songs" in artist_data and "results" in artist_data["songs"]:
+            for song in artist_data["songs"]["results"][:limit]:
+                top_titles.add(_normalize_song_title(song.get("title", "")))
+        return top_titles
+    except Exception as e:
+        log.warning("Failed to get top songs for %s: %s", artist_name, e)
+        return set()
+
 def cmd_download_pending(args):
     """Bypasses SpotDL entirely and just downloads pending songs currently in the DB."""
     with db_connect() as db:
@@ -1419,7 +1445,7 @@ def cmd_download_pending(args):
         # Determine the pending tracks we will download for this artist
         with db_connect() as db_conn:
             pending_songs = db_conn.execute("""
-                SELECT s.spotify_id
+                SELECT s.spotify_id, s.title
                 FROM songs s
                 JOIN albums al ON s.album_id = al.spotify_id
                 WHERE s.artist_id = ? AND s.status != 'downloaded'
@@ -1427,13 +1453,28 @@ def cmd_download_pending(args):
             """, (sid,)).fetchall()
             
             if limit > 0 and len(pending_songs) > limit:
-                # Keep only the top 'limit' newest tracks, skip the rest
-                keep_ids = {ps["spotify_id"] for ps in pending_songs[:limit]}
-                skip_ids = [ps["spotify_id"] for ps in pending_songs[limit:]]
+                top_titles = _get_top_songs_for_artist(name, limit)
+                if top_titles:
+                    matched = []
+                    unmatched = []
+                    for ps in pending_songs:
+                        if _normalize_song_title(ps["title"]) in top_titles:
+                            matched.append(ps)
+                        else:
+                            unmatched.append(ps)
+                    final_list = matched + unmatched
+                    keep_ids = {ps["spotify_id"] for ps in final_list[:limit]}
+                    skip_ids = [ps["spotify_id"] for ps in final_list[limit:]]
+                    log.info("[%d/%d] %s: Matched %d Top Songs by views, limiting download to %d tracks (out of %d pending)", i, total, name, len(matched), limit, len(pending_songs))
+                else:
+                    keep_ids = {ps["spotify_id"] for ps in pending_songs[:limit]}
+                    skip_ids = [ps["spotify_id"] for ps in pending_songs[limit:]]
+                    log.info("[%d/%d] %s: Limiting download to newest %d tracks (out of %d pending)", i, total, name, limit, len(pending_songs))
                 
-                # Update skipped tracks to "skipped" (or we can just leave them pending but not download them)
-                # Let's just leave them pending, but only pass the ones we want to download
-                log.info("[%d/%d] %s: Limiting download to newest %d tracks (out of %d pending)", i, total, name, limit, len(pending_songs))
+                # Clean the waiting list by deleting skipped songs
+                if skip_ids:
+                    db_conn.execute(f"DELETE FROM songs WHERE spotify_id IN ({','.join(['?']*len(skip_ids))})", skip_ids)
+                    log.info("  -> Deleted %d skipped pending songs for %s to keep the queue clean", len(skip_ids), name)
             else:
                 keep_ids = None
                 

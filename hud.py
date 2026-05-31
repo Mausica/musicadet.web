@@ -245,7 +245,19 @@ def api_stats():
         albums_total = conn.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
         albums_downloaded = conn.execute("SELECT COUNT(*) FROM albums WHERE downloaded_count >= track_count AND track_count > 0").fetchone()[0]
         songs_downloaded = conn.execute("SELECT COUNT(*) FROM songs WHERE status='downloaded'").fetchone()[0]
-        songs_pending = conn.execute("SELECT COUNT(*) FROM songs WHERE status='pending'").fetchone()[0]
+        
+        # Calculate capped songs pending based on per-artist and global limits
+        art_rows = conn.execute("SELECT max_downloads, (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id AND status='downloaded') as dl, (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id AND status!='downloaded') as pd FROM artists a WHERE a.active=1").fetchall()
+        global_max = int(load_cfg().get("max_downloads_per_artist", 0))
+        songs_pending = 0
+        for r in art_rows:
+            max_dl = r["max_downloads"] if r["max_downloads"] is not None else global_max
+            dl, pd = r["dl"], r["pd"]
+            if max_dl > 0:
+                allowed = max(0, max_dl - dl)
+                songs_pending += min(pd, allowed)
+            else:
+                songs_pending += pd
         songs_failed = conn.execute("SELECT COUNT(*) FROM songs WHERE status='failed'").fetchone()[0]
         songs_missing_cover = conn.execute(
             "SELECT COUNT(*) FROM songs WHERE status='downloaded' AND has_cover=0"
@@ -297,7 +309,7 @@ def api_artists(q: str = "", status: str = "all"):
                (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id) AS songs_total
         FROM artists a
     """
-    where, params = [], []
+    where, params = ["a.active >= 0"], []
     if q:
         where.append("a.name LIKE ?")
         params.append(f"%{q}%")
@@ -312,8 +324,18 @@ def api_artists(q: str = "", status: str = "all"):
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY a.name COLLATE NOCASE LIMIT 2000"
+    global_max = int(load_cfg().get("max_downloads_per_artist", 0))
     with db() as conn:
         rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        
+    for r in rows:
+        max_dl = r["max_downloads"] if r["max_downloads"] is not None else global_max
+        if max_dl > 0:
+            pd = r["songs_total"] - r["songs_dl"]
+            allowed_pending = max(0, max_dl - r["songs_dl"])
+            capped_pending = min(pd, allowed_pending)
+            r["songs_total"] = r["songs_dl"] + capped_pending
+            
     return rows
 
 
@@ -410,8 +432,11 @@ def api_delete_artist(spotify_id: str, delete_files: bool = False):
         row = conn.execute("SELECT name FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
         if row:
             artist_name = row["name"]
-            # Delete artist from database (SQLite cascade removes albums & songs)
-            conn.execute("DELETE FROM artists WHERE spotify_id=?", (spotify_id,))
+            # Soft-delete artist from database so they are ignored in future playlist syncs
+            conn.execute("UPDATE artists SET active=-1 WHERE spotify_id=?", (spotify_id,))
+            # Delete their albums and songs to clean up the DB
+            conn.execute("DELETE FROM albums WHERE artist_id=?", (spotify_id,))
+            conn.execute("DELETE FROM songs WHERE artist_id=?", (spotify_id,))
             
             if delete_files:
                 # Physically delete the artist folder from storage
@@ -1547,7 +1572,13 @@ function renderArtists(){
     return `<tr><td>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
       <td>
         <div style="display:flex; gap:6px; align-items:center;">
-          <input type="number" class="sm" style="width:70px" value="${r.max_downloads||''}" placeholder="Limit" onchange="setArtistLimit('${r.spotify_id}', this.value)" title="Max Downloads (empty=global limit, 0=unlimited)" />
+          <select class="sm" style="width:85px; padding: 2px 4px; border: 1px solid var(--border-card); background: #111; color: var(--txt); border-radius: 4px;" onchange="setArtistLimit('${r.spotify_id}', this.value)" title="Max Downloads">
+            <option value="" ${r.max_downloads==null?'selected':''}>Global</option>
+            <option value="50" ${r.max_downloads===50?'selected':''}>50</option>
+            <option value="100" ${r.max_downloads===100?'selected':''}>100</option>
+            <option value="150" ${r.max_downloads===150?'selected':''}>150</option>
+            <option value="0" ${r.max_downloads===0?'selected':''}>Unlimit</option>
+          </select>
           <button class="btn ghost sm" onclick="toggleArtist('${r.spotify_id}')">${r.active?'Off':'On'}</button>
           <button class="btn danger sm" onclick="delArtist('${r.spotify_id}')">×</button>
         </div>
