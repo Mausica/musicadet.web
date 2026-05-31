@@ -890,10 +890,14 @@ def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total:
 
         # Check if file already exists on disk
         safe_artist = custom_dl._clean_filename(name)
-        safe_album = custom_dl._clean_filename(album_name)
+        resolved_album = custom_dl.detect_singles(album_name, s["title"])
+        safe_album = custom_dl._clean_filename(resolved_album)
         safe_title = custom_dl._clean_filename(s["title"])
-        trk = str(track_num).zfill(2) if track_num else "00"
-        expected = music_dir / safe_artist / safe_album / f"{trk} - {safe_title}.{fmt}"
+        if track_num and safe_album != "Singles":
+            trk = str(track_num).zfill(2)
+            expected = music_dir / safe_artist / safe_album / f"{trk} - {safe_title}.{fmt}"
+        else:
+            expected = music_dir / safe_artist / safe_album / f"{safe_title}.{fmt}"
 
         if expected.exists():
             with db_connect() as db:
@@ -1109,8 +1113,7 @@ def cmd_sync_playlist(args):
             log.info("[%d/%d] %s — %s", idx, len(songs), primary_artist, title)
 
             # Detect Singles
-            if _clean_filename(album).lower() == _clean_filename(title).lower() or not album:
-                album = "Singles"
+            album = custom_dl.detect_singles(album, title)
 
             # Check if already downloaded
             if song_id:
@@ -1206,8 +1209,7 @@ def cmd_download_direct(args):
             track_num = _track_number_from_song(song)
             yt_url = song.get("download_url") or song.get("youtube_url")
 
-            if _clean_filename(album).lower() == _clean_filename(title).lower() or not album:
-                album = "Singles"
+            album = custom_dl.detect_singles(album, title)
 
             log.info("[%d/%d] %s — %s", idx, len(songs), primary_artist, title)
             path = downloader.download_track(
@@ -1242,8 +1244,7 @@ def cmd_download_direct(args):
             album = entry.get("album") or "Unknown Album"
             track_num = None  # flat extraction usually doesn't give track numbers
 
-            if _clean_filename(album).lower() == _clean_filename(title).lower() or album == "Unknown Album":
-                album = "Singles"
+            album = custom_dl.detect_singles(album, title)
 
             # Strip "- Topic" from YouTube artist names
             if artist.endswith(" - Topic"):

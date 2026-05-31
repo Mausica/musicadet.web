@@ -570,8 +570,7 @@ def api_track_download(path: str):
         res = subprocess.run(["ffmpeg", "-y", "-i", str(full_path), "-b:a", "320k", tmp_path], 
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-            # Look up info in DB to enforce perfect metadata
+        # Look up info in DB to enforce perfect metadata
         title = full_path.stem
         artist, album, track_num = "", "", None
         rel_path = os.path.relpath(full_path, music_dir)
@@ -583,7 +582,6 @@ def api_track_download(path: str):
                 if ar: artist = ar["name"]
                 al = conn.execute("SELECT name FROM albums WHERE spotify_id=?", (song["album_id"],)).fetchone()
                 if al: album = al["name"]
-        
         
         import custom_dl
         if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
@@ -989,8 +987,17 @@ HTML = r"""<!doctype html>
     transition: .3s;
     border-radius: 50%;
   }
-  input:checked + .slider { background-color: var(--primary); }
+  .switch:hover .slider {
+    background-color: #52525b;
+  }
+  input:checked + .slider {
+    background-color: var(--success);
+    box-shadow: 0 0 8px rgba(74, 222, 128, 0.4);
+  }
   input:checked + .slider:before { transform: translateX(20px); }
+  input:focus + .slider {
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.2);
+  }
   
   th {
     color: var(--muted);
@@ -1118,7 +1125,38 @@ HTML = r"""<!doctype html>
   }
   .modal-close:hover { color: var(--txt); }
   .val { font-weight: 500; font-size: 14px; margin-bottom: 8px; color: var(--txt); }
-  @media (max-width: 500px) {
+  @media (max-width: 600px) {
+    header {
+      padding: 12px 16px;
+    }
+    .logo {
+      font-size: 26px;
+    }
+    main {
+      padding: 12px;
+    }
+    .grid.stats {
+      grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+      gap: 8px;
+    }
+    .stat {
+      padding: 12px;
+    }
+    .stat .n {
+      font-size: 22px;
+    }
+    .card {
+      padding: 16px;
+    }
+    .row {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 12px;
+    }
+    .row > * {
+      width: 100% !important;
+      flex: none !important;
+    }
     .modal-body { flex-direction: column; }
     #tmCover { width: 100% !important; height: auto !important; aspect-ratio: 1; }
   }
@@ -1436,9 +1474,11 @@ function renderArtists(){
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
     const prog=(r.songs_dl||0)+'/'+(r.songs_total||0);
     return `<tr><td>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
-      <td class="row" style="border:none">
-        <button class="btn ghost sm" onclick="toggleArtist('${r.spotify_id}')">${r.active?'Off':'On'}</button>
-        <button class="btn danger sm" onclick="delArtist('${r.spotify_id}')">×</button>
+      <td>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <button class="btn ghost sm" onclick="toggleArtist('${r.spotify_id}')">${r.active?'Off':'On'}</button>
+          <button class="btn danger sm" onclick="delArtist('${r.spotify_id}')">×</button>
+        </div>
       </td></tr>`;
   }).join('')||'<tr><td colspan=5 class="muted">No artists yet.</td></tr>';
 }
@@ -1454,10 +1494,12 @@ async function loadPlaylists(){
   $('#playlistRows').innerHTML=rows.map(r=>{
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
     return `<tr><td><a href="${esc(r.url)}" target="_blank">${esc(r.name)}</a></td><td>${act}</td><td class="muted">${(r.last_synced||'-').slice(0,10)}</td>
-      <td class="row" style="border:none">
-        <button class="btn ghost sm" onclick="syncPl('${r.url}')">Sync</button>
-        <button class="btn ghost sm" onclick="togglePl('${r.spotify_id}')">${r.active?'Off':'On'}</button>
-        <button class="btn danger sm" onclick="delPl('${r.spotify_id}')">×</button>
+      <td>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <button class="btn ghost sm" onclick="syncPl('${r.url}')">Sync</button>
+          <button class="btn ghost sm" onclick="togglePl('${r.spotify_id}')">${r.active?'Off':'On'}</button>
+          <button class="btn danger sm" onclick="delPl('${r.spotify_id}')">×</button>
+        </div>
       </td></tr>`;
   }).join('')||'<tr><td colspan=4 class="muted">No playlists.</td></tr>';
 }
@@ -1478,7 +1520,12 @@ async function loadTracks(){
   const q=encodeURIComponent($('#trackSearch').value||'');
   const rows=await api(`/api/tracks?q=${q}&limit=300`);
   $('#trackRows').innerHTML=rows.map(r=>`<tr><td>${esc(r.artist)}</td><td class="muted">${esc(r.album)}</td><td>${esc(r.title)}</td>
-    <td style="text-align:right; white-space:nowrap; display:flex; gap:6px; justify-content:flex-end; align-items:center;"><a class="btn ghost sm" href="/api/track/download?path=${encodeURIComponent(r.path)}" download title="Download"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></a><button class="btn ghost sm" onclick="showTrackInfo('${esc(r.path)}')">Info</button></td></tr>`).join('')
+    <td style="text-align:right; white-space:nowrap;">
+      <div style="display:inline-flex; gap:6px; justify-content:flex-end; align-items:center;">
+        <a class="btn ghost sm" href="/api/track/download?path=${encodeURIComponent(r.path)}" download title="Download"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></a>
+        <button class="btn ghost sm" onclick="showTrackInfo('${esc(r.path)}')">Info</button>
+      </div>
+    </td></tr>`).join('')
     ||'<tr><td colspan=4 class="muted">No files found.</td></tr>';
   $('#trackHint').textContent=rows.length+' files shown';
 }

@@ -36,7 +36,7 @@ except ImportError:
 
 try:
     from mutagen.oggopus import OggOpus
-    from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK
+    from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, APIC
     import mutagen as _mutagen_mod
 except ImportError:
     OggOpus = None
@@ -50,6 +50,16 @@ except ImportError:
 def _clean_filename(name: str) -> str:
     """Remove characters illegal on Linux/Windows filesystems."""
     return re.sub(r'[\\/*?:"<>|]', "", str(name)).strip().strip(".")
+
+
+def detect_singles(album: Optional[str], title: str) -> str:
+    if not album or album == "Unknown Album":
+        return "Singles"
+    album_clean = _clean_filename(album).lower().replace(" - single", "").replace(" - ep", "").strip()
+    title_clean = _clean_filename(title).lower().split(" (feat")[0].split(" - ")[0].strip()
+    if album_clean == title_clean:
+        return "Singles"
+    return album
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -340,12 +350,18 @@ class YtDlpDownloader:
             return None
 
         # Build the output path
+        resolved_album = detect_singles(album, title)
         artist_folder = self.music_dir / _clean_filename(artist)
-        album_folder = artist_folder / _clean_filename(album) if album else artist_folder
+        safe_album = _clean_filename(resolved_album) if resolved_album else ""
+        album_folder = artist_folder / safe_album if safe_album else artist_folder
         album_folder.mkdir(parents=True, exist_ok=True)
 
         safe_title = _clean_filename(title)
-        out_path = album_folder / f"{safe_title}.{self.fmt}"
+        if track_number and safe_album != "Singles":
+            trk = str(track_number).zfill(2)
+            out_path = album_folder / f"{trk} - {safe_title}.{self.fmt}"
+        else:
+            out_path = album_folder / f"{safe_title}.{self.fmt}"
 
         if out_path.exists():
             log.info("    ↳ Already exists: %s", out_path.name)
