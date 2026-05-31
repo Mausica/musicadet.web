@@ -56,6 +56,9 @@ def _clean_filename(name: str) -> str:
 # Metadata embedding (Mutagen)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_bad_genre(g: str) -> bool:
+    return not g or g.lower() in ("music", "music videos", "music video", "")
+
 def _fetch_itunes_cover(artist: str, title: str) -> tuple[Optional[bytes], Optional[str], Optional[str]]:
     import urllib.request, urllib.parse, json
     query = urllib.parse.quote(f"{artist} {title}")
@@ -68,7 +71,7 @@ def _fetch_itunes_cover(artist: str, title: str) -> tuple[Optional[bytes], Optio
                 img_url = result.get("artworkUrl100", "").replace("100x100bb.jpg", "600x600bb.jpg")
                 year = result.get("releaseDate", "")[:4] if "releaseDate" in result else None
                 genre = result.get("primaryGenreName")
-                if genre and genre.lower() in ("music", "music videos", "music video"):
+                if _is_bad_genre(genre):
                     genre = None
                 if img_url:
                     with urllib.request.urlopen(img_url, timeout=5) as ir:
@@ -77,6 +80,22 @@ def _fetch_itunes_cover(artist: str, title: str) -> tuple[Optional[bytes], Optio
     except Exception as e:
         log.debug("iTunes metadata fetch failed for %s - %s: %s", artist, title, e)
     return None, None, None
+
+def _fetch_artist_genre(artist: str) -> Optional[str]:
+    """Query iTunes for the artist alone to get their real genre."""
+    import urllib.request, urllib.parse, json
+    query = urllib.parse.quote(artist)
+    url = f"https://itunes.apple.com/search?term={query}&limit=5&media=music&entity=song"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            data = json.loads(r.read())
+            for result in data.get("results", []):
+                genre = result.get("primaryGenreName", "")
+                if not _is_bad_genre(genre):
+                    return genre
+    except Exception:
+        pass
+    return None
 
 def _fetch_youtube_metadata(artist: str, title: str) -> tuple[Optional[bytes], Optional[str], Optional[str]]:
     if yt_dlp is None:
@@ -140,18 +159,26 @@ def enforce_primary_artist(
             if track_number:
                 audio["tracknumber"] = [str(track_number)]
             
-            if fetch_cover and "metadata_block_picture" not in audio:
+            # Always fix bad/missing genre
+            existing_genre = audio.get("genre", [""])[0]
+            need_cover = fetch_cover and "metadata_block_picture" not in audio
+            need_genre = _is_bad_genre(existing_genre)
+            
+            if need_cover or need_genre:
                 img_data, year, genre = _fetch_itunes_cover(primary_artist, title)
                 if not img_data:
                     y_img, y_year, y_genre = _fetch_youtube_metadata(primary_artist, title)
                     img_data = img_data or y_img
                     year = year or y_year
                     genre = genre or y_genre
+                # If still no genre, search by artist name alone
+                if _is_bad_genre(genre):
+                    genre = _fetch_artist_genre(primary_artist)
                 if year:
                     audio["date"] = [str(year)]
-                if genre:
+                if genre and not _is_bad_genre(genre):
                     audio["genre"] = [genre]
-                if img_data:
+                if need_cover and img_data:
                     from mutagen.flac import Picture
                     import base64
                     pic = Picture()
@@ -177,20 +204,27 @@ def enforce_primary_artist(
             if track_number:
                 audio.add(TRCK(encoding=3, text=str(track_number)))
             
-            if fetch_cover and not audio.getall("APIC"):
+            # Always fix bad/missing genre for mp3
+            existing_genre = str(audio.get("TCON", ""))
+            need_cover = fetch_cover and not audio.getall("APIC")
+            need_genre = _is_bad_genre(existing_genre)
+            
+            if need_cover or need_genre:
                 img_data, year, genre = _fetch_itunes_cover(primary_artist, title)
                 if not img_data:
                     y_img, y_year, y_genre = _fetch_youtube_metadata(primary_artist, title)
                     img_data = img_data or y_img
                     year = year or y_year
                     genre = genre or y_genre
+                if _is_bad_genre(genre):
+                    genre = _fetch_artist_genre(primary_artist)
                 if year:
                     from mutagen.id3 import TDRC
                     audio.add(TDRC(encoding=3, text=str(year)))
-                if genre:
+                if genre and not _is_bad_genre(genre):
                     from mutagen.id3 import TCON
                     audio.add(TCON(encoding=3, text=genre))
-                if img_data:
+                if need_cover and img_data:
                     audio.add(APIC(
                         encoding=3,
                         mime="image/jpeg",
