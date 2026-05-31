@@ -31,6 +31,7 @@ DEFAULTS = {
     "bitrate": "320k",
     "threads": 4,
     "output_template": "{artist}/{album}/{title}.{output-ext}",
+    "download_format": "original",
     "playlist_save_timeout": 600,
     "playlist_save_retries": 3,
     "artist_save_timeout": 900,
@@ -41,7 +42,7 @@ DEFAULTS = {
 }
 
 CONFIG_KEYS = [
-    "music_dir", "sync_dir", "db_path", "log_dir", "format", "bitrate", "threads",
+    "music_dir", "sync_dir", "db_path", "log_dir", "format", "download_format", "bitrate", "threads",
     "output_template", "playlist_save_timeout", "playlist_save_retries",
     "artist_save_timeout", "lyrics_providers", "generate_lrc", "hud_port",
 ]
@@ -552,6 +553,48 @@ def api_track_download(path: str):
     full_path = music_dir / path
     if not full_path.exists():
         return Response(status_code=404)
+        
+    dl_format = load_cfg().get("download_format", "original")
+    ext = full_path.suffix.lower()
+    
+    if dl_format == "mp3" and ext == ".opus":
+        import tempfile, subprocess, os
+        from starlette.background import BackgroundTask
+        from fastapi.responses import FileResponse
+        
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(tmp_fd)
+        
+        # Transcode on the fly
+        subprocess.run(["ffmpeg", "-y", "-i", str(full_path), "-c:a", "libmp3lame", "-q:a", "0", tmp_path], 
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # Look up info in DB to enforce perfect metadata
+        title = full_path.stem
+        artist, album, track_num = "", "", None
+        rel_path = os.path.relpath(full_path, music_dir)
+        with db() as conn:
+            song = conn.execute("SELECT * FROM songs WHERE file_path=?", (rel_path,)).fetchone()
+            if song:
+                title, track_num = song["title"], song["track_number"]
+                ar = conn.execute("SELECT name FROM artists WHERE spotify_id=?", (song["artist_id"],)).fetchone()
+                if ar: artist = ar["name"]
+                al = conn.execute("SELECT name FROM albums WHERE spotify_id=?", (song["album_id"],)).fetchone()
+                if al: album = al["name"]
+        
+        import custom_dl
+        custom_dl.enforce_primary_artist(Path(tmp_path), artist, title, album, track_num, fetch_cover=True)
+        
+        def cleanup():
+            try: os.unlink(tmp_path)
+            except: pass
+            
+        return FileResponse(
+            path=tmp_path,
+            filename=full_path.with_suffix(".mp3").name,
+            media_type="audio/mpeg",
+            background=BackgroundTask(cleanup)
+        )
     
     import mimetypes
     mime = mimetypes.guess_type(str(full_path))[0] or "application/octet-stream"
@@ -653,9 +696,11 @@ HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>MusicaDet</title>
+<title>Musicadet</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22 font-family=%22serif%22 font-style=%22italic%22 font-weight=%22bold%22>M</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Dancing+Script:wght@700&display=swap" rel="stylesheet"/>
 <style>
   :root {
     --bg: #000000;
@@ -716,14 +761,14 @@ HTML = r"""<!doctype html>
   }
   .logo {
     font-weight: 700;
-    font-size: 26px;
+    font-size: 32px;
     letter-spacing: -.04em;
     color: #ffffff;
-    font-family: 'Brush Script MT', cursive, sans-serif;
+    padding-right: 8px;
+    font-family: 'Dancing Script', cursive;
     background: linear-gradient(135deg, #fff 0%, #a1a1aa 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
-    padding-right: 8px;
   }
   .dot {
     width: 8px;
@@ -885,7 +930,8 @@ HTML = r"""<!doctype html>
     box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.1);
   }
   input {
-    flex: 1;
+    width: 100%;
+    box-sizing: border-box;
     min-width: 160px;
   }
   label {
@@ -1176,10 +1222,16 @@ HTML = r"""<!doctype html>
       <h2>Settings</h2>
       <div class="field"><label>Music folder</label><input id="cfgMusicDir"/></div>
       <div class="row">
-        <div class="field" style="flex:1"><label>Format</label>
+        <div class="field" style="flex:1"><label>Storage format</label>
           <select id="cfgFormat" style="width:100%"><option value="mp3">mp3</option><option value="opus">opus</option><option value="flac">flac</option></select>
         </div>
+        <div class="field" style="flex:1"><label>Web download format</label>
+          <select id="cfgDlFormat" style="width:100%"><option value="original">Original (as stored)</option><option value="mp3">Transcode to mp3</option></select>
+        </div>
         <div class="field" style="flex:1"><label>Bitrate</label><input id="cfgBitrate" placeholder="320k"/></div>
+        <div class="field" style="flex:1"><label>Workers (Threads)</label>
+          <select id="cfgThreads" style="width:100%"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="8">8</option></select>
+        </div>
       </div>
       <div class="field"><label>Output template</label><input id="cfgTemplate"/></div>
       <div class="field"><label>Lyrics providers (comma-separated)</label><input id="cfgLyrics" placeholder="genius,musixmatch,azlyrics"/></div>
@@ -1187,11 +1239,12 @@ HTML = r"""<!doctype html>
         <div class="field" style="flex:1"><label>Playlist timeout (s)</label><input id="cfgPlTimeout" type="number"/></div>
         <div class="field" style="flex:1"><label>Playlist retries</label><input id="cfgPlRetries" type="number"/></div>
       </div>
-      <label style="display:flex;align-items:center;gap:8px;margin-bottom:16px;cursor:pointer">
-        <input type="checkbox" id="cfgLrc" style="flex:0;width:auto"/> Generate .lrc sidecar files
+      <label style="display:flex; align-items:center; gap:10px; margin-bottom:24px; cursor:pointer;">
+        <input type="checkbox" id="cfgLrc" style="width:18px; height:18px; margin:0; flex-shrink:0;"/>
+        <span style="font-size:14px; font-weight:500; color:var(--txt)">Generate .lrc sidecar files</span>
       </label>
-      <button class="btn" onclick="saveSettings()">Save settings</button>
-      <div class="hint">Changing HUD port requires restarting the service.</div>
+      <button class="btn" onclick="saveSettings()" style="padding:12px 24px; font-size:14px;">Save settings</button>
+      <div class="hint" style="margin-top:12px">Changing HUD port requires restarting the service.</div>
     </div>
   </section>
 
@@ -1260,18 +1313,22 @@ async function loadSettings(){
   const c=await api('/api/config');
   $('#cfgMusicDir').value=c.music_dir||'';
   $('#cfgFormat').value=c.format||'mp3';
+  $('#cfgDlFormat').value=c.download_format||'original';
   $('#cfgBitrate').value=c.bitrate||'320k';
   $('#cfgTemplate').value=c.output_template||'';
   $('#cfgLyrics').value=(c.lyrics_providers||[]).join(',');
   $('#cfgPlTimeout').value=c.playlist_save_timeout||600;
   $('#cfgPlRetries').value=c.playlist_save_retries||3;
   $('#cfgLrc').checked=!!c.generate_lrc;
+  $('#cfgThreads').value=c.threads||4;
 }
 async function saveSettings(){
   const body={
     music_dir:$('#cfgMusicDir').value.trim(),
     format:$('#cfgFormat').value,
+    download_format:$('#cfgDlFormat').value,
     bitrate:$('#cfgBitrate').value.trim(),
+    threads:parseInt($('#cfgThreads').value)||4,
     output_template:$('#cfgTemplate').value.trim(),
     lyrics_providers:$('#cfgLyrics').value.split(',').map(s=>s.trim()).filter(Boolean),
     playlist_save_timeout:parseInt($('#cfgPlTimeout').value)||600,
