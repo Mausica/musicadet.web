@@ -138,6 +138,8 @@ def _migrate_columns(db: sqlite3.Connection) -> None:
     artist_cols = {r[1] for r in db.execute("PRAGMA table_info(artists)")}
     if "albums_scanned_at" not in artist_cols:
         db.execute("ALTER TABLE artists ADD COLUMN albums_scanned_at TEXT")
+    if "max_downloads" not in artist_cols:
+        db.execute("ALTER TABLE artists ADD COLUMN max_downloads INTEGER")
 
     song_cols = {r[1] for r in db.execute("PRAGMA table_info(songs)")}
     if "youtube_url" not in song_cols:
@@ -156,6 +158,7 @@ def db_init():
                 sync_done    INTEGER DEFAULT 0,
                 last_synced  TEXT,
                 albums_scanned_at TEXT,
+                max_downloads INTEGER,
                 added_at     TEXT DEFAULT (datetime('now'))
             );
 
@@ -449,8 +452,8 @@ def cmd_deduplicate(args):
                             db.execute("UPDATE songs SET artist_id = ? WHERE album_id = ?", (canonical_id, da_id))
                     
                     # Move physical files
-                    dup_folder = Path(CFG["music_dir"]) / _clean_filename(dup_name)
-                    canonical_folder = Path(CFG["music_dir"]) / _clean_filename(canonical_name)
+                    dup_folder = Path(CFG["music_dir"]) / custom_dl._clean_filename(dup_name)
+                    canonical_folder = Path(CFG["music_dir"]) / custom_dl._clean_filename(canonical_name)
                     if dup_folder.exists() and dup_folder.is_dir() and dup_folder.resolve() != canonical_folder.resolve():
                         log.info("    Moving files from '%s' to '%s'", dup_folder.name, canonical_folder.name)
                         _merge_folders(dup_folder, canonical_folder)
@@ -1227,7 +1230,7 @@ def cmd_scan_artists(args):
     log.info("Artist catalog scan complete")
 
 
-def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total: int) -> bool:
+def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total: int, allowed_song_ids: set = None) -> bool:
     """
     Core sequential download loop for one artist.
 
@@ -1275,6 +1278,9 @@ def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total:
             """,
             (sid,),
         ).fetchall()
+
+    if allowed_song_ids is not None:
+        pending_rows = [r for r in pending_rows if r["spotify_id"] in allowed_song_ids]
 
     log.info("[%d/%d] %s — %d tracks to download", index, total, name, len(pending_rows))
 
@@ -1391,7 +1397,7 @@ def cmd_download_pending(args):
     with db_connect() as db:
         # Get artists that actually have pending songs
         artists = db.execute("""
-            SELECT DISTINCT a.spotify_id, a.name 
+            SELECT DISTINCT a.spotify_id, a.name, a.max_downloads
             FROM artists a 
             JOIN songs s ON s.artist_id = a.spotify_id 
             WHERE a.active=1 AND s.status != 'downloaded'
@@ -1401,11 +1407,37 @@ def cmd_download_pending(args):
     workers = min(int(CFG.get("scan_concurrency", 4)), max(len(artists), 1))
     log.info("Artists with pending tracks: %d (×%d workers)", len(artists), workers)
     total = len(artists)
+    
+    max_dl = int(CFG.get("max_downloads_per_artist", 0))
 
     def _dl_worker(i_a):
         i, a = i_a
-        sid, name = a["spotify_id"], a["name"]
-        return _sync_artist_with_ytdlp(sid, name, [], i, total)
+        sid, name, artist_limit = a["spotify_id"], a["name"], a["max_downloads"]
+        
+        limit = artist_limit if artist_limit is not None else max_dl
+        
+        # Determine the pending tracks we will download for this artist
+        with db_connect() as db_conn:
+            pending_songs = db_conn.execute("""
+                SELECT s.spotify_id
+                FROM songs s
+                JOIN albums al ON s.album_id = al.spotify_id
+                WHERE s.artist_id = ? AND s.status != 'downloaded'
+                ORDER BY al.release_year DESC, al.name, s.track_number
+            """, (sid,)).fetchall()
+            
+            if limit > 0 and len(pending_songs) > limit:
+                # Keep only the top 'limit' newest tracks, skip the rest
+                keep_ids = {ps["spotify_id"] for ps in pending_songs[:limit]}
+                skip_ids = [ps["spotify_id"] for ps in pending_songs[limit:]]
+                
+                # Update skipped tracks to "skipped" (or we can just leave them pending but not download them)
+                # Let's just leave them pending, but only pass the ones we want to download
+                log.info("[%d/%d] %s: Limiting download to newest %d tracks (out of %d pending)", i, total, name, limit, len(pending_songs))
+            else:
+                keep_ids = None
+                
+        return _sync_artist_with_ytdlp(sid, name, [], i, total, allowed_song_ids=keep_ids)
 
     ok = failed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:

@@ -45,7 +45,7 @@ DEFAULTS = {
 CONFIG_KEYS = [
     "music_dir", "sync_dir", "db_path", "log_dir", "format", "download_format", "bitrate", "threads",
     "output_template", "artist_scanner", "playlist_save_timeout", "playlist_save_retries",
-    "artist_save_timeout", "lyrics_providers", "generate_lrc", "hud_port",
+    "artist_save_timeout", "lyrics_providers", "generate_lrc", "hud_port", "max_downloads_per_artist",
 ]
 
 AUDIO_EXTS = {".opus", ".mp3", ".m4a", ".flac", ".ogg", ".wav", ".aac", ".webm"}
@@ -210,6 +210,7 @@ class ConfigIn(BaseModel):
     lyrics_providers: Optional[list[str]] = None
     generate_lrc: Optional[bool] = None
     hud_port: Optional[int] = None
+    max_downloads_per_artist: Optional[int] = None
 
 
 @app.get("/api/config")
@@ -242,6 +243,7 @@ def api_stats():
         p_total = conn.execute("SELECT COUNT(*) FROM playlists").fetchone()[0]
         p_active = conn.execute("SELECT COUNT(*) FROM playlists WHERE active=1").fetchone()[0]
         albums_total = conn.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
+        albums_downloaded = conn.execute("SELECT COUNT(*) FROM albums WHERE downloaded_count >= track_count AND track_count > 0").fetchone()[0]
         songs_downloaded = conn.execute("SELECT COUNT(*) FROM songs WHERE status='downloaded'").fetchone()[0]
         songs_pending = conn.execute("SELECT COUNT(*) FROM songs WHERE status='pending'").fetchone()[0]
         songs_failed = conn.execute("SELECT COUNT(*) FROM songs WHERE status='failed'").fetchone()[0]
@@ -255,7 +257,7 @@ def api_stats():
         "artists_total": a_total, "artists_active": a_active, "artists_synced": a_synced,
         "artists_pending": a_active - a_synced,
         "playlists_total": p_total, "playlists_active": p_active,
-        "albums_total": albums_total,
+        "albums_total": albums_total, "albums_downloaded": albums_downloaded,
         "songs_downloaded": songs_downloaded, "songs_pending": songs_pending,
         "songs_failed": songs_failed,
         "songs_missing_cover": songs_missing_cover,
@@ -289,7 +291,7 @@ def count_tracks() -> int:
 def api_artists(q: str = "", status: str = "all"):
     sql = """
         SELECT a.spotify_id, a.name, a.source, a.active, a.sync_done, a.last_synced, a.added_at,
-               a.albums_scanned_at,
+               a.albums_scanned_at, a.max_downloads,
                (SELECT COUNT(*) FROM albums WHERE artist_id=a.spotify_id) AS album_count,
                (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id AND status='downloaded') AS songs_dl,
                (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id) AS songs_total
@@ -386,10 +388,46 @@ def api_toggle_artist(spotify_id: str):
     return {"ok": True, "active": new}
 
 
-@app.delete("/api/artists/{spotify_id}")
-def api_delete_artist(spotify_id: str):
+@app.post("/api/artists/{spotify_id}/limit")
+async def api_set_artist_limit(spotify_id: str, request: Request):
+    data = await request.json()
+    limit = data.get("limit")
     with db() as conn:
-        conn.execute("DELETE FROM artists WHERE spotify_id=?", (spotify_id,))
+        if limit is None or limit == "":
+            conn.execute("UPDATE artists SET max_downloads = NULL WHERE spotify_id=?", (spotify_id,))
+        else:
+            conn.execute("UPDATE artists SET max_downloads = ? WHERE spotify_id=?", (int(limit), spotify_id))
+    return {"ok": True}
+
+
+@app.delete("/api/artists/{spotify_id}")
+def api_delete_artist(spotify_id: str, delete_files: bool = False):
+    import shutil
+    import re
+    from pathlib import Path
+    
+    with db() as conn:
+        row = conn.execute("SELECT name FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
+        if row:
+            artist_name = row["name"]
+            # Delete artist from database (SQLite cascade removes albums & songs)
+            conn.execute("DELETE FROM artists WHERE spotify_id=?", (spotify_id,))
+            
+            if delete_files:
+                # Physically delete the artist folder from storage
+                cfg = load_cfg()
+                music_dir = Path(cfg["music_dir"])
+                
+                # Sanitize name helper matching music_sync.py
+                def clean_name(name: str) -> str:
+                    return re.sub(r'[\\/*?:"<>|]', "", str(name)).strip().strip(".")
+                    
+                artist_folder = music_dir / clean_name(artist_name)
+                if artist_folder.exists() and artist_folder.is_dir():
+                    try:
+                        shutil.rmtree(str(artist_folder))
+                    except Exception:
+                        pass
     return {"ok": True}
 
 
@@ -1331,6 +1369,7 @@ HTML = r"""<!doctype html>
       <div class="row">
         <div class="field" style="flex:1"><label>Playlist timeout (s)</label><input id="cfgPlTimeout" type="number"/></div>
         <div class="field" style="flex:1"><label>Playlist retries</label><input id="cfgPlRetries" type="number"/></div>
+        <div class="field" style="flex:1"><label>Max DLs per Artist (0=∞)</label><input id="cfgMaxDl" type="number" placeholder="200"/></div>
       </div>
       <label style="display:flex; align-items:center; gap:12px; margin-bottom:24px; cursor:pointer;">
         <div class="switch">
@@ -1396,10 +1435,21 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
 async function api(path,opts){const r=await fetch(path,opts);return r.json();}
 async function loadStats(){
   const s=await api('/api/stats');
-  const cards=[['Artists',s.artists_total],['Synced',s.artists_synced],['Pending',s.artists_pending],
-    ['Albums',s.albums_total],['Songs OK',s.songs_downloaded],['Songs wait',s.songs_pending],
-    ['No cover',s.songs_missing_cover],['No lyrics',s.songs_missing_lyrics],['Files',s.tracks]];
-  $('#statCards').innerHTML=cards.map(c=>`<div class="card stat"><div class="n">${c[1]}</div><div class="l">${c[0]}</div></div>`).join('');
+  const total_songs = s.songs_downloaded + s.songs_pending;
+  const cards = [
+    { title: 'Artists', main: s.artists_total, sub: `${s.artists_synced} / ${s.artists_total} synced` },
+    { title: 'Albums', main: s.albums_total, sub: `${s.albums_downloaded} / ${s.albums_total} fully downloaded` },
+    { title: 'Songs', main: total_songs, sub: `${s.songs_downloaded} / ${total_songs} downloaded` }
+  ];
+  $('#statCards').innerHTML=cards.map(c=>`
+    <div class="card stat" style="padding: 20px 24px;">
+      <div class="n" style="display:flex; align-items:baseline; gap:12px; margin-bottom: 8px;">
+        <span style="font-size: 1.1em;">${c.main}</span>
+        <span style="font-size:0.45em; color:var(--muted); font-weight:normal; letter-spacing: 0.5px;">${c.sub}</span>
+      </div>
+      <div class="l" style="font-weight: 600; letter-spacing: 1px; text-transform: uppercase; font-size: 0.75em; color: var(--txt); opacity: 0.9;">${c.title}</div>
+    </div>
+  `).join('');
   const busy=!!s.running;
   $('#dot').className='dot'+(busy?' busy':'');
   $('#statusText').textContent=busy?('running: '+s.running):'idle';
@@ -1416,6 +1466,7 @@ async function loadSettings(){
   $('#cfgLyrics').value=(c.lyrics_providers||[]).join(',');
   $('#cfgPlTimeout').value=c.playlist_save_timeout||600;
   $('#cfgPlRetries').value=c.playlist_save_retries||3;
+  $('#cfgMaxDl').value=c.max_downloads_per_artist||0;
   $('#cfgLrc').checked=!!c.generate_lrc;
   $('#cfgThreads').value=c.threads||4;
 }
@@ -1431,6 +1482,7 @@ async function saveSettings(){
     lyrics_providers:$('#cfgLyrics').value.split(',').map(s=>s.trim()).filter(Boolean),
     playlist_save_timeout:parseInt($('#cfgPlTimeout').value)||600,
     playlist_save_retries:parseInt($('#cfgPlRetries').value)||3,
+    max_downloads_per_artist:parseInt($('#cfgMaxDl').value)||0,
     generate_lrc:$('#cfgLrc').checked
   };
   const r=await api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -1495,6 +1547,7 @@ function renderArtists(){
     return `<tr><td>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
       <td>
         <div style="display:flex; gap:6px; align-items:center;">
+          <input type="number" class="sm" style="width:70px" value="${r.max_downloads||''}" placeholder="Limit" onchange="setArtistLimit('${r.spotify_id}', this.value)" title="Max Downloads (empty=global limit, 0=unlimited)" />
           <button class="btn ghost sm" onclick="toggleArtist('${r.spotify_id}')">${r.active?'Off':'On'}</button>
           <button class="btn danger sm" onclick="delArtist('${r.spotify_id}')">×</button>
         </div>
@@ -1507,7 +1560,15 @@ async function addArtist(){
   $('#artistEntry').value='';toast('Adding — see console');showConsole();
 }
 async function toggleArtist(id){await api(`/api/artists/${id}/toggle`,{method:'POST'});loadArtists();}
-async function delArtist(id){if(!confirm('Remove artist?'))return;await api(`/api/artists/${id}`,{method:'DELETE'});loadArtists();}
+async function setArtistLimit(id, limit){
+  await api(`/api/artists/${id}/limit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:limit})});
+}
+async function delArtist(id){
+  if(!confirm('Remove artist from database?'))return;
+  const delFiles=confirm('Do you also want to physically delete all downloaded files/folders for this artist from storage?');
+  await api(`/api/artists/${id}?delete_files=${delFiles}`,{method:'DELETE'});
+  loadArtists();
+}
 async function loadPlaylists(){
   const rows=await api('/api/playlists');
   $('#playlistRows').innerHTML=rows.map(r=>{

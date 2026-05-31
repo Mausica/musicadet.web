@@ -148,7 +148,7 @@ def scan_artist(artist_name: str, ytmusic_instance=None) -> List[Dict]:
                 }
 
                 # Singles go into a merged "Singles" bucket
-                if category_key == "singles" and len(tracks) == 1:
+                if len(tracks) < 5 or category_key == "singles":
                     singles_tracks.append(song_dict)
                 else:
                     songs.append(song_dict)
