@@ -56,13 +56,29 @@ def _clean_filename(name: str) -> str:
 # Metadata embedding (Mutagen)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _fetch_itunes_cover(artist: str, title: str) -> Optional[bytes]:
+    import urllib.request, urllib.parse, json
+    query = urllib.parse.quote(f"{artist} {title}")
+    url = f"https://itunes.apple.com/search?term={query}&limit=1&media=music"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            data = json.loads(r.read())
+            if data.get("resultCount", 0) > 0:
+                img_url = data["results"][0].get("artworkUrl100", "").replace("100x100bb.jpg", "600x600bb.jpg")
+                if img_url:
+                    with urllib.request.urlopen(img_url, timeout=5) as ir:
+                        return ir.read()
+    except Exception as e:
+        log.debug("iTunes cover fetch failed for %s - %s: %s", artist, title, e)
+    return None
+
 def enforce_primary_artist(
     file_path: Path,
     primary_artist: str,
     title: str,
     album: str,
     track_number: Optional[int],
-    cover_url: str = None,
+    fetch_cover: bool = True,
 ) -> bool:
     """
     Write Vorbis / ID3 tags to an audio file.
@@ -82,6 +98,19 @@ def enforce_primary_artist(
                 audio["album"] = album
             if track_number:
                 audio["tracknumber"] = str(track_number)
+            
+            if fetch_cover and "metadata_block_picture" not in audio:
+                img_data = _fetch_itunes_cover(primary_artist, title)
+                if img_data:
+                    from mutagen.flac import Picture
+                    import base64
+                    pic = Picture()
+                    pic.type = 3 # front cover
+                    pic.mime = "image/jpeg"
+                    pic.desc = "Cover"
+                    pic.data = img_data
+                    audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
+            
             audio.save()
             return True
 
@@ -97,6 +126,18 @@ def enforce_primary_artist(
                 audio.add(TALB(encoding=3, text=album))
             if track_number:
                 audio.add(TRCK(encoding=3, text=str(track_number)))
+            
+            if fetch_cover and not audio.getall("APIC"):
+                img_data = _fetch_itunes_cover(primary_artist, title)
+                if img_data:
+                    audio.add(APIC(
+                        encoding=3,
+                        mime="image/jpeg",
+                        type=3,
+                        desc="Cover",
+                        data=img_data
+                    ))
+
             audio.save(file_path)
             return True
 

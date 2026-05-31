@@ -1379,15 +1379,40 @@ def cmd_fix_metadata(args):
         return
 
     for a in artists:
-        if a["spotify_id"].startswith("local:"):
-            continue
         log.info("Fixing metadata: %s", a["name"])
-        target = _artist_target(a["spotify_id"], a["name"])
-        if spotdl_fix_artist_metadata(a["spotify_id"], a["name"], target):
-            stats = reconcile_artist_downloads(a["spotify_id"], a["name"])
-            log.info("  → Metadata: %d/%d cover, %d/%d lyrics",
-                     stats["cover"], stats["downloaded"],
-                     stats["lyrics"], stats["downloaded"])
+        
+        # 1. Fallback / Local tagging: run enforce_primary_artist on all downloaded songs
+        with db_connect() as db:
+            songs = db.execute(
+                "SELECT * FROM songs WHERE artist_id=? AND status='downloaded' AND file_path IS NOT NULL",
+                (a["spotify_id"],)
+            ).fetchall()
+        
+        music_dir = Path(CFG["music_dir"])
+        for song in songs:
+            fp = Path(song["file_path"])
+            if not fp.is_absolute():
+                fp = music_dir / fp
+            if fp.exists():
+                # We already know artist/title/album from DB; embed them along with iTunes cover
+                album_name = "Unknown Album"
+                with db_connect() as db:
+                    al = db.execute("SELECT name FROM albums WHERE spotify_id=?", (song["album_id"],)).fetchone()
+                    if al: album_name = al["name"]
+                
+                custom_dl.enforce_primary_artist(fp, a["name"], song["title"], album_name, song["track_number"], fetch_cover=True)
+        
+        # 2. Spotify tagging (SpotDL): only for real Spotify artists
+        if not a["spotify_id"].startswith("local:"):
+            target = _artist_target(a["spotify_id"], a["name"])
+            if spotdl_fix_artist_metadata(a["spotify_id"], a["name"], target):
+                pass # spotdl succeeded
+
+        # 3. Reconcile to update has_cover / has_lyrics
+        stats = reconcile_artist_downloads(a["spotify_id"], a["name"])
+        log.info("  → Metadata: %d/%d cover, %d/%d lyrics",
+                 stats["cover"], stats["downloaded"],
+                 stats["lyrics"], stats["downloaded"])
 
 
 def cmd_list_albums(args):

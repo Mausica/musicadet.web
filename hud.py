@@ -473,6 +473,7 @@ ACTIONS = {
     "scan-artists-new": (["scan-artists", "--new-only"], "Scan new artists"),
     "artists-sync": (["artists-sync"], "Sync all artists"),
     "artists-sync-new": (["artists-sync", "--new-only"], "Sync new artists"),
+    "download-pending": (["download-pending"], "Download pending tracks"),
     "reconcile": (["reconcile"], "Reconcile files"),
     "migrate-structure": (["migrate-structure"], "Migrate library structure"),
     "fix-metadata": (["fix-metadata"], "Fix metadata"),
@@ -597,7 +598,12 @@ HTML = r"""<!doctype html>
     display: flex;
     align-items: center;
     gap: 16px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  header::-webkit-scrollbar {
+    display: none;
   }
   .header-gradient {
     position: absolute;
@@ -609,9 +615,14 @@ HTML = r"""<!doctype html>
   }
   .logo {
     font-weight: 700;
-    font-size: 19px;
-    letter-spacing: -.02em;
+    font-size: 26px;
+    letter-spacing: -.04em;
     color: #ffffff;
+    font-family: 'Brush Script MT', cursive, sans-serif;
+    background: linear-gradient(135deg, #fff 0%, #a1a1aa 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    padding-right: 8px;
   }
   .dot {
     width: 8px;
@@ -644,7 +655,8 @@ HTML = r"""<!doctype html>
     display: flex;
     gap: 6px;
     margin-left: auto;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    white-space: nowrap;
   }
   nav button {
     background: transparent;
@@ -904,7 +916,7 @@ HTML = r"""<!doctype html>
 <body>
 <header>
   <div class="header-gradient"></div>
-  <div class="logo">MusicaDet</div>
+  <div class="logo">M</div>
   <div class="status"><span id="dot" class="dot"></span><span id="statusText">idle</span></div>
   <nav>
     <button data-tab="dashboard" class="active">Dashboard</button>
@@ -928,7 +940,7 @@ HTML = r"""<!doctype html>
         <button class="btn ghost" onclick="action('scan-artists')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="3"></circle></svg> Scan Albums</button>
         <button class="btn ghost" onclick="action('artists-sync-new')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></svg> Sync New</button>
         <button class="btn ghost" onclick="action('artists-sync')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg> Sync All</button>
-        <button class="btn ghost" onclick="action('download-pending')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download Pending</button>
+        <button class="btn ghost" onclick="action('download-pending')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download</button>
         <button class="btn ghost" onclick="action('reconcile')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg> Reconcile</button>
         <button class="btn ghost" onclick="action('migrate-structure')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Migrate Structure</button>
         <button class="btn ghost" onclick="action('fix-metadata')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg> Fix Metadata</button>
@@ -1011,8 +1023,10 @@ HTML = r"""<!doctype html>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
-      <table><thead><tr><th>Playlist</th><th>Status</th><th>Last scan</th><th>Actions</th></tr></thead>
+      <div style="overflow-x:auto;">
+      <table class="table"><thead><tr><th>Playlist</th><th>Status</th><th>Last scan</th><th>Actions</th></tr></thead>
       <tbody id="playlistRows"></tbody></table>
+      </div>
     </div>
   </section>
 
@@ -1022,8 +1036,10 @@ HTML = r"""<!doctype html>
         <input id="trackSearch" placeholder="Search files..." oninput="loadTracks()"/>
         <button class="btn ghost sm" onclick="loadTracks()">Refresh</button>
       </div>
-      <table><thead><tr><th>Artist</th><th>Album</th><th>File</th></tr></thead>
+      <div style="overflow-x:auto;">
+      <table class="table"><thead><tr><th>Artist</th><th>Album</th><th>File</th></tr></thead>
       <tbody id="trackRows"></tbody></table>
+      </div>
       <div class="hint" id="trackHint"></div>
     </div>
   </section>
