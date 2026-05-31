@@ -883,37 +883,38 @@ def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total:
     log.info("[%d/%d] %s — %d tracks to download", index, total, name, len(pending_rows))
 
     success = True
-    with db_connect() as db:
-        for s in pending_rows:
-            yt_url = yt_url_map.get(s["spotify_id"])
-            track_num = s["track_number"]
-            album_name = s["album_name"] or "Unknown Album"
+    for s in pending_rows:
+        yt_url = yt_url_map.get(s["spotify_id"])
+        track_num = s["track_number"]
+        album_name = s["album_name"] or "Unknown Album"
 
-            # Check if file already exists on disk
-            safe_artist = custom_dl._clean_filename(name)
-            safe_album = custom_dl._clean_filename(album_name)
-            safe_title = custom_dl._clean_filename(s["title"])
-            trk = str(track_num).zfill(2) if track_num else "00"
-            expected = music_dir / safe_artist / safe_album / f"{trk} - {safe_title}.{fmt}"
+        # Check if file already exists on disk
+        safe_artist = custom_dl._clean_filename(name)
+        safe_album = custom_dl._clean_filename(album_name)
+        safe_title = custom_dl._clean_filename(s["title"])
+        trk = str(track_num).zfill(2) if track_num else "00"
+        expected = music_dir / safe_artist / safe_album / f"{trk} - {safe_title}.{fmt}"
 
-            if expected.exists():
+        if expected.exists():
+            with db_connect() as db:
                 rel = str(expected.relative_to(music_dir))
                 db.execute(
                     "UPDATE songs SET status='downloaded', file_path=? WHERE spotify_id=?",
                     (rel, s["spotify_id"]),
                 )
-                log.info("    ✓ Already on disk: %s", expected.name)
-                continue
+            log.info("    ✓ Already on disk: %s", expected.name)
+            continue
 
-            # Download
-            result = downloader.download_track(
-                artist=name,
-                title=s["title"],
-                album=album_name,
-                track_number=track_num,
-                yt_url=yt_url,
-            )
+        # Download
+        result = downloader.download_track(
+            artist=name,
+            title=s["title"],
+            album=album_name,
+            track_number=track_num,
+            yt_url=yt_url,
+        )
 
+        with db_connect() as db:
             if result and result.exists():
                 # Embed metadata
                 custom_dl.enforce_primary_artist(

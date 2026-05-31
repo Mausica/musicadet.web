@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 BASE = Path(__file__).resolve().parent
@@ -467,6 +467,71 @@ def api_tracks(q: str = "", limit: int = 300):
     return out
 
 
+@app.get("/api/track/info")
+def api_track_info(path: str):
+    music_dir = Path(load_cfg()["music_dir"])
+    full_path = music_dir / path
+    if not full_path.exists():
+        return JSONResponse({"error": "File not found"}, status_code=404)
+    
+    info = {
+        "title": full_path.stem,
+        "artist": "", "album": "", "genre": "", "year": "", "has_cover": False
+    }
+    
+    try:
+        import mutagen
+        audio = mutagen.File(full_path)
+        if audio and audio.tags:
+            tags = audio.tags
+            if full_path.suffix.lower() == ".opus":
+                info["title"] = tags.get("title", [info["title"]])[0]
+                info["artist"] = tags.get("artist", [""])[0]
+                info["album"] = tags.get("album", [""])[0]
+                info["year"] = tags.get("date", [""])[0]
+                info["genre"] = tags.get("genre", [""])[0]
+                info["has_cover"] = "metadata_block_picture" in tags
+            elif full_path.suffix.lower() == ".mp3":
+                info["title"] = str(tags.get("TIT2", info["title"]))
+                info["artist"] = str(tags.get("TPE1", ""))
+                info["album"] = str(tags.get("TALB", ""))
+                info["year"] = str(tags.get("TDRC", ""))
+                info["genre"] = str(tags.get("TCON", ""))
+                info["has_cover"] = any(k.startswith("APIC") for k in tags)
+    except Exception:
+        pass
+
+    return info
+
+
+@app.get("/api/track/cover")
+def api_track_cover(path: str):
+    music_dir = Path(load_cfg()["music_dir"])
+    full_path = music_dir / path
+    if not full_path.exists():
+        return Response(status_code=404)
+    
+    try:
+        import mutagen
+        audio = mutagen.File(full_path)
+        if audio and audio.tags:
+            if full_path.suffix.lower() == ".opus" and "metadata_block_picture" in audio.tags:
+                import base64
+                from mutagen.flac import Picture
+                b64_data = audio.tags["metadata_block_picture"][0]
+                pic = Picture(base64.b64decode(b64_data))
+                return Response(content=pic.data, media_type=pic.mime)
+            elif full_path.suffix.lower() == ".mp3":
+                for k in audio.tags:
+                    if k.startswith("APIC"):
+                        apic = audio.tags[k]
+                        return Response(content=apic.data, media_type=apic.mime)
+    except Exception:
+        pass
+    
+    return Response(status_code=404)
+
+
 ACTIONS = {
     "scan": (["scan"], "Scan playlists"),
     "scan-artists": (["scan-artists"], "Scan artist albums"),
@@ -911,6 +976,32 @@ HTML = r"""<!doctype html>
     from { opacity: 0; transform: translateY(6px); }
     to { opacity: 1; transform: translateY(0); }
   }
+  
+  .modal {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.8); z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(5px);
+  }
+  .modal-content {
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: 16px;
+    padding: 24px; width: 90%; max-width: 500px;
+    position: relative;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+  }
+  .modal-close {
+    position: absolute; top: 16px; right: 16px;
+    background: transparent; border: none; color: var(--muted);
+    font-size: 24px; cursor: pointer;
+  }
+  .modal-close:hover { color: var(--txt); }
+  .val { font-weight: 500; font-size: 14px; margin-bottom: 8px; color: var(--txt); }
+  @media (max-width: 500px) {
+    .modal-body { flex-direction: column; }
+    #tmCover { width: 100% !important; height: auto !important; aspect-ratio: 1; }
+  }
 </style>
 </head>
 <body>
@@ -1037,7 +1128,7 @@ HTML = r"""<!doctype html>
         <button class="btn ghost sm" onclick="loadTracks()">Refresh</button>
       </div>
       <div style="overflow-x:auto;">
-      <table class="table"><thead><tr><th>Artist</th><th>Album</th><th>File</th></tr></thead>
+      <table class="table"><thead><tr><th>Artist</th><th>Album</th><th>File</th><th></th></tr></thead>
       <tbody id="trackRows"></tbody></table>
       </div>
       <div class="hint" id="trackHint"></div>
@@ -1079,6 +1170,23 @@ HTML = r"""<!doctype html>
     </div>
   </section>
 </main>
+
+<div id="trackModal" class="modal hide">
+  <div class="modal-content">
+    <button class="modal-close" onclick="$('#trackModal').classList.add('hide')">×</button>
+    <div class="modal-body" style="display:flex; gap:24px;">
+      <img id="tmCover" src="" style="width:200px; height:200px; object-fit:cover; border-radius:12px; background:#111; border: 1px solid var(--border-card);" />
+      <div style="flex:1;">
+        <h2 id="tmTitle" style="margin-top:0; font-size:20px; line-height:1.2; margin-bottom:16px;"></h2>
+        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Artist</label><div id="tmArtist" class="val"></div></div>
+        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Album</label><div id="tmAlbum" class="val"></div></div>
+        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Genre</label><div id="tmGenre" class="val"></div></div>
+        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Year</label><div id="tmYear" class="val"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1231,9 +1339,28 @@ async function delPl(id){if(!confirm('Remove?'))return;await api(`/api/playlists
 async function loadTracks(){
   const q=encodeURIComponent($('#trackSearch').value||'');
   const rows=await api(`/api/tracks?q=${q}&limit=300`);
-  $('#trackRows').innerHTML=rows.map(r=>`<tr><td>${esc(r.artist)}</td><td class="muted">${esc(r.album)}</td><td>${esc(r.title)}</td></tr>`).join('')
-    ||'<tr><td colspan=3 class="muted">No files found.</td></tr>';
+  $('#trackRows').innerHTML=rows.map(r=>`<tr><td>${esc(r.artist)}</td><td class="muted">${esc(r.album)}</td><td>${esc(r.title)}</td>
+    <td style="text-align:right;"><button class="btn ghost sm" onclick="showTrackInfo('${esc(r.path)}')">Info</button></td></tr>`).join('')
+    ||'<tr><td colspan=4 class="muted">No files found.</td></tr>';
   $('#trackHint').textContent=rows.length+' files shown';
+}
+async function showTrackInfo(path) {
+  $('#tmCover').src=''; $('#tmTitle').textContent='Loading...';
+  $('#tmArtist').textContent='-'; $('#tmAlbum').textContent='-';
+  $('#tmGenre').textContent='-'; $('#tmYear').textContent='-';
+  $('#trackModal').classList.remove('hide');
+  const info=await api('/api/track/info?path='+encodeURIComponent(path));
+  if(info.error){ $('#tmTitle').textContent='Error'; return; }
+  $('#tmTitle').textContent=info.title||'Unknown';
+  $('#tmArtist').textContent=info.artist||'-';
+  $('#tmAlbum').textContent=info.album||'-';
+  $('#tmGenre').textContent=info.genre||'-';
+  $('#tmYear').textContent=info.year||'-';
+  if(info.has_cover) {
+    $('#tmCover').src='/api/track/cover?path='+encodeURIComponent(path)+'&t='+Date.now();
+  } else {
+    $('#tmCover').src='';
+  }
 }
 async function action(a){const r=await api('/api/actions/'+a,{method:'POST'});toast('Started: '+(r.label||a));showConsole();}
 async function downloadDirect(){
