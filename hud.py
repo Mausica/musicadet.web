@@ -116,6 +116,8 @@ def ensure_db() -> None:
             conn.execute("ALTER TABLE artists ADD COLUMN max_downloads INTEGER")
         if "is_romanian" not in cols:
             conn.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
+        if "romanian_manual" not in cols:
+            conn.execute("ALTER TABLE artists ADD COLUMN romanian_manual INTEGER DEFAULT 0")
         for pl in load_cfg().get("playlists", []):
             pid = _extract_id(pl.get("url", ""), "playlist")
             if pid:
@@ -429,13 +431,25 @@ async def api_set_artist_limit(spotify_id: str, request: Request):
 
 
 @app.post("/api/artists/{spotify_id}/ro")
-def api_toggle_romanian(spotify_id: str):
+async def api_set_romanian(spotify_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     with db() as conn:
-        row = conn.execute("SELECT is_romanian FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
+        row = conn.execute(
+            "SELECT is_romanian FROM artists WHERE spotify_id=?", (spotify_id,)
+        ).fetchone()
         if not row:
             return JSONResponse({"error": "not found"}, status_code=404)
-        new = 0 if row["is_romanian"] else 1
-        conn.execute("UPDATE artists SET is_romanian=? WHERE spotify_id=?", (new, spotify_id))
+        if "is_romanian" in body:
+            new = 1 if body["is_romanian"] else 0
+        else:
+            new = 0 if row["is_romanian"] else 1
+        conn.execute(
+            "UPDATE artists SET is_romanian=?, romanian_manual=1 WHERE spotify_id=?",
+            (new, spotify_id),
+        )
     return {"ok": True, "is_romanian": new}
 
 
@@ -805,6 +819,7 @@ HTML = r"""<!doctype html>
     --muted: #a1a1aa;
   }
   * { box-sizing: border-box; }
+  html { color-scheme: dark; }
   body {
     margin: 0;
     font: 14px/1.6 'Inter', system-ui, -apple-system, sans-serif;
@@ -987,6 +1002,82 @@ HTML = r"""<!doctype html>
     font-size: 12px;
     border-radius: 8px;
   }
+  .btn-ro {
+    border: 1px solid #0057b7;
+    background: rgba(0, 87, 183, 0.12);
+    color: #9ec5ff;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font: 700 11px 'Inter', sans-serif;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .btn-ro:hover {
+    background: rgba(0, 87, 183, 0.28);
+    color: #fff;
+    border-color: #3b82f6;
+  }
+  .filter-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+  .filter-chips .chip {
+    border: 1px solid var(--border-card);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--muted);
+    padding: 6px 12px;
+    border-radius: 8px;
+    font: 500 12px 'Inter', sans-serif;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .filter-chips .chip:hover {
+    color: var(--txt);
+    border-color: rgba(255, 255, 255, 0.2);
+  }
+  .filter-chips .chip.active {
+    color: var(--txt);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.25);
+  }
+  .filter-chips .chip.chip-ro.active {
+    border-color: #0057b7;
+    background: rgba(0, 87, 183, 0.2);
+    color: #9ec5ff;
+  }
+  .ro-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 26px;
+    height: 20px;
+    margin-right: 8px;
+    padding: 0 5px;
+    border-radius: 4px;
+    border: 1px solid var(--border-card);
+    background: transparent;
+    color: var(--muted);
+    font: 800 9px 'Inter', sans-serif;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    vertical-align: middle;
+    transition: all 0.15s ease;
+  }
+  .ro-toggle:hover {
+    border-color: #0057b7;
+    color: #9ec5ff;
+  }
+  .ro-toggle.on {
+    background: #0057b7;
+    border-color: #0057b7;
+    color: #fff;
+  }
+  tr.row-ro td:first-child {
+    border-left: 2px solid #0057b7;
+  }
   .btn.danger {
     background: transparent;
     color: var(--error);
@@ -1017,6 +1108,16 @@ HTML = r"""<!doctype html>
     border-color: var(--primary);
     background: rgba(255, 255, 255, 0.06);
     box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.1);
+  }
+  select {
+    color-scheme: dark;
+    background-color: #18181b;
+    cursor: pointer;
+  }
+  select option,
+  select optgroup {
+    background-color: #18181b;
+    color: #fafafa;
   }
   input {
     width: 100%;
@@ -1334,16 +1435,17 @@ HTML = r"""<!doctype html>
     <div class="card" style="margin-top:16px">
       <div class="row" style="margin-bottom:14px">
         <input id="artistSearch" placeholder="Search..." oninput="loadArtists()"/>
-        <select id="artistFilter" onchange="loadArtists()">
-          <option value="all">All</option>
-          <option value="romanian">🇷🇴 Romanian</option>
-          <option value="international">🌍 International</option>
-          <option value="active">Active</option>
-          <option value="pending">Pending</option><option value="synced">Synced</option>
-          <option value="disabled">Disabled</option>
-        </select>
+        <div class="filter-chips" id="artistFilterChips" role="group" aria-label="Filter artists">
+          <button type="button" class="chip active" data-value="all">All</button>
+          <button type="button" class="chip chip-ro" data-value="romanian">Romanian</button>
+          <button type="button" class="chip" data-value="international">International</button>
+          <button type="button" class="chip" data-value="active">Active</button>
+          <button type="button" class="chip" data-value="pending">Pending</button>
+          <button type="button" class="chip" data-value="synced">Synced</button>
+          <button type="button" class="chip" data-value="disabled">Disabled</button>
+        </div>
         <button class="btn ghost sm" onclick="loadArtists()">Refresh</button>
-        <button class="btn ghost sm" onclick="action('mark-romanian')" title="Detect Romanian artists (curated list + MusicBrainz) — run after adding artists">🇷🇴 Mark Romanian</button>
+        <button type="button" class="btn-ro" onclick="action('mark-romanian')" title="Auto-detect Romanian artists (list + MusicBrainz). Manual RO flags are kept.">RO</button>
       </div>
       <div style="overflow-x:auto;">
       <table class="table"><thead><tr><th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th>Actions</th></tr></thead>
@@ -1575,11 +1677,18 @@ async function showSongs(albumId,albumName){
     return `<tr><td class="muted">${r.track_number||''}</td><td>${esc(r.title)}</td><td>${st}</td><td>${meta(r.has_cover)}</td><td>${meta(r.has_lyrics)}</td></tr>`;
   }).join('')||'<tr><td colspan=5 class="muted">No songs.</td></tr>';
 }
-let curArt = [], artPage = 0;
+let curArt = [], artPage = 0, artistFilter = 'all';
+document.getElementById('artistFilterChips')?.addEventListener('click', e => {
+  const chip = e.target.closest('.chip');
+  if (!chip) return;
+  artistFilter = chip.dataset.value || 'all';
+  document.querySelectorAll('#artistFilterChips .chip').forEach(c =>
+    c.classList.toggle('active', c === chip));
+  loadArtists();
+});
 async function loadArtists(){
   const q=encodeURIComponent($('#artistSearch').value||'');
-  const st=$('#artistFilter').value;
-  curArt=await api(`/api/artists?q=${q}&status=${st}`);
+  curArt=await api(`/api/artists?q=${q}&status=${artistFilter}`);
   artPage=0;
   renderArtists();
 }
@@ -1591,9 +1700,10 @@ function renderArtists(){
     const sync=r.sync_done?'<span class="pill done">synced</span>':'<span class="pill pend">pending</span>';
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
     const prog=(r.songs_dl||0)+'/'+(r.songs_total||0);
-    const roFlag = r.is_romanian ? '🇷🇴' : '🌍';
-    const roTitle = r.is_romanian ? 'Mark as International' : 'Mark as Romanian';
-    return `<tr style="${r.is_romanian ? 'border-left: 2px solid #0057b7;' : ''}"><td><span title="${roTitle}" style="cursor:pointer; margin-right:6px; opacity:${r.is_romanian?'1':'0.3'}; transition:opacity 0.2s" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity='${r.is_romanian?1:0.3}'" onclick="toggleRo('${r.spotify_id}')">${roFlag}</span>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
+    const roCls = r.is_romanian ? 'on' : '';
+    const roTitle = r.is_romanian ? 'Clear Romanian flag' : 'Mark as Romanian';
+    const rowCls = r.is_romanian ? 'row-ro' : '';
+    return `<tr class="${rowCls}"><td><button type="button" class="ro-toggle ${roCls}" title="${roTitle}" onclick="setRomanian('${r.spotify_id}', ${r.is_romanian?0:1})">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
       <td>
         <div style="display:flex; gap:6px; align-items:center;">
           <select class="sm" style="width:85px; padding: 2px 4px; border: 1px solid var(--border-card); background: #111; color: var(--txt); border-radius: 4px;" onchange="setArtistLimit('${r.spotify_id}', this.value)" title="Max Downloads">
@@ -1615,7 +1725,14 @@ async function addArtist(){
   $('#artistEntry').value='';toast('Adding — see console');showConsole();
 }
 async function toggleArtist(id){await api(`/api/artists/${id}/toggle`,{method:'POST'});loadArtists();}
-async function toggleRo(id){await api(`/api/artists/${id}/ro`,{method:'POST'});loadArtists();}
+async function setRomanian(id, val){
+  await api(`/api/artists/${id}/ro`,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({is_romanian: !!val}),
+  });
+  loadArtists();
+}
 async function setArtistLimit(id, limit){
   await api(`/api/artists/${id}/limit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:limit})});
 }

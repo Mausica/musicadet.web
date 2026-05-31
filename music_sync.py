@@ -142,6 +142,8 @@ def _migrate_columns(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE artists ADD COLUMN max_downloads INTEGER")
     if "is_romanian" not in artist_cols:
         db.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
+    if "romanian_manual" not in artist_cols:
+        db.execute("ALTER TABLE artists ADD COLUMN romanian_manual INTEGER DEFAULT 0")
 
     song_cols = {r[1] for r in db.execute("PRAGMA table_info(songs)")}
     if "youtube_url" not in song_cols:
@@ -291,14 +293,47 @@ _ROMANIAN_ARTISTS = {
 }
 
 
+def _normalize_artist_name(name: str) -> tuple[str, str]:
+    """Strip YouTube/Spotify noise before Romanian matching."""
+    n = name.lower()
+    for cut in (
+        " - topic", " - vevo", " - official", " official", " topic",
+        " (official", " [official",
+    ):
+        if cut in n:
+            n = n.split(cut)[0]
+    n = re.sub(r"\s*-\s*official.*$", "", n, flags=re.I)
+    n = re.sub(r"#\s*\d+.*$", "", n)
+    n = re.sub(r"\s+\d+\s*$", "", n)
+    n = re.sub(r"[^a-z0-9 ]", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    ns = re.sub(r"[^a-z0-9]", "", n)
+    return n, ns
+
+
+def _matches_romanian_list(norm: str, norm_nospace: str) -> bool:
+    if norm in _ROMANIAN_ARTISTS or norm_nospace in _ROMANIAN_ARTISTS:
+        return True
+    for ro_name in _ROMANIAN_ARTISTS:
+        if len(ro_name) < 4:
+            continue
+        if ro_name in norm or ro_name in norm_nospace:
+            return True
+        if norm and (norm in ro_name or norm_nospace in ro_name):
+            if len(norm) >= 4:
+                return True
+    return _is_romanian_fuzzy(norm) or _is_romanian_fuzzy(norm_nospace)
+
+
 def _is_romanian_fuzzy(norm: str) -> bool:
     """Check if a normalized artist name fuzzy-matches any known Romanian artist."""
+    if not norm or len(norm) < 3:
+        return False
     from difflib import SequenceMatcher
     for ro_name in _ROMANIAN_ARTISTS:
-        # Only fuzzy-match names of similar length (avoid false positives)
-        if abs(len(norm) - len(ro_name)) <= 3:
+        if abs(len(norm) - len(ro_name)) <= 4:
             ratio = SequenceMatcher(None, norm, ro_name).ratio()
-            if ratio >= 0.88:
+            if ratio >= 0.85:
                 return True
     return False
 
@@ -318,13 +353,17 @@ def _check_musicbrainz(artist_name: str) -> bool:
             data = json.loads(resp.read())
         artists = data.get("artists", [])
         for a in artists:
-            # Check score confidence (MusicBrainz returns 0-100 score)
-            if int(a.get("score", 0)) >= 85:
+            if int(a.get("score", 0)) >= 70:
                 country = (a.get("country") or "").upper()
                 area = (a.get("area") or {}).get("name", "").lower()
                 if country == "RO" or "romania" in area:
                     _mb_cache[artist_name] = True
-                    time.sleep(0.3)  # Respect MusicBrainz rate limit (1 req/sec)
+                    time.sleep(0.35)
+                    return True
+                begin = (a.get("begin-area") or {}).get("name", "").lower()
+                if "romania" in begin:
+                    _mb_cache[artist_name] = True
+                    time.sleep(0.35)
                     return True
         _mb_cache[artist_name] = False
         time.sleep(0.3)
@@ -345,31 +384,22 @@ def _auto_mark_romanian_artists():
             # Only process artists not yet manually set (is_romanian IS NULL means never checked)
             # We use is_romanian=0 as "not marked" — but we don't re-check already marked ones
             artists = db.execute(
-                "SELECT spotify_id, name FROM artists WHERE active >= 0 AND is_romanian = 0"
+                """SELECT spotify_id, name FROM artists
+                   WHERE active >= 0 AND is_romanian = 0 AND COALESCE(romanian_manual, 0) = 0"""
             ).fetchall()
 
             marked = 0
             mb_checked = 0
+            mb_cap = int(CFG.get("romanian_mb_cap", 0))  # 0 = no cap
             for art in artists:
                 name = art["name"]
-                norm = re.sub(r'[^a-z0-9 ]', '', name.lower()).strip()
-                norm_nospace = re.sub(r'[^a-z0-9]', '', name.lower()).strip()
+                norm, norm_nospace = _normalize_artist_name(name)
 
-                is_ro = False
+                is_ro = _matches_romanian_list(norm, norm_nospace)
+                if is_ro:
+                    log.debug("RO (list): %s", name)
 
-                # Tier 1: Exact match
-                if norm in _ROMANIAN_ARTISTS or norm_nospace in _ROMANIAN_ARTISTS:
-                    is_ro = True
-                    log.debug("RO (exact): %s", name)
-
-                # Tier 2: Fuzzy match (handles ' - Topic', diacritics, typos)
-                if not is_ro:
-                    if _is_romanian_fuzzy(norm) or _is_romanian_fuzzy(norm_nospace):
-                        is_ro = True
-                        log.debug("RO (fuzzy): %s", name)
-
-                # Tier 3: MusicBrainz API (only for artists not in our list)
-                if not is_ro and mb_checked < 200:  # Cap API calls per run
+                if not is_ro and (mb_cap == 0 or mb_checked < mb_cap):
                     is_ro = _check_musicbrainz(name)
                     mb_checked += 1
                     if is_ro:
@@ -378,12 +408,14 @@ def _auto_mark_romanian_artists():
                 if is_ro:
                     db.execute(
                         "UPDATE artists SET is_romanian=1 WHERE spotify_id=?",
-                        (art["spotify_id"],)
+                        (art["spotify_id"],),
                     )
                     marked += 1
 
-            if marked:
-                log.info("Auto-marked %d Romanian artists (checked %d via MusicBrainz)", marked, mb_checked)
+            log.info(
+                "Romanian detection: marked %d / %d artists (%d MusicBrainz lookups)",
+                marked, len(artists), mb_checked,
+            )
     except Exception as e:
         log.warning("Auto-mark Romanian artists failed: %s", e)
 
