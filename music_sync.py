@@ -125,7 +125,7 @@ log = logging.getLogger("musicadet")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(CFG["db_path"])
+    conn = sqlite3.connect(CFG["db_path"], timeout=60.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -317,13 +317,14 @@ def verify_song_metadata(path: Path) -> dict:
             ))
         else:
             from mutagen import File as MutagenFile
-            audio = MutagenFile(path, easy=True)
+            audio = MutagenFile(path)
             if audio is not None and audio.tags:
                 tags = audio.tags
                 result["has_core_tags"] = int(bool(
                     tags.get("title") and tags.get("artist") and tags.get("album")
                 ))
-                result["has_cover"] = int(bool(getattr(audio, "pictures", None)))
+                has_pic = bool(getattr(audio, "pictures", None)) or "metadata_block_picture" in tags
+                result["has_cover"] = int(has_pic)
     except Exception as e:
         log.debug("metadata verify failed for %s: %s", path, e)
     return result

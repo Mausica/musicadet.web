@@ -56,7 +56,7 @@ def _clean_filename(name: str) -> str:
 # Metadata embedding (Mutagen)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_itunes_cover(artist: str, title: str) -> Optional[bytes]:
+def _fetch_itunes_cover(artist: str, title: str) -> tuple[Optional[bytes], Optional[str], Optional[str]]:
     import urllib.request, urllib.parse, json
     query = urllib.parse.quote(f"{artist} {title}")
     url = f"https://itunes.apple.com/search?term={query}&limit=1&media=music"
@@ -64,13 +64,17 @@ def _fetch_itunes_cover(artist: str, title: str) -> Optional[bytes]:
         with urllib.request.urlopen(url, timeout=5) as r:
             data = json.loads(r.read())
             if data.get("resultCount", 0) > 0:
-                img_url = data["results"][0].get("artworkUrl100", "").replace("100x100bb.jpg", "600x600bb.jpg")
+                result = data["results"][0]
+                img_url = result.get("artworkUrl100", "").replace("100x100bb.jpg", "600x600bb.jpg")
+                year = result.get("releaseDate", "")[:4] if "releaseDate" in result else None
+                genre = result.get("primaryGenreName")
                 if img_url:
                     with urllib.request.urlopen(img_url, timeout=5) as ir:
-                        return ir.read()
+                        return ir.read(), year, genre
+                return None, year, genre
     except Exception as e:
-        log.debug("iTunes cover fetch failed for %s - %s: %s", artist, title, e)
-    return None
+        log.debug("iTunes metadata fetch failed for %s - %s: %s", artist, title, e)
+    return None, None, None
 
 def enforce_primary_artist(
     file_path: Path,
@@ -91,16 +95,20 @@ def enforce_primary_artist(
     try:
         if ext == ".opus":
             audio = OggOpus(file_path)
-            audio["title"] = title
-            audio["artist"] = primary_artist
-            audio["albumartist"] = primary_artist
+            audio["title"] = [title]
+            audio["artist"] = [primary_artist]
+            audio["albumartist"] = [primary_artist]
             if album:
-                audio["album"] = album
+                audio["album"] = [album]
             if track_number:
-                audio["tracknumber"] = str(track_number)
+                audio["tracknumber"] = [str(track_number)]
             
             if fetch_cover and "metadata_block_picture" not in audio:
-                img_data = _fetch_itunes_cover(primary_artist, title)
+                img_data, year, genre = _fetch_itunes_cover(primary_artist, title)
+                if year:
+                    audio["date"] = [str(year)]
+                if genre:
+                    audio["genre"] = [genre]
                 if img_data:
                     from mutagen.flac import Picture
                     import base64
@@ -128,7 +136,13 @@ def enforce_primary_artist(
                 audio.add(TRCK(encoding=3, text=str(track_number)))
             
             if fetch_cover and not audio.getall("APIC"):
-                img_data = _fetch_itunes_cover(primary_artist, title)
+                img_data, year, genre = _fetch_itunes_cover(primary_artist, title)
+                if year:
+                    from mutagen.id3 import TDRC
+                    audio.add(TDRC(encoding=3, text=str(year)))
+                if genre:
+                    from mutagen.id3 import TCON
+                    audio.add(TCON(encoding=3, text=genre))
                 if img_data:
                     audio.add(APIC(
                         encoding=3,
@@ -375,7 +389,7 @@ def check_and_complete_artist_albums(
     download via yt-dlp.
     Returns the number of albums that were (re-)downloaded.
     """
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=60.0)
     conn.row_factory = sqlite3.Row
 
     albums = conn.execute(
