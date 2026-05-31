@@ -54,8 +54,13 @@ WRAPPER
 chmod +x /usr/local/bin/musicadet
 rm -f /usr/local/bin/music-sync
 
+echo "==> Stopping HUD before database init..."
+systemctl stop musicadet-hud.service 2>/dev/null || true
+sleep 2
+
 echo "==> Initializing database (schema only)..."
 python3 "$INSTALL_DIR/music_sync.py" init-db >/dev/null 2>&1 || true
+sleep 1
 
 echo "==> Removing legacy systemd units (if any)..."
 for old in music-sync.timer music-sync-hud.service music-sync.service; do

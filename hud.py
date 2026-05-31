@@ -8,12 +8,16 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
+
+_db_lock = threading.RLock()
+_schema_ready = False
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -72,25 +76,39 @@ def public_cfg() -> dict:
 
 def db() -> sqlite3.Connection:
     cfg = load_cfg()
-    conn = sqlite3.connect(cfg["db_path"], timeout=30)
+    conn = sqlite3.connect(cfg["db_path"], timeout=60, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=60000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
+def _commit_retry(conn: sqlite3.Connection, attempts: int = 8) -> None:
+    for attempt in range(attempts):
+        try:
+            conn.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt >= attempts - 1:
+                raise
+            time.sleep(0.15 * (attempt + 1))
+
+
 @contextmanager
 def db_tx():
-    """Writable DB transaction with explicit commit."""
-    conn = db()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    """Writable DB transaction — serialized to avoid database is locked."""
+    with _db_lock:
+        conn = db()
+        try:
+            yield conn
+            _commit_retry(conn)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def _ensure_artist_schema(conn: sqlite3.Connection) -> None:
@@ -103,61 +121,80 @@ def _ensure_artist_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE artists ADD COLUMN romanian_manual INTEGER DEFAULT 0")
 
 
-def ensure_db() -> None:
-    with db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS artists (
-              spotify_id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT DEFAULT 'manual',
-              active INTEGER DEFAULT 1, sync_done INTEGER DEFAULT 0, last_synced TEXT,
-              albums_scanned_at TEXT, added_at TEXT DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS playlists (
-              spotify_id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL,
-              active INTEGER DEFAULT 1, last_synced TEXT
-            );
-            CREATE TABLE IF NOT EXISTS playlist_artists (
-              playlist_id TEXT NOT NULL, artist_id TEXT NOT NULL,
-              PRIMARY KEY (playlist_id, artist_id)
-            );
-            CREATE TABLE IF NOT EXISTS albums (
-              spotify_id TEXT PRIMARY KEY, artist_id TEXT NOT NULL, name TEXT NOT NULL,
-              release_year TEXT, track_count INTEGER DEFAULT 0, downloaded_count INTEGER DEFAULT 0,
-              last_scanned TEXT, UNIQUE(artist_id, name)
-            );
-            CREATE TABLE IF NOT EXISTS songs (
-              spotify_id TEXT PRIMARY KEY, album_id TEXT NOT NULL, artist_id TEXT NOT NULL,
-              title TEXT NOT NULL, track_number INTEGER, status TEXT DEFAULT 'pending',
-              file_path TEXT, has_cover INTEGER DEFAULT 0, has_lyrics INTEGER DEFAULT 0,
-              has_core_tags INTEGER DEFAULT 0, metadata_checked_at TEXT, last_error TEXT,
-              updated_at TEXT DEFAULT (datetime('now'))
-            );
-            """
-        )
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(artists)")}
-        if "albums_scanned_at" not in cols:
-            conn.execute("ALTER TABLE artists ADD COLUMN albums_scanned_at TEXT")
-        if "max_downloads" not in cols:
-            conn.execute("ALTER TABLE artists ADD COLUMN max_downloads INTEGER")
-        if "is_romanian" not in cols:
-            conn.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
-        if "romanian_manual" not in cols:
-            conn.execute("ALTER TABLE artists ADD COLUMN romanian_manual INTEGER DEFAULT 0")
-        conn.executescript(
-            """
-            CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
-            CREATE INDEX IF NOT EXISTS idx_songs_artist_status ON songs(artist_id, status);
-            CREATE INDEX IF NOT EXISTS idx_artists_active_name ON artists(active, name);
-            """
-        )
-        for pl in load_cfg().get("playlists", []):
-            pid = _extract_id(pl.get("url", ""), "playlist")
-            if pid:
-                conn.execute(
-                    """INSERT INTO playlists (spotify_id, name, url) VALUES (?,?,?)
-                       ON CONFLICT(spotify_id) DO UPDATE SET name=excluded.name, url=excluded.url""",
-                    (pid, pl["name"], pl["url"]),
-                )
+def ensure_db(force: bool = False) -> None:
+    global _schema_ready
+    if _schema_ready and not force:
+        return
+    last_exc: Optional[Exception] = None
+    for attempt in range(10):
+        try:
+            with db_tx() as conn:
+                _run_ensure_db_schema(conn)
+            _schema_ready = True
+            return
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            if "locked" not in str(exc).lower():
+                raise
+            time.sleep(0.3 * (attempt + 1))
+    if last_exc:
+        raise last_exc
+
+
+def _run_ensure_db_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS artists (
+          spotify_id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT DEFAULT 'manual',
+          active INTEGER DEFAULT 1, sync_done INTEGER DEFAULT 0, last_synced TEXT,
+          albums_scanned_at TEXT, added_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS playlists (
+          spotify_id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL,
+          active INTEGER DEFAULT 1, last_synced TEXT
+        );
+        CREATE TABLE IF NOT EXISTS playlist_artists (
+          playlist_id TEXT NOT NULL, artist_id TEXT NOT NULL,
+          PRIMARY KEY (playlist_id, artist_id)
+        );
+        CREATE TABLE IF NOT EXISTS albums (
+          spotify_id TEXT PRIMARY KEY, artist_id TEXT NOT NULL, name TEXT NOT NULL,
+          release_year TEXT, track_count INTEGER DEFAULT 0, downloaded_count INTEGER DEFAULT 0,
+          last_scanned TEXT, UNIQUE(artist_id, name)
+        );
+        CREATE TABLE IF NOT EXISTS songs (
+          spotify_id TEXT PRIMARY KEY, album_id TEXT NOT NULL, artist_id TEXT NOT NULL,
+          title TEXT NOT NULL, track_number INTEGER, status TEXT DEFAULT 'pending',
+          file_path TEXT, has_cover INTEGER DEFAULT 0, has_lyrics INTEGER DEFAULT 0,
+          has_core_tags INTEGER DEFAULT 0, metadata_checked_at TEXT, last_error TEXT,
+          updated_at TEXT DEFAULT (datetime('now'))
+        );
+        """
+    )
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(artists)")}
+    if "albums_scanned_at" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN albums_scanned_at TEXT")
+    if "max_downloads" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN max_downloads INTEGER")
+    if "is_romanian" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
+    if "romanian_manual" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN romanian_manual INTEGER DEFAULT 0")
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
+        CREATE INDEX IF NOT EXISTS idx_songs_artist_status ON songs(artist_id, status);
+        CREATE INDEX IF NOT EXISTS idx_artists_active_name ON artists(active, name);
+        """
+    )
+    for pl in load_cfg().get("playlists", []):
+        pid = _extract_id(pl.get("url", ""), "playlist")
+        if pid:
+            conn.execute(
+                """INSERT INTO playlists (spotify_id, name, url) VALUES (?,?,?)
+                   ON CONFLICT(spotify_id) DO UPDATE SET name=excluded.name, url=excluded.url""",
+                (pid, pl["name"], pl["url"]),
+            )
 
 
 def _extract_id(url: str, kind: str) -> Optional[str]:
@@ -215,14 +252,13 @@ app = FastAPI(title="MusicaDet HUD")
 
 @app.on_event("startup")
 async def _startup() -> None:
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    Path(load_cfg()["db_path"]).parent.mkdir(parents=True, exist_ok=True)
     try:
-        Path(load_cfg()["db_path"]).parent.mkdir(parents=True, exist_ok=True)
         ensure_db()
     except Exception as exc:
-        import logging
-        logging.basicConfig(level=logging.ERROR)
-        logging.error("HUD startup failed (database init): %s", exc)
-        raise
+        logging.error("HUD schema init deferred (will retry on write): %s", exc)
 
 
 class ArtistIn(BaseModel):
@@ -286,7 +322,6 @@ def api_put_config(body: ConfigIn):
 
 @app.get("/api/stats")
 def api_stats():
-    ensure_db()
     with db() as conn:
         a_total = conn.execute("SELECT COUNT(*) FROM artists").fetchone()[0]
         a_active = conn.execute("SELECT COUNT(*) FROM artists WHERE active=1").fetchone()[0]
@@ -356,6 +391,7 @@ def _decode_artist_id(spotify_id: str) -> str:
 
 
 def _apply_artist_limit(spotify_id: str, limit_raw) -> dict:
+    _db_ready()
     sid = _decode_artist_id((spotify_id or "").strip())
     if not sid:
         return {"error": "missing artist id"}
@@ -555,6 +591,7 @@ def api_db_summary():
 
 @app.post("/api/artists/bulk")
 def api_bulk_artists(body: BulkArtistsIn):
+    _db_ready()
     allowed = {"enable", "disable", "ro_on", "ro_off", "limit"}
     if body.action not in allowed:
         return JSONResponse({"error": "invalid action"}, status_code=400)
@@ -617,8 +654,14 @@ async def api_add_artist(body: ArtistIn):
     return {"ok": True}
 
 
+def _db_ready() -> None:
+    if not _schema_ready:
+        ensure_db()
+
+
 @app.post("/api/artists/{spotify_id:path}/toggle")
 def api_toggle_artist(spotify_id: str):
+    _db_ready()
     spotify_id = _decode_artist_id(spotify_id)
     with db_tx() as conn:
         row = conn.execute("SELECT active FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
@@ -656,6 +699,7 @@ async def api_set_artist_limit(spotify_id: str, request: Request):
 
 @app.post("/api/artists/{spotify_id:path}/ro")
 async def api_set_romanian(spotify_id: str, request: Request):
+    _db_ready()
     spotify_id = _decode_artist_id(spotify_id)
     try:
         body = await request.json()
@@ -705,6 +749,7 @@ def _purge_artist_data(spotify_id: str, artist_name: str, delete_files: bool) ->
 
 @app.delete("/api/artists/{spotify_id:path}")
 async def api_delete_artist(spotify_id: str, delete_files: bool = False):
+    _db_ready()
     spotify_id = _decode_artist_id(spotify_id)
     with db_tx() as conn:
         row = conn.execute("SELECT name FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
@@ -1048,7 +1093,10 @@ HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<meta name="theme-color" content="#000000"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
 <title>Musicadet</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22 font-family=%22serif%22 font-style=%22italic%22 font-weight=%22bold%22>M</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
@@ -1068,7 +1116,7 @@ HTML = r"""<!doctype html>
     --txt: #fafafa;
     --muted: #a1a1aa;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html { color-scheme: dark; }
   body {
     margin: 0;
@@ -1076,6 +1124,8 @@ HTML = r"""<!doctype html>
     color: var(--txt);
     background: radial-gradient(1000px 600px at 50% -10%, rgba(255, 255, 255, 0.03), transparent 70%), var(--bg);
     min-height: 100vh;
+    min-height: 100dvh;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   }
   a {
     color: var(--txt);
@@ -1086,24 +1136,22 @@ HTML = r"""<!doctype html>
     color: #ffffff;
     text-decoration: underline;
   }
-  header {
-    position: relative;
+  .app-chrome {
     position: sticky;
     top: 0;
-    z-index: 20;
+    z-index: 25;
     backdrop-filter: blur(20px);
-    background: rgba(0, 0, 0, 0.85);
+    background: rgba(0, 0, 0, 0.92);
     border-bottom: 1px solid var(--border-card);
-    padding: 16px 24px;
+  }
+  header {
+    position: relative;
+    padding: 14px 20px;
     display: flex;
     align-items: center;
-    gap: 16px;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-  header::-webkit-scrollbar {
-    display: none;
+    gap: 12px;
+    max-width: 1200px;
+    margin: 0 auto;
   }
   .header-gradient {
     position: absolute;
@@ -1151,14 +1199,19 @@ HTML = r"""<!doctype html>
     border-radius: 99px;
     border: 1px solid var(--border-card);
   }
-  nav {
+  .main-nav {
     display: flex;
     gap: 6px;
-    margin-left: auto;
     flex-wrap: nowrap;
-    white-space: nowrap;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 20px 12px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
   }
-  nav button {
+  .main-nav::-webkit-scrollbar { display: none; }
+  .main-nav button {
     background: transparent;
     border: 1px solid transparent;
     color: var(--muted);
@@ -1167,21 +1220,64 @@ HTML = r"""<!doctype html>
     cursor: pointer;
     font: 500 13px 'Inter', sans-serif;
     transition: all 0.2s ease;
+    flex: 0 0 auto;
+    touch-action: manipulation;
   }
-  nav button.active {
+  @media (min-width: 769px) {
+    .app-chrome {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      padding-right: 8px;
+    }
+    header { flex: 1; min-width: 0; padding: 14px 12px 14px 20px; }
+    .main-nav {
+      margin-left: auto;
+      padding: 14px 20px 14px 0;
+      flex: 0 1 auto;
+    }
+  }
+  nav button.active,
+  .main-nav button.active {
     color: var(--txt);
     background: rgba(255, 255, 255, 0.06);
     border-color: var(--border-card);
   }
-  nav button:hover {
+  nav button:hover,
+  .main-nav button:hover {
     color: var(--txt);
     background: rgba(255, 255, 255, 0.03);
   }
   main {
     max-width: 1200px;
     margin: 0 auto;
-    padding: 24px;
+    padding: 20px;
+    padding-bottom: max(20px, env(safe-area-inset-bottom));
   }
+  .table-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 0 -4px;
+    padding: 0 4px;
+  }
+  .pager {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+  }
+  .pager .btn { min-height: 44px; min-width: 88px; justify-content: center; }
+  .toolbar-stack {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  .toolbar-stack > input { flex: 1 1 180px; min-width: 0; }
+  .toolbar-stack > .filter-chips { flex: 1 1 100%; }
   .grid {
     display: grid;
     gap: 16px;
@@ -1248,9 +1344,10 @@ HTML = r"""<!doctype html>
     background: rgba(255, 255, 255, 0.06);
   }
   .btn.sm {
-    padding: 6px 12px;
+    padding: 8px 14px;
     font-size: 12px;
     border-radius: 8px;
+    min-height: 40px;
   }
   .btn-ro {
     border: 1px solid #0057b7;
@@ -1561,11 +1658,13 @@ HTML = r"""<!doctype html>
     border: 1px solid var(--border-card);
     background: transparent;
     color: var(--txt);
-    padding: 4px 9px;
-    border-radius: 6px;
-    font: 600 11px 'Inter', sans-serif;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font: 600 12px 'Inter', sans-serif;
     cursor: pointer;
     line-height: 1.2;
+    min-height: 40px;
+    touch-action: manipulation;
   }
   .sel-btn:hover { background: rgba(255, 255, 255, 0.06); }
   .sel-btn.ro { border-color: #0057b7; color: #9ec5ff; }
@@ -1628,6 +1727,14 @@ HTML = r"""<!doctype html>
     box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
   }
   .toast.show { opacity: 1; transform: none; }
+  .toast.err {
+    background: #450a0a;
+    color: #fecaca;
+    border: 1px solid var(--error);
+    max-width: min(420px, calc(100vw - 40px));
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
   .progress {
     font-variant-numeric: tabular-nums;
     font-size: 12px;
@@ -1667,58 +1774,253 @@ HTML = r"""<!doctype html>
   }
   .modal-close:hover { color: var(--txt); }
   .val { font-weight: 500; font-size: 14px; margin-bottom: 8px; color: var(--txt); }
-  @media (max-width: 600px) {
+  @media (max-width: 768px) {
+    .app-chrome {
+      border-bottom: none;
+    }
     header {
-      padding: 12px 16px;
+      padding: 10px 14px;
     }
     .logo {
-      font-size: 26px;
+      font-size: 28px;
+    }
+    .status {
+      font-size: 11px;
+      margin-left: auto;
+    }
+    .main-nav {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 40;
+      max-width: none;
+      margin: 0;
+      padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
+      gap: 4px;
+      background: rgba(0, 0, 0, 0.96);
+      border-top: 1px solid var(--border-card);
+      box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.6);
+    }
+    .main-nav button {
+      flex: 1 1 0;
+      min-width: 0;
+      min-height: 48px;
+      padding: 6px 4px;
+      font-size: 10px;
+      font-weight: 600;
+      border-radius: 10px;
+      text-align: center;
+      line-height: 1.2;
     }
     main {
-      padding: 12px;
+      padding: 12px 12px calc(88px + env(safe-area-inset-bottom));
+    }
+    h2 {
+      font-size: 16px;
+      margin-bottom: 12px;
     }
     .grid.stats {
-      grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+      grid-template-columns: 1fr;
       gap: 8px;
     }
-    .stat {
-      padding: 12px;
-    }
     .stat .n {
-      font-size: 22px;
+      font-size: 24px;
+    }
+    .stat .n span[style] {
+      display: block !important;
+      margin-top: 4px !important;
+      font-size: 12px !important;
     }
     .card {
-      padding: 16px;
+      padding: 14px;
+      border-radius: 12px;
+    }
+    .actions {
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .actions .btn {
+      justify-content: center;
+      min-height: 48px;
+      padding: 12px 10px;
+      font-size: 12px;
+    }
+    .actions .btn svg {
+      display: none;
     }
     .row {
       flex-direction: column;
       align-items: stretch;
-      gap: 12px;
+      gap: 10px;
     }
     .row > * {
       width: 100% !important;
       flex: none !important;
     }
+    .toolbar-stack .toolbar-select,
+    .toolbar-stack .btn-ro,
+    .toolbar-stack .btn {
+      width: 100%;
+      min-height: 44px;
+    }
+    .sel-bar {
+      overflow-x: auto;
+      flex-wrap: nowrap;
+      -webkit-overflow-scrolling: touch;
+      padding-bottom: 4px;
+    }
+    .sel-bar .sel-btn {
+      flex: 0 0 auto;
+    }
+    .toast {
+      left: 12px;
+      right: 12px;
+      bottom: calc(76px + env(safe-area-inset-bottom));
+      text-align: center;
+      max-width: none;
+    }
+    .console {
+      height: 50vh;
+      font-size: 12px;
+    }
+    .modal-content {
+      width: 94%;
+      max-height: 90vh;
+      overflow-y: auto;
+      margin: 12px;
+    }
     .modal-body { flex-direction: column; }
     #tmCover { width: 100% !important; height: auto !important; aspect-ratio: 1; }
+    /* Card layout for data tables */
+    .table-cards thead {
+      display: none;
+    }
+    .table-cards tbody tr {
+      display: block;
+      margin-bottom: 12px;
+      padding: 12px 14px;
+      border: 1px solid var(--border-card);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.02);
+    }
+    .table-cards tbody tr:hover td {
+      background: transparent;
+    }
+    .table-cards tbody td {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 0;
+      border: none;
+      text-align: right;
+    }
+    .table-cards tbody td::before {
+      content: attr(data-label);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      flex: 0 0 auto;
+      text-align: left;
+    }
+    .table-cards tbody td.chk-col::before,
+    .table-cards tbody td[data-label=""]::before {
+      display: none;
+    }
+    .table-cards tbody td.chk-col {
+      justify-content: flex-start;
+      padding-bottom: 4px;
+    }
+    .table-cards tbody td:last-child,
+    .table-cards tbody td.td-actions {
+      flex-direction: column;
+      align-items: stretch;
+      padding-top: 10px;
+      margin-top: 4px;
+      border-top: 1px solid var(--border-card);
+    }
+    .table-cards tbody td:last-child::before,
+    .table-cards tbody td.td-actions::before {
+      align-self: flex-start;
+      margin-bottom: 6px;
+    }
+    .table-cards tbody td.td-actions > div,
+    .table-cards tbody td:last-child > div {
+      width: 100%;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: stretch;
+    }
+    .table-cards tbody td.td-actions .toolbar-select,
+    .table-cards tbody td:last-child .toolbar-select {
+      flex: 1 1 100%;
+      min-height: 44px;
+      width: 100% !important;
+    }
+    .table-cards tbody td.td-actions .btn,
+    .table-cards tbody td:last-child .btn {
+      flex: 1 1 calc(50% - 4px);
+      min-height: 44px;
+      justify-content: center;
+    }
+    .table-cards tbody td:first-child:not(.chk-col) {
+      font-size: 15px;
+      font-weight: 600;
+      flex-wrap: wrap;
+    }
+    .table-cards tbody td:first-child:not(.chk-col)::before {
+      flex: 1 0 100%;
+      margin-bottom: 4px;
+    }
+    .ro-toggle {
+      min-width: 36px;
+      min-height: 32px;
+      font-size: 10px;
+    }
+    input.row-chk {
+      width: 22px;
+      height: 22px;
+    }
+    .pager {
+      position: sticky;
+      bottom: calc(72px + env(safe-area-inset-bottom));
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.85);
+      backdrop-filter: blur(12px);
+      margin: 12px -14px 0;
+      padding: 10px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border-card);
+    }
+  }
+  @media (min-width: 769px) {
+    .main-nav button[data-short] {
+      font-size: 13px;
+    }
   }
 </style>
 </head>
 <body>
-<header>
-  <div class="header-gradient"></div>
-  <div class="logo">M</div>
-  <div class="status"><span id="dot" class="dot"></span><span id="statusText">idle</span></div>
-  <nav>
-    <button data-tab="dashboard" class="active">Dashboard</button>
-    <button data-tab="library">Library</button>
-    <button data-tab="artists">Artists</button>
-    <button data-tab="playlists">Playlists</button>
-    <button data-tab="tracks">Files</button>
-    <button data-tab="settings">Settings</button>
-    <button data-tab="console">Console</button>
+<div class="app-chrome">
+  <header>
+    <div class="header-gradient"></div>
+    <div class="logo">M</div>
+    <div class="status"><span id="dot" class="dot"></span><span id="statusText">idle</span></div>
+  </header>
+  <nav class="main-nav" id="mainNav" aria-label="Sections">
+    <button type="button" data-tab="dashboard" class="active" data-short="Home">Dashboard</button>
+    <button type="button" data-tab="artists" data-short="Artists">Artists</button>
+    <button type="button" data-tab="library" data-short="Library">Library</button>
+    <button type="button" data-tab="tracks" data-short="Files">Files</button>
+    <button type="button" data-tab="playlists" data-short="Lists">Playlists</button>
+    <button type="button" data-tab="settings" data-short="Setup">Settings</button>
+    <button type="button" data-tab="console" data-short="Logs">Console</button>
   </nav>
-</header>
+</div>
 <main>
   <section id="dashboard">
     <div class="grid stats" id="statCards"></div>
@@ -1749,23 +2051,23 @@ HTML = r"""<!doctype html>
 
   <section id="library" class="hide">
     <div class="card">
-      <div class="row" style="margin-bottom:14px">
-        <select id="libArtist" onchange="loadLibrary()"><option value="">All artists</option></select>
-        <select id="libStatus" onchange="loadLibrary()">
+      <div class="toolbar-stack">
+        <select id="libArtist" class="toolbar-select" onchange="loadLibrary()"><option value="">All artists</option></select>
+        <select id="libStatus" class="toolbar-select" onchange="loadLibrary()">
           <option value="all">All albums</option>
           <option value="pending">Incomplete</option>
           <option value="complete">Complete</option>
         </select>
-        <button class="btn ghost sm" onclick="loadLibrary()">Refresh</button>
+        <button type="button" class="btn ghost sm" onclick="loadLibrary()">Refresh</button>
       </div>
-      <div style="overflow-x:auto;">
-      <table class="table"><thead><tr><th>Artist</th><th>Album</th><th>Progress</th><th>Action</th></tr></thead>
+      <div class="table-scroll">
+      <table class="table table-cards"><thead><tr><th>Artist</th><th>Album</th><th>Progress</th><th>Action</th></tr></thead>
       <tbody id="libRows"></tbody></table>
       </div>
-      <div class="row" style="margin-top:12px; justify-content:space-between;">
-        <button class="btn ghost sm" onclick="libPage=Math.max(0,libPage-1);renderLibrary()">← Prev</button>
+      <div class="pager">
+        <button type="button" class="btn ghost sm" onclick="libPrev()">← Prev</button>
         <span id="libPageInfo" class="muted">Page 1</span>
-        <button class="btn ghost sm" onclick="libPage++;renderLibrary()">Next →</button>
+        <button type="button" class="btn ghost sm" onclick="libNext()">Next →</button>
       </div>
     </div>
     <div class="card hide" id="songPanel" style="margin-top:16px">
@@ -1785,8 +2087,8 @@ HTML = r"""<!doctype html>
     </div>
     <div class="card" style="margin-top:16px">
       <div id="dbSummary" class="db-summary muted">Loading database stats…</div>
-      <div class="row" style="margin-bottom:14px">
-        <input id="artistSearch" placeholder="Search..." oninput="debouncedLoadArtists()"/>
+      <div class="toolbar-stack">
+        <input id="artistSearch" placeholder="Search artists…" oninput="debouncedLoadArtists()"/>
         <div class="filter-chips" id="artistFilterChips" role="group" aria-label="Filter artists">
           <button type="button" class="chip active" data-value="all">All</button>
           <button type="button" class="chip chip-ro" data-value="romanian">Romanian</button>
@@ -1823,16 +2125,16 @@ HTML = r"""<!doctype html>
         <button type="button" class="sel-btn ghost" onclick="pickPage()">Page</button>
         <button type="button" class="sel-btn ghost" onclick="clearSel()" title="Clear">✕</button>
       </div>
-      <div style="overflow-x:auto;">
-      <table class="table"><thead><tr>
+      <div class="table-scroll">
+      <table class="table table-cards"><thead><tr>
         <th class="chk-col sel-col hide"><input type="checkbox" class="row-chk" id="artPickPage" title="Page" onchange="pickPage(this.checked)"/></th>
         <th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody id="artistRows"></tbody></table>
       </div>
-      <div class="row" style="margin-top:12px; justify-content:space-between;">
-        <button class="btn ghost sm" onclick="artPage=Math.max(0,artPage-1);renderArtists()">← Prev</button>
+      <div class="pager">
+        <button type="button" class="btn ghost sm" onclick="artPrev()">← Prev</button>
         <span id="artPageInfo" class="muted">Page 1</span>
-        <button class="btn ghost sm" onclick="artPage++;renderArtists()">Next →</button>
+        <button type="button" class="btn ghost sm" onclick="artNext()">Next →</button>
       </div>
     </div>
   </section>
@@ -1847,8 +2149,8 @@ HTML = r"""<!doctype html>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
-      <div style="overflow-x:auto;">
-      <table class="table"><thead><tr><th>Playlist</th><th>Status</th><th>Last scan</th><th>Actions</th></tr></thead>
+      <div class="table-scroll">
+      <table class="table table-cards"><thead><tr><th>Playlist</th><th>Status</th><th>Last scan</th><th>Actions</th></tr></thead>
       <tbody id="playlistRows"></tbody></table>
       </div>
     </div>
@@ -1856,16 +2158,16 @@ HTML = r"""<!doctype html>
 
   <section id="tracks" class="hide">
     <div class="card">
-      <div class="row" style="margin-bottom:14px">
-        <input id="trackSearch" placeholder="Search files..." oninput="debouncedLoadTracks()"/>
+      <div class="toolbar-stack">
+        <input id="trackSearch" placeholder="Search files…" oninput="debouncedLoadTracks()"/>
         <button type="button" class="btn ghost sm" onclick="loadTracks(true)">Refresh</button>
         <button type="button" class="btn ghost sm" onclick="loadTracks(true,true)" title="Rescan music folder">Rescan</button>
       </div>
-      <div style="overflow-x:auto;">
-      <table class="table"><thead><tr><th>Artist</th><th>Album</th><th>File</th><th></th></tr></thead>
+      <div class="table-scroll">
+      <table class="table table-cards"><thead><tr><th>Artist</th><th>Album</th><th>File</th><th></th></tr></thead>
       <tbody id="trackRows"></tbody></table>
       </div>
-      <div class="row" style="margin-top:12px; justify-content:space-between;">
+      <div class="pager">
         <button type="button" class="btn ghost sm" onclick="trackPrev()">← Prev</button>
         <span id="trackPageInfo" class="muted">Page 1</span>
         <button type="button" class="btn ghost sm" onclick="trackNext()">Next →</button>
@@ -1954,6 +2256,8 @@ HTML = r"""<!doctype html>
 const $=s=>document.querySelector(s);
 const CHUNK=80;
 const TRACK_PAGE=100;
+const LIB_PAGE=80;
+const ART_PAGE=100;
 let autoscroll=true;
 let artistsLoadGen=0, libLoadGen=0, tracksLoadGen=0;
 let artistTotal=0, libTotal=0, trackTotal=0;
@@ -1962,42 +2266,60 @@ let curPl=[];
 let selectMode=false;
 let selectedArtists=new Set();
 function artistUrl(id,action){return `/api/artists/${encodeURIComponent(id)}/${action}`;}
-function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
+let _toastT;
+function toast(m,isErr){
+  const t=$('#toast');
+  t.textContent=m;
+  t.classList.toggle('err',!!isErr);
+  t.classList.add('show');
+  clearTimeout(_toastT);
+  _toastT=setTimeout(()=>t.classList.remove('show','err'),isErr?7000:2200);
+  if(isErr)console.error('[MusicaDet]',m);
+}
+function toastErr(m){toast(m,true);}
 function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
 function skeletonRows(cols,n=10){return Array.from({length:n},()=>'<tr class="skeleton-row">'+Array.from({length:cols},()=>'<td><span class="skel"></span></td>').join('')+'</tr>').join('');}
 async function api(path,opts={},signal){
   const r=await fetch(path,{...opts,signal});
+  let text='';
+  try{text=await r.text();}catch(_){}
   let data={};
-  try{data=await r.json();}catch(_){}
-  if(!r.ok)throw new Error(data.error||data.detail||('HTTP '+r.status));
+  if(text){
+    try{data=JSON.parse(text);}catch(_){
+      if(!r.ok)throw new Error(text.trim().slice(0,240)||('HTTP '+r.status));
+    }
+  }
+  if(!r.ok){
+    let msg=data.error||data.message;
+    if(!msg&&data.detail){
+      msg=Array.isArray(data.detail)
+        ?data.detail.map(d=>d.msg||(typeof d==='string'?d:JSON.stringify(d))).join('; ')
+        :data.detail;
+    }
+    if(!msg&&text)msg=text.trim().slice(0,240);
+    throw new Error(msg||('HTTP '+r.status));
+  }
   return data;
 }
 function esc(s){return (s==null?'':s).toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function artistById(id){return curArt.find(a=>a.spotify_id===id);}
 function flashArtistRow(id){
-  const tr=document.querySelector(`tr[data-aid="${id}"]`);
+  const tr=document.querySelector(`tr[data-aid="${CSS.escape(id)}"]`);
   if(tr){tr.classList.remove('row-flash');void tr.offsetWidth;tr.classList.add('row-flash');}
 }
-async function fetchAllChunks(baseUrl,isStale,onChunk,seed=[],startAt=0){
-  let items=seed.slice(),offset=startAt,total=null;
-  while(true){
-    if(isStale())return items;
-    const sep=baseUrl.includes('?')?'&':'?';
-    const page=await api(`${baseUrl}${sep}offset=${offset}&limit=${CHUNK}`);
-    if(isStale())return items;
-    if(!page.items)break;
-    total=page.total??page.items.length;
-    items=items.concat(page.items);
-    offset=items.length;
-    onChunk(items,total);
-    if(items.length>=total||page.items.length<CHUNK)break;
-    await new Promise(r=>setTimeout(r,0));
-  }
-  return items;
+function applyNavLabels(){
+  const mobile=window.matchMedia('(max-width:768px)').matches;
+  document.querySelectorAll('#mainNav button').forEach(b=>{
+    if(!b.dataset.full)b.dataset.full=b.textContent.trim();
+    b.textContent=mobile?(b.dataset.short||b.dataset.full):b.dataset.full;
+  });
 }
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
+applyNavLabels();
+window.addEventListener('resize',applyNavLabels);
+document.querySelectorAll('#mainNav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#mainNav button').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');
+  b.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});
   ['dashboard','library','artists','playlists','tracks','settings','console'].forEach(id=>$('#'+id).classList.add('hide'));
   $('#'+b.dataset.tab).classList.remove('hide');
   if(b.dataset.tab==='artists'){loadDbSummary();loadArtists();}
@@ -2005,9 +2327,11 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   if(b.dataset.tab==='tracks')loadTracks();
   if(b.dataset.tab==='library'){loadLibArtists();loadLibrary();}
   if(b.dataset.tab==='settings')loadSettings();
+  window.scrollTo({top:0,behavior:'smooth'});
 });
 async function loadStats(){
-  const s=await api('/api/stats');
+  let s;
+  try{s=await api('/api/stats');}catch(e){toastErr('Dashboard: '+(e.message||e));return;}
   const total_songs = s.songs_downloaded + s.songs_pending;
   const cards = [
     { title: 'Artists', main: s.artists_total, sub: `${s.artists_synced} / ${s.artists_total} synced` },
@@ -2044,6 +2368,7 @@ async function loadSettings(){
   $('#cfgThreads').value=c.threads||4;
 }
 async function saveSettings(){
+  try{
   const body={
     music_dir:$('#cfgMusicDir').value.trim(),
     format:$('#cfgFormat').value,
@@ -2059,9 +2384,10 @@ async function saveSettings(){
     generate_lrc:$('#cfgLrc').checked
   };
   const r=await api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(r.error){toast(r.error);return;}
+  if(r.error){toastErr(r.error);return;}
   toast('Settings saved');
   loadStats();
+  }catch(e){toastErr(e.message||'Save settings failed');}
 }
 async function loadLibArtists(){
   const rows=await api('/api/artists/names');
@@ -2077,45 +2403,45 @@ function libBaseUrl(){
   if(aid)url+=`&artist_id=${encodeURIComponent(aid)}`;
   return url;
 }
-async function loadLibrary(){
+async function loadLibrary(reset=true){
+  if(reset)libPage=0;
   const gen=++libLoadGen;
-  libPage=0;
-  curLib=[];
-  libTotal=0;
   $('#libRows').innerHTML=skeletonRows(4);
-  $('#libPageInfo').innerHTML='Loading<span class="loading-hint">…</span>';
+  $('#libPageInfo').textContent='…';
   try{
-    const first=await api(`${libBaseUrl()}&offset=0&limit=${CHUNK}`);
+    const off=libPage*LIB_PAGE;
+    const page=await api(`${libBaseUrl()}&offset=${off}&limit=${LIB_PAGE}`);
     if(gen!==libLoadGen)return;
-    curLib=first.items||[];
-    libTotal=first.total??curLib.length;
+    curLib=page.items||[];
+    libTotal=page.total??0;
     renderLibrary();
-    fetchAllChunks(libBaseUrl(),()=>gen!==libLoadGen,(items,total)=>{
-      curLib=items;libTotal=total;renderLibrary();
-    },curLib,curLib.length);
   }catch(e){
-    if(gen===libLoadGen)$('#libRows').innerHTML='<tr><td colspan=4 class="muted">Load failed.</td></tr>';
+    if(gen===libLoadGen){
+      $('#libRows').innerHTML='<tr><td colspan=4 class="muted">Load failed.</td></tr>';
+      toastErr('Library: '+(e.message||e));
+    }
   }
 }
+function libPrev(){if(libPage>0){libPage--;loadLibrary(false);}}
+function libNext(){if((libPage+1)*LIB_PAGE<libTotal){libPage++;loadLibrary(false);}}
 function renderLibrary(){
-  const start=libPage*100, end=start+100;
-  const pageRows=curLib.slice(start,end);
-  const loaded=curLib.length;
-  const tail=loaded<libTotal?` · loading ${loaded}/${libTotal}`:'';
-  $('#libPageInfo').textContent=`Page ${libPage+1} of ${Math.ceil(Math.max(loaded,1)/100)||1} (${libTotal||loaded} total)${tail}`;
-  $('#libRows').innerHTML=pageRows.map(r=>{
+  const pages=Math.max(1,Math.ceil(libTotal/LIB_PAGE));
+  $('#libPageInfo').textContent=`${libPage+1} / ${pages} · ${libTotal} albums`;
+  $('#libRows').innerHTML=curLib.map(r=>{
     const pct=r.track_count?Math.round(100*r.downloaded_count/r.track_count):0;
     const bar=`<div style="height:4px;background:rgba(255,255,255,.1);border-radius:99px;overflow:hidden;width:60px;display:inline-block;vertical-align:middle;margin-left:6px"><div style="height:100%;width:${pct}%;background:#ffffff;border-radius:99px"></div></div>`;
     const pill=r.downloaded_count>=r.track_count&&r.track_count>0?'<span class="pill done">done</span>':'<span class="pill pend">'+pct+'%</span>';
-    return `<tr><td>${esc(r.artist_name)}</td><td>${esc(r.name)}</td><td class="progress">${r.downloaded_count}/${r.track_count} ${bar} ${pill}</td>
-      <td><button class="btn ghost sm" onclick="showSongs('${r.spotify_id}','${esc(r.name)}')">Songs</button></td></tr>`;
+    return `<tr><td data-label="Artist">${esc(r.artist_name)}</td><td data-label="Album">${esc(r.name)}</td><td data-label="Progress" class="progress">${r.downloaded_count}/${r.track_count} ${bar} ${pill}</td>
+      <td data-label="Action"><button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button></td></tr>`;
   }).join('')||'<tr><td colspan=4 class="muted">No albums yet — run Scan Albums.</td></tr>';
 }
 async function showSongs(albumId,albumName){
   $('#songPanelTitle').textContent='Songs — '+albumName;
   $('#songPanel').classList.remove('hide');
   $('#songRows').innerHTML=skeletonRows(5,6);
-  const res=await api(`/api/songs?album_id=${encodeURIComponent(albumId)}`);
+  let res;
+  try{res=await api(`/api/songs?album_id=${encodeURIComponent(albumId)}`);}
+  catch(e){$('#songRows').innerHTML='<tr><td colspan=5 class="muted">Load failed.</td></tr>';toastErr(e.message||'Songs failed');return;}
   const rows=Array.isArray(res)?res:(res.items||[]);
   const meta=v=>v?'<span class="meta-ok">✓</span>':'<span class="meta-no">—</span>';
   $('#songRows').innerHTML=rows.map(r=>{
@@ -2142,7 +2468,7 @@ async function loadDbSummary(){
   try{
     const s=await api('/api/db/summary');
     $('#dbSummary').innerHTML=`<b>${s.artists_active}</b> on · <b>${s.artists_pending_sync}</b> pending · <b>${s.artists_romanian}</b> ro · <b>${s.albums_incomplete}</b> albums left`;
-  }catch(e){$('#dbSummary').textContent='';}
+  }catch(e){$('#dbSummary').textContent='';toastErr('Summary: '+(e.message||e));}
 }
 function syncSelBar(){
   const n=selectedArtists.size;
@@ -2161,15 +2487,13 @@ function togglePick(id,on){
   syncSelBar();renderArtists();
 }
 function pickPage(forceOn){
-  const start=artPage*100,end=start+100;
-  const page=curArt.slice(start,end);
-  const allPicked=page.length>0&&page.every(a=>selectedArtists.has(a.spotify_id));
+  const allPicked=curArt.length>0&&curArt.every(a=>selectedArtists.has(a.spotify_id));
   const on=typeof forceOn==='boolean'?forceOn:!allPicked;
-  page.forEach(a=>{
+  curArt.forEach(a=>{
     if(on)selectedArtists.add(a.spotify_id);else selectedArtists.delete(a.spotify_id);
   });
   const p=$('#artPickPage');if(p)p.checked=on;
-  renderArtists();
+  syncSelBar();
 }
 function clearSel(){
   selectedArtists.clear();
@@ -2188,53 +2512,50 @@ async function bulkSel(action){
     const r=await api('/api/artists/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     toast(String(r.updated));
     clearSel();loadDbSummary();loadArtists();
-  }catch(e){toast(e.message||'Failed');}
+  }catch(e){toastErr(e.message||'Bulk update failed');}
 }
-async function loadArtists(){
+async function loadArtists(reset=true){
+  if(reset){artPage=0;selectedArtists.clear();}
   const gen=++artistsLoadGen;
-  artPage=0;
-  curArt=[];
-  artistTotal=0;
   $('#artistRows').innerHTML=skeletonRows(5);
-  $('#artPageInfo').innerHTML='Loading<span class="loading-hint">…</span>';
+  $('#artPageInfo').textContent='…';
   try{
-    const first=await api(`${artistsBaseUrl()}&offset=0&limit=${CHUNK}`);
+    const off=artPage*ART_PAGE;
+    const page=await api(`${artistsBaseUrl()}&offset=${off}&limit=${ART_PAGE}`);
     if(gen!==artistsLoadGen)return;
-    curArt=first.items||[];
-    artistTotal=first.total??curArt.length;
+    curArt=page.items||[];
+    artistTotal=page.total??0;
     renderArtists();
-    fetchAllChunks(artistsBaseUrl(),()=>gen!==artistsLoadGen,(items,total)=>{
-      curArt=items;artistTotal=total;renderArtists();
-    },curArt,curArt.length);
   }catch(e){
-    if(gen===artistsLoadGen)$('#artistRows').innerHTML=`<tr><td colspan="${selectMode?6:5}" class="muted">Load failed.</td></tr>`;
+    if(gen===artistsLoadGen){
+      $('#artistRows').innerHTML=`<tr><td colspan="${selectMode?6:5}" class="muted">Load failed.</td></tr>`;
+      toastErr('Artists: '+(e.message||e));
+    }
   }
 }
+function artPrev(){if(artPage>0){artPage--;loadArtists(false);}}
+function artNext(){if((artPage+1)*ART_PAGE<artistTotal){artPage++;loadArtists(false);}}
 function artistLimitSelected(r,val){
   const m=r.max_downloads;
   if(val==='')return m==null||m===undefined;
   return Number(m)===Number(val);
 }
 function renderArtists(){
-  const start=artPage*100, end=start+100;
-  const pageRows=curArt.slice(start,end);
-  const loaded=curArt.length;
-  const tail=loaded<artistTotal?` · loading ${loaded}/${artistTotal}`:'';
-  $('#artPageInfo').textContent=`Page ${artPage+1} of ${Math.ceil(Math.max(loaded,1)/100)||1} (${artistTotal||loaded} total)${tail}`;
-  $('#artistRows').innerHTML=pageRows.map(r=>{
+  const pages=Math.max(1,Math.ceil(artistTotal/ART_PAGE));
+  $('#artPageInfo').textContent=`${artPage+1} / ${pages} · ${artistTotal}`;
+  $('#artistRows').innerHTML=curArt.map(r=>{
     const sync=r.sync_done?'<span class="pill done">synced</span>':'<span class="pill pend">pending</span>';
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
     const prog=(r.songs_dl||0)+'/'+(r.songs_total||0);
     const roCls = r.is_romanian ? 'on' : '';
     const roTitle = r.is_romanian ? 'Clear Romanian flag' : 'Mark as Romanian';
     const rowCls = r.is_romanian ? 'row-ro' : '';
-    const id=JSON.stringify(r.spotify_id);
     const picked=selectedArtists.has(r.spotify_id);
-    const chk=selectMode?`<td class="chk-col sel-col"><input type="checkbox" class="row-chk" ${picked?'checked':''} onchange="togglePick(${id},this.checked)"/></td>`:'';
-    return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td><button type="button" class="ro-toggle ${roCls}" title="${roTitle}" onclick="setRomanian(${id}, ${r.is_romanian?0:1})">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
-      <td>
+    const chk=selectMode?`<td class="chk-col sel-col" data-label=""><input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/></td>`:'';
+    return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td data-label="Artist"><button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button>${esc(r.name)}</td><td data-label="Albums" class="muted">${r.album_count||0}</td><td data-label="Songs" class="muted">${prog}</td><td data-label="Status">${act} ${sync}</td>
+      <td class="td-actions" data-label="Actions">
         <div style="display:flex; gap:6px; align-items:center;">
-          <select class="toolbar-select" style="width:85px; min-width:85px;" onchange="setArtistLimit(${id}, this.value)" title="Max Downloads">
+          <select class="toolbar-select" data-limit data-aid="${esc(r.spotify_id)}" style="width:85px; min-width:85px;" title="Max Downloads">
             <option value="" ${artistLimitSelected(r,'')?'selected':''}>Global</option>
             <option value="10" ${artistLimitSelected(r,10)?'selected':''}>10</option>
             <option value="50" ${artistLimitSelected(r,50)?'selected':''}>50</option>
@@ -2242,8 +2563,8 @@ function renderArtists(){
             <option value="150" ${artistLimitSelected(r,150)?'selected':''}>150</option>
             <option value="0" ${artistLimitSelected(r,0)?'selected':''}>Unlimit</option>
           </select>
-          <button class="btn ghost sm" onclick="toggleArtist(${id})">${r.active?'Off':'On'}</button>
-          <button class="btn danger sm" title="Remove from database (fast). Shift+click: also delete files on disk." onclick="delArtist(${id}, event)">×</button>
+          <button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
+          <button type="button" class="btn danger sm" data-del title="Remove from database (fast). Shift+click: also delete files on disk.">×</button>
         </div>
       </td></tr>`;
   }).join('')||`<tr><td colspan="${selectMode?6:5}" class="muted">No artists yet.</td></tr>`;
@@ -2251,8 +2572,10 @@ function renderArtists(){
 }
 async function addArtist(){
   const v=$('#artistEntry').value.trim();if(!v)return;
-  await api('/api/artists',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry:v})});
-  $('#artistEntry').value='';toast('Adding — see console');showConsole();
+  try{
+    await api('/api/artists',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry:v})});
+    $('#artistEntry').value='';toast('Adding — see console');showConsole();
+  }catch(e){toastErr(e.message||'Add artist failed');}
 }
 async function toggleArtist(id){
   const a=artistById(id);if(!a)return;
@@ -2263,7 +2586,7 @@ async function toggleArtist(id){
     const r=await api(artistUrl(id,'toggle'),{method:'POST'});
     a.active=r.active?1:0;
     renderArtists();
-  }catch(e){a.active=prev;renderArtists();toast(e.message||'Update failed');}
+  }catch(e){a.active=prev;renderArtists();toastErr(e.message||'Toggle failed');}
 }
 async function setRomanian(id, val){
   const a=artistById(id);if(!a)return;
@@ -2278,7 +2601,7 @@ async function setRomanian(id, val){
     });
     a.is_romanian=r.is_romanian?1:0;
     renderArtists();
-  }catch(e){a.is_romanian=prev?1:0;renderArtists();toast(e.message||'Update failed');}
+  }catch(e){a.is_romanian=prev?1:0;renderArtists();toastErr(e.message||'Romanian flag failed');}
 }
 function patchArtistLimit(id, maxDl){
   const a=artistById(id);
@@ -2299,7 +2622,7 @@ async function setArtistLimit(id, limit){
     if(r.error)throw new Error(r.error);
     patchArtistLimit(id,r.max_downloads);
     renderArtists();
-  }catch(e){patchArtistLimit(id,prev);renderArtists();toast(e.message||'Update failed');}
+  }catch(e){patchArtistLimit(id,prev);renderArtists();toastErr(e.message||'Limit save failed');}
 }
 async function delArtist(id,ev){
   const a=artistById(id);
@@ -2326,18 +2649,18 @@ async function delArtist(id,ev){
       artistTotal++;
       renderArtists();
     }
-    toast('Remove failed');
+    toastErr(e.message||'Remove failed');
   }
 }
 function renderPlaylists(){
   $('#playlistRows').innerHTML=curPl.map(r=>{
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
-    return `<tr><td><a href="${esc(r.url)}" target="_blank">${esc(r.name)}</a></td><td>${act}</td><td class="muted">${(r.last_synced||'-').slice(0,10)}</td>
-      <td>
+    return `<tr><td data-label="Playlist"><a href="${esc(r.url)}" target="_blank">${esc(r.name)}</a></td><td data-label="Status">${act}</td><td data-label="Last scan" class="muted">${(r.last_synced||'-').slice(0,10)}</td>
+      <td class="td-actions" data-label="Actions">
         <div style="display:flex; gap:6px; align-items:center;">
-          <button class="btn ghost sm" onclick="syncPl('${r.url}')">Sync</button>
-          <button class="btn ghost sm" onclick="togglePl('${r.spotify_id}')">${r.active?'Off':'On'}</button>
-          <button class="btn danger sm" onclick="delPl('${r.spotify_id}')">×</button>
+          <button type="button" class="btn ghost sm" data-pl-sync data-url="${esc(r.url)}">Sync</button>
+          <button type="button" class="btn ghost sm" data-pl-toggle data-pl-id="${esc(r.spotify_id)}">${r.active?'Off':'On'}</button>
+          <button type="button" class="btn danger sm" data-pl-del data-pl-id="${esc(r.spotify_id)}">×</button>
         </div>
       </td></tr>`;
   }).join('')||'<tr><td colspan=4 class="muted">No playlists.</td></tr>';
@@ -2349,12 +2672,12 @@ async function loadPlaylists(){
 async function addPlaylist(){
   const name=$('#plName').value.trim(),url=$('#plUrl').value.trim();if(!url)return;
   const r=await api('/api/playlists',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,url})});
-  if(r.error){toast(r.error);return;}
+  if(r.error){toastErr(r.error);return;}
   $('#plName').value='';$('#plUrl').value='';loadPlaylists();toast('Added');
 }
 async function syncPl(url){
   const r=await api('/api/actions/sync-playlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-  if(r.error){toast(r.error);return;}
+  if(r.error){toastErr(r.error);return;}
   toast('Started: '+r.label);showConsole();
 }
 async function togglePl(id){
@@ -2366,9 +2689,13 @@ async function togglePl(id){
     const r=await api(`/api/playlists/${id}/toggle`,{method:'POST'});
     p.active=r.active?1:0;
     renderPlaylists();
-  }catch(e){p.active=prev;renderPlaylists();toast('Update failed');}
+  }catch(e){p.active=prev;renderPlaylists();toastErr(e.message||'Playlist toggle failed');}
 }
-async function delPl(id){if(!confirm('Remove?'))return;await api(`/api/playlists/${id}`,{method:'DELETE'});loadPlaylists();}
+async function delPl(id){
+  if(!confirm('Remove?'))return;
+  try{await api(`/api/playlists/${encodeURIComponent(id)}`,{method:'DELETE'});loadPlaylists();}
+  catch(e){toastErr(e.message||'Remove playlist failed');}
+}
 let curTracks=[];
 function tracksBaseUrl(refresh=false){
   const q=encodeURIComponent($('#trackSearch').value||'');
@@ -2390,7 +2717,10 @@ async function loadTracks(reset=true,refreshIndex=false){
     trackTotal=page.total??0;
     renderTracks();
   }catch(e){
-    if(gen===tracksLoadGen)$('#trackRows').innerHTML='<tr><td colspan=4 class="muted">Load failed.</td></tr>';
+    if(gen===tracksLoadGen){
+      $('#trackRows').innerHTML='<tr><td colspan=4 class="muted">Load failed.</td></tr>';
+      toastErr('Files: '+(e.message||e));
+    }
   }
 }
 const debouncedLoadTracks=debounce(()=>loadTracks(true),320);
@@ -2401,11 +2731,11 @@ function trackNext(){
 function renderTracks(){
   const pages=Math.max(1,Math.ceil(trackTotal/TRACK_PAGE));
   $('#trackPageInfo').textContent=`Page ${trackPage+1} of ${pages} (${trackTotal} files)`;
-  $('#trackRows').innerHTML=curTracks.map(r=>`<tr><td>${esc(r.artist)}</td><td class="muted">${esc(r.album)}</td><td>${esc(r.title)}</td>
-    <td style="text-align:right; white-space:nowrap;">
+  $('#trackRows').innerHTML=curTracks.map(r=>`<tr><td data-label="Artist">${esc(r.artist)}</td><td data-label="Album" class="muted">${esc(r.album)}</td><td data-label="File">${esc(r.title)}</td>
+    <td class="td-actions" data-label="">
       <div style="display:inline-flex; gap:6px; justify-content:flex-end; align-items:center;">
         <a class="btn ghost sm" href="/api/track/download?path=${encodeURIComponent(r.path)}" download title="Download"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></a>
-        <button class="btn ghost sm" onclick="showTrackInfo('${esc(r.path)}')">Info</button>
+        <button type="button" class="btn ghost sm" data-track-info data-path="${esc(r.path)}">Info</button>
       </div>
     </td></tr>`).join('')
     ||'<tr><td colspan=4 class="muted">No files found.</td></tr>';
@@ -2417,8 +2747,9 @@ async function showTrackInfo(path) {
   $('#tmGenre').textContent='-'; $('#tmYear').textContent='-';
   $('#tmLength').textContent='-'; $('#tmBitrate').textContent='-';
   $('#trackModal').classList.remove('hide');
+  try{
   const info=await api('/api/track/info?path='+encodeURIComponent(path));
-  if(info.error){ $('#tmTitle').textContent='Error'; return; }
+  if(info.error){ $('#tmTitle').textContent=info.error; toastErr(info.error); return; }
   $('#tmTitle').textContent=info.title||'Unknown';
   $('#tmArtist').textContent=info.artist||'-';
   $('#tmAlbum').textContent=info.album||'-';
@@ -2438,17 +2769,28 @@ async function showTrackInfo(path) {
   } else {
     $('#tmCover').src='';
   }
+  }catch(e){$('#tmTitle').textContent='Error';toastErr(e.message||'Track info failed');}
 }
-async function action(a){const r=await api('/api/actions/'+a,{method:'POST'});toast('Started: '+(r.label||a));showConsole();}
+async function action(a){
+  try{
+    const r=await api('/api/actions/'+a,{method:'POST'});
+    toast('Started: '+(r.label||a));showConsole();
+  }catch(e){toastErr(e.message||'Action failed');}
+}
 async function downloadDirect(){
   const url=$('#directDownloadUrl').value.trim();if(!url)return;
-  const r=await api('/api/actions/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-  if(r.error){toast(r.error);return;}
-  $('#directDownloadUrl').value='';
-  toast('Started: '+r.label);showConsole();
+  try{
+    const r=await api('/api/actions/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    if(r.error){toastErr(r.error);return;}
+    $('#directDownloadUrl').value='';
+    toast('Started: '+r.label);showConsole();
+  }catch(e){toastErr(e.message||'Download failed');}
 }
-async function stop(){await api('/api/stop',{method:'POST'});toast('Stop requested');}
-function showConsole(){document.querySelector('nav button[data-tab="console"]').click();}
+async function stop(){
+  try{await api('/api/stop',{method:'POST'});toast('Stop requested');}
+  catch(e){toastErr(e.message||'Stop failed');}
+}
+function showConsole(){document.querySelector('#mainNav button[data-tab="console"]')?.click();}
 function clearConsole(){$('#consoleOut').innerHTML='';}
 function connectWS(){
   const proto=location.protocol==='https:'?'wss':'ws';
@@ -2472,6 +2814,35 @@ function connectWS(){
 }
 $('#consoleOut').addEventListener('scroll',e=>{
   const el=e.target;autoscroll=(el.scrollHeight-el.scrollTop-el.clientHeight)<40;
+});
+document.getElementById('artistRows')?.addEventListener('click',e=>{
+  const tr=e.target.closest('tr[data-aid]');
+  if(!tr)return;
+  const id=tr.dataset.aid;
+  if(e.target.closest('button[data-ro]')){setRomanian(id,parseInt(e.target.closest('button[data-ro]').dataset.val,10));return;}
+  if(e.target.closest('button[data-toggle]')){toggleArtist(id);return;}
+  if(e.target.closest('button[data-del]')){delArtist(id,e);return;}
+});
+document.getElementById('artistRows')?.addEventListener('change',e=>{
+  if(e.target.matches('select[data-limit]'))setArtistLimit(e.target.dataset.aid,e.target.value);
+  if(e.target.matches('input.row-chk'))togglePick(e.target.dataset.aid,e.target.checked);
+});
+document.getElementById('libRows')?.addEventListener('click',e=>{
+  const b=e.target.closest('button[data-album]');
+  if(!b)return;
+  showSongs(b.dataset.album,b.dataset.albumName||'').catch(err=>toastErr(err.message||'Songs failed'));
+});
+document.getElementById('playlistRows')?.addEventListener('click',e=>{
+  const sync=e.target.closest('[data-pl-sync]');
+  if(sync){syncPl(sync.dataset.url).catch(err=>toastErr(err.message||'Sync failed'));return;}
+  const tgl=e.target.closest('[data-pl-toggle]');
+  if(tgl){togglePl(tgl.dataset.plId);return;}
+  const del=e.target.closest('[data-pl-del]');
+  if(del){delPl(del.dataset.plId);return;}
+});
+document.getElementById('trackRows')?.addEventListener('click',e=>{
+  const b=e.target.closest('[data-track-info]');
+  if(b)showTrackInfo(b.dataset.path);
 });
 loadStats();connectWS();setInterval(loadStats,15000);
 </script>
