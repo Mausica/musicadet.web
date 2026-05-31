@@ -220,7 +220,6 @@ def db_init():
                         SET name=excluded.name, url=excluded.url
                 """, (pid, pl["name"], pl["url"]))
 
-    _auto_mark_romanian_artists()
     log.info("DB ready: %s", CFG["db_path"])
 
 
@@ -1303,6 +1302,11 @@ def cmd_import(args):
     log.info("Imported %d new artists from %s", added, args.file)
 
 
+def cmd_mark_romanian(args):
+    log.info("Marking Romanian artists (list + MusicBrainz)...")
+    _auto_mark_romanian_artists()
+
+
 def cmd_list(args):
     with db_connect() as db:
         rows = db.execute("""
@@ -2196,6 +2200,7 @@ Examples:
     imp_ = subparsers.add_parser("import", help="Bulk import artists from a text file")
     imp_.add_argument("file")
 
+    subparsers.add_parser("init-db", help="Create/migrate database schema only (no Romanian detection)")
     subparsers.add_parser("list", help="List all artists in the DB")
 
     dis_ = subparsers.add_parser("disable", help="Disable an artist")
@@ -2206,6 +2211,10 @@ Examples:
 
     sub = subparsers.add_parser("clean-ytm", help="Wipe all pending YouTube Music data to revert to Spotify scanner")
     subparsers.add_parser("deduplicate", help="Merge duplicate artists and tracks")
+    subparsers.add_parser(
+        "mark-romanian",
+        help="Detect and flag Romanian artists (curated list + MusicBrainz)",
+    )
 
     args = p.parse_args()
 
@@ -2224,11 +2233,13 @@ Examples:
         "list-albums":       cmd_list_albums,
         "add":               cmd_add,
         "import":            cmd_import,
+        "init-db":           lambda _a: None,
         "list":              cmd_list,
         "disable":           cmd_disable,
         "enable":            cmd_enable,
         "clean-ytm":         cmd_clean_ytm,
         "deduplicate":       cmd_deduplicate,
+        "mark-romanian":     cmd_mark_romanian,
     }
 
     fn = routes.get(args.cmd)

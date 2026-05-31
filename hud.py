@@ -112,6 +112,10 @@ def ensure_db() -> None:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(artists)")}
         if "albums_scanned_at" not in cols:
             conn.execute("ALTER TABLE artists ADD COLUMN albums_scanned_at TEXT")
+        if "max_downloads" not in cols:
+            conn.execute("ALTER TABLE artists ADD COLUMN max_downloads INTEGER")
+        if "is_romanian" not in cols:
+            conn.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
         for pl in load_cfg().get("playlists", []):
             pid = _extract_id(pl.get("url", ""), "playlist")
             if pid:
@@ -1280,7 +1284,6 @@ HTML = r"""<!doctype html>
         <button class="btn ghost" onclick="action('migrate-structure')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Migrate Structure</button>
         <button class="btn ghost" onclick="action('fix-metadata')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg> Fix Metadata</button>
         <button class="btn ghost danger-text" onclick="if(confirm('This will deduplicate all artists, tracks, and 1-track albums in the database and filesystem. Proceed?')) action('deduplicate')" style="color: #ff4b4b;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg> Deduplicate</button>
-        <button class="btn ghost" onclick="action('mark-romanian')" title="Auto-detect Romanian artists using MusicBrainz API — run once after adding artists">🇷🇴 Mark Romanian</button>
         <button class="btn danger" onclick="stop()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"></polygon><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg> Stop</button>
       </div>
       <div class="gradient-sep"></div>
@@ -1340,6 +1343,7 @@ HTML = r"""<!doctype html>
           <option value="disabled">Disabled</option>
         </select>
         <button class="btn ghost sm" onclick="loadArtists()">Refresh</button>
+        <button class="btn ghost sm" onclick="action('mark-romanian')" title="Detect Romanian artists (curated list + MusicBrainz) — run after adding artists">🇷🇴 Mark Romanian</button>
       </div>
       <div style="overflow-x:auto;">
       <table class="table"><thead><tr><th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th>Actions</th></tr></thead>

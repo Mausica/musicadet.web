@@ -54,8 +54,8 @@ WRAPPER
 chmod +x /usr/local/bin/musicadet
 rm -f /usr/local/bin/music-sync
 
-echo "==> Initializing database..."
-python3 "$INSTALL_DIR/music_sync.py" list >/dev/null || true
+echo "==> Initializing database (schema only)..."
+python3 "$INSTALL_DIR/music_sync.py" init-db >/dev/null 2>&1 || true
 
 echo "==> Removing legacy systemd units (if any)..."
 for old in music-sync.timer music-sync-hud.service music-sync.service; do
@@ -114,6 +114,7 @@ echo "   musicadet fix-metadata"
 echo "   musicadet list-albums"
 echo "   musicadet add \"Artist Name\""
 echo "   musicadet list"
+echo "   musicadet mark-romanian              # HUD: Artists tab → Mark Romanian"
 echo ""
 echo " Update anytime:"
 echo "   bash <(curl -fsSL https://raw.githubusercontent.com/Mausica/musicadet.web/main/install.sh)"
