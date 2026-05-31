@@ -10,9 +10,10 @@ import sqlite3
 import sys
 import time
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -76,6 +77,30 @@ def db() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+@contextmanager
+def db_tx():
+    """Writable DB transaction with explicit commit."""
+    conn = db()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _ensure_artist_schema(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(artists)")}
+    if "max_downloads" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN max_downloads INTEGER")
+    if "is_romanian" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
+    if "romanian_manual" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN romanian_manual INTEGER DEFAULT 0")
 
 
 def ensure_db() -> None:
@@ -212,6 +237,11 @@ class BulkArtistsIn(BaseModel):
     limit: Optional[int] = None
 
 
+class ArtistLimitBody(BaseModel):
+    spotify_id: str
+    limit: Optional[Union[str, int]] = None
+
+
 class PlaylistIn(BaseModel):
     name: str
     url: str
@@ -323,6 +353,28 @@ def count_tracks() -> int:
 def _decode_artist_id(spotify_id: str) -> str:
     from urllib.parse import unquote
     return unquote(spotify_id)
+
+
+def _apply_artist_limit(spotify_id: str, limit_raw) -> dict:
+    sid = _decode_artist_id((spotify_id or "").strip())
+    if not sid:
+        return {"error": "missing artist id"}
+    with db_tx() as conn:
+        _ensure_artist_schema(conn)
+        if not conn.execute("SELECT 1 FROM artists WHERE spotify_id=?", (sid,)).fetchone():
+            return {"error": "not found"}
+        if limit_raw is None or str(limit_raw).strip() == "":
+            conn.execute("UPDATE artists SET max_downloads=NULL WHERE spotify_id=?", (sid,))
+        else:
+            try:
+                val = int(limit_raw)
+            except (TypeError, ValueError):
+                return {"error": "invalid limit"}
+            conn.execute("UPDATE artists SET max_downloads=? WHERE spotify_id=?", (val, sid))
+        saved = conn.execute(
+            "SELECT max_downloads FROM artists WHERE spotify_id=?", (sid,)
+        ).fetchone()
+    return {"ok": True, "max_downloads": saved["max_downloads"] if saved else None}
 
 
 def _artist_filters(q: str, status: str) -> tuple[list[str], list]:
@@ -506,7 +558,8 @@ def api_bulk_artists(body: BulkArtistsIn):
     allowed = {"enable", "disable", "ro_on", "ro_off", "limit"}
     if body.action not in allowed:
         return JSONResponse({"error": "invalid action"}, status_code=400)
-    with db() as conn:
+    with db_tx() as conn:
+        _ensure_artist_schema(conn)
         if body.ids:
             target_ids = list(dict.fromkeys(body.ids))
         else:
@@ -552,7 +605,6 @@ def api_bulk_artists(body: BulkArtistsIn):
                     f"UPDATE artists SET max_downloads=? WHERE spotify_id IN ({placeholders})",
                     [int(body.limit)] + target_ids,
                 )
-        conn.commit()
     return {"ok": True, "updated": len(target_ids)}
 
 
@@ -565,10 +617,10 @@ async def api_add_artist(body: ArtistIn):
     return {"ok": True}
 
 
-@app.post("/api/artists/{spotify_id}/toggle")
+@app.post("/api/artists/{spotify_id:path}/toggle")
 def api_toggle_artist(spotify_id: str):
     spotify_id = _decode_artist_id(spotify_id)
-    with db() as conn:
+    with db_tx() as conn:
         row = conn.execute("SELECT active FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
         if not row:
             return JSONResponse({"error": "not found"}, status_code=404)
@@ -577,38 +629,40 @@ def api_toggle_artist(spotify_id: str):
     return {"ok": True, "active": new}
 
 
-@app.post("/api/artists/{spotify_id}/limit")
+@app.post("/api/artists/limit")
+def api_set_artist_limit_body(body: ArtistLimitBody):
+    result = _apply_artist_limit(body.spotify_id, body.limit)
+    if result.get("error") == "not found":
+        return JSONResponse(result, status_code=404)
+    if result.get("error"):
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+@app.post("/api/artists/{spotify_id:path}/limit")
 async def api_set_artist_limit(spotify_id: str, request: Request):
-    spotify_id = _decode_artist_id(spotify_id)
     try:
         data = await request.json()
     except Exception:
         data = {}
     limit = data.get("limit")
-    with db() as conn:
-        if not conn.execute("SELECT 1 FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone():
-            return JSONResponse({"error": "not found"}, status_code=404)
-        if limit is None or limit == "":
-            conn.execute("UPDATE artists SET max_downloads = NULL WHERE spotify_id=?", (spotify_id,))
-            conn.commit()
-            return {"ok": True, "max_downloads": None}
-        try:
-            val = int(limit)
-        except (TypeError, ValueError):
-            return JSONResponse({"error": "invalid limit"}, status_code=400)
-        conn.execute("UPDATE artists SET max_downloads = ? WHERE spotify_id=?", (val, spotify_id))
-        conn.commit()
-    return {"ok": True, "max_downloads": val}
+    result = _apply_artist_limit(spotify_id, limit)
+    if result.get("error") == "not found":
+        return JSONResponse(result, status_code=404)
+    if result.get("error"):
+        return JSONResponse(result, status_code=400)
+    return result
 
 
-@app.post("/api/artists/{spotify_id}/ro")
+@app.post("/api/artists/{spotify_id:path}/ro")
 async def api_set_romanian(spotify_id: str, request: Request):
     spotify_id = _decode_artist_id(spotify_id)
     try:
         body = await request.json()
     except Exception:
         body = {}
-    with db() as conn:
+    with db_tx() as conn:
+        _ensure_artist_schema(conn)
         row = conn.execute(
             "SELECT is_romanian FROM artists WHERE spotify_id=?", (spotify_id,)
         ).fetchone()
@@ -649,10 +703,10 @@ def _purge_artist_data(spotify_id: str, artist_name: str, delete_files: bool) ->
                 pass
 
 
-@app.delete("/api/artists/{spotify_id}")
+@app.delete("/api/artists/{spotify_id:path}")
 async def api_delete_artist(spotify_id: str, delete_files: bool = False):
     spotify_id = _decode_artist_id(spotify_id)
-    with db() as conn:
+    with db_tx() as conn:
         row = conn.execute("SELECT name FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
         if not row:
             return JSONResponse({"error": "not found"}, status_code=404)
@@ -2226,17 +2280,26 @@ async function setRomanian(id, val){
     renderArtists();
   }catch(e){a.is_romanian=prev?1:0;renderArtists();toast(e.message||'Update failed');}
 }
+function patchArtistLimit(id, maxDl){
+  const a=artistById(id);
+  if(a)a.max_downloads=maxDl;
+}
 async function setArtistLimit(id, limit){
   const a=artistById(id);if(!a)return;
   const prev=a.max_downloads;
-  a.max_downloads=limit===''?null:parseInt(limit,10);
+  const next=limit===''?null:parseInt(limit,10);
+  patchArtistLimit(id,next);
   renderArtists();flashArtistRow(id);
   try{
-    const r=await api(artistUrl(id,'limit'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:limit})});
+    const r=await api('/api/artists/limit',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({spotify_id:id,limit:limit===''?null:limit}),
+    });
     if(r.error)throw new Error(r.error);
-    a.max_downloads=r.max_downloads;
+    patchArtistLimit(id,r.max_downloads);
     renderArtists();
-  }catch(e){a.max_downloads=prev;renderArtists();toast(e.message||'Update failed');}
+  }catch(e){patchArtistLimit(id,prev);renderArtists();toast(e.message||'Update failed');}
 }
 async function delArtist(id,ev){
   const a=artistById(id);
