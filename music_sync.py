@@ -598,6 +598,10 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
             album_name = album_names.get(song["album_id"], "")
             title_key = song["title"].strip().lower()
             album_key = album_name.lower()
+            
+            resolved_album_key = ""
+            if custom_dl:
+                resolved_album_key = custom_dl._clean_filename(custom_dl.detect_singles(album_name, song["title"])).lower()
 
             found: Optional[Path] = None
             if song["file_path"]:
@@ -610,8 +614,10 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
             if not found:
                 for key in [
                     (display_name.lower(), album_key, title_key),
+                    (display_name.lower(), resolved_album_key, title_key),
                     (display_name.lower(), "", title_key),
                     (artist_id.lower(), album_key, title_key),
+                    (artist_id.lower(), resolved_album_key, title_key),
                     (artist_id.lower(), "", title_key),
                 ]:
                     if key in by_full:
@@ -620,6 +626,8 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
 
             if not found and album_key:
                 found = by_album_title.get((album_key, title_key))
+            if not found and resolved_album_key:
+                found = by_album_title.get((resolved_album_key, title_key))
 
             now = datetime.now().isoformat(timespec="seconds")
             if found:
