@@ -567,10 +567,11 @@ def api_track_download(path: str):
         os.close(tmp_fd)
         
         # Transcode on the fly
-        subprocess.run(["ffmpeg", "-y", "-i", str(full_path), "-c:a", "libmp3lame", "-q:a", "0", tmp_path], 
+        res = subprocess.run(["ffmpeg", "-y", "-i", str(full_path), "-b:a", "320k", tmp_path], 
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # Look up info in DB to enforce perfect metadata
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            # Look up info in DB to enforce perfect metadata
         title = full_path.stem
         artist, album, track_num = "", "", None
         rel_path = os.path.relpath(full_path, music_dir)
@@ -583,8 +584,14 @@ def api_track_download(path: str):
                 al = conn.execute("SELECT name FROM albums WHERE spotify_id=?", (song["album_id"],)).fetchone()
                 if al: album = al["name"]
         
+        
         import custom_dl
-        custom_dl.enforce_primary_artist(Path(tmp_path), artist, title, album, track_num, fetch_cover=True)
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            custom_dl.enforce_primary_artist(Path(tmp_path), artist, title, album, track_num, fetch_cover=True)
+        else:
+            # If transcode failed completely, just send original
+            os.unlink(tmp_path)
+            return FileResponse(full_path, filename=full_path.name)
         
         def cleanup():
             try: os.unlink(tmp_path)
@@ -1471,7 +1478,7 @@ async function loadTracks(){
   const q=encodeURIComponent($('#trackSearch').value||'');
   const rows=await api(`/api/tracks?q=${q}&limit=300`);
   $('#trackRows').innerHTML=rows.map(r=>`<tr><td>${esc(r.artist)}</td><td class="muted">${esc(r.album)}</td><td>${esc(r.title)}</td>
-    <td style="text-align:right; white-space:nowrap; display:flex; gap:6px; justify-content:flex-end;"><a class="btn ghost sm" href="/api/track/download?path=${encodeURIComponent(r.path)}" download title="Download"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></a><button class="btn ghost sm" onclick="showTrackInfo('${esc(r.path)}')">Info</button></td></tr>`).join('')
+    <td style="text-align:right; white-space:nowrap; display:flex; gap:6px; justify-content:flex-end; align-items:center;"><a class="btn ghost sm" href="/api/track/download?path=${encodeURIComponent(r.path)}" download title="Download"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></a><button class="btn ghost sm" onclick="showTrackInfo('${esc(r.path)}')">Info</button></td></tr>`).join('')
     ||'<tr><td colspan=4 class="muted">No files found.</td></tr>';
   $('#trackHint').textContent=rows.length+' files shown';
 }

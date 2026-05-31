@@ -360,7 +360,8 @@ class YtDlpDownloader:
                 log.warning("    ✗ No YouTube result for: %s", query)
                 return None
 
-        log.info("    ↳ Downloading: %s → %s", title, out_path.name)
+        rel = out_path.relative_to(self.music_dir)
+        log.info("    ↳ Downloading: %s → %s", title, rel)
 
         # yt-dlp writes {outtmpl}.{ext}; we give it the path without extension
         out_tpl = str(out_path.with_suffix("")) + ".%(ext)s"
