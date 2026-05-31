@@ -30,7 +30,7 @@ DEFAULTS = {
     "format": "opus",
     "bitrate": "320k",
     "threads": 4,
-    "output_template": "{artist}/{album}/{track_number} - {title}.{output-ext}",
+    "output_template": "{artist}/{album}/{track-number} - {title}.{output-ext}",
     "download_format": "original",
     "playlist_save_timeout": 600,
     "playlist_save_retries": 3,
@@ -965,8 +965,8 @@ HTML = r"""<!doctype html>
   .switch {
     position: relative;
     display: inline-block;
-    width: 44px;
-    height: 24px;
+    width: 48px;
+    height: 26px;
     flex-shrink: 0;
   }
   .switch input { opacity: 0; width: 0; height: 0; }
@@ -974,27 +974,34 @@ HTML = r"""<!doctype html>
     position: absolute;
     cursor: pointer;
     top: 0; left: 0; right: 0; bottom: 0;
-    background-color: #3f3f46;
-    transition: .3s;
-    border-radius: 24px;
+    background-color: #27272a;
+    transition: .4s cubic-bezier(0.4, 0.0, 0.2, 1);
+    border-radius: 26px;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.5);
+    border: 1px solid rgba(255,255,255,0.05);
   }
   .slider:before {
     position: absolute;
     content: "";
-    height: 18px; width: 18px;
-    left: 3px; bottom: 3px;
-    background-color: white;
-    transition: .3s;
+    height: 20px; width: 20px;
+    left: 2px; bottom: 2px;
+    background: linear-gradient(180deg, #ffffff 0%, #e4e4e7 100%);
+    transition: .4s cubic-bezier(0.4, 0.0, 0.2, 1);
     border-radius: 50%;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.4), inset 0 -1px 1px rgba(0,0,0,0.1);
   }
   .switch:hover .slider {
-    background-color: #52525b;
+    background-color: #3f3f46;
   }
   input:checked + .slider {
     background-color: var(--success);
-    box-shadow: 0 0 8px rgba(74, 222, 128, 0.4);
+    border-color: var(--success);
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.2), 0 0 12px rgba(74, 222, 128, 0.3);
   }
-  input:checked + .slider:before { transform: translateX(20px); }
+  input:checked + .slider:before { 
+    transform: translateX(22px);
+    background: linear-gradient(180deg, #ffffff 0%, #f4f4f5 100%);
+  }
   input:focus + .slider {
     box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.2);
   }
@@ -1394,7 +1401,7 @@ async function loadSettings(){
   $('#cfgFormat').value=c.format||'mp3';
   $('#cfgDlFormat').value=c.download_format||'original';
   $('#cfgBitrate').value=c.bitrate||'320k';
-  $('#cfgTemplate').value=c.output_template||'';
+  $('#cfgTemplate').value=c.output_template||'{artist}/{album}/{track-number} - {title}.{output-ext}';
   $('#cfgLyrics').value=(c.lyrics_providers||[]).join(',');
   $('#cfgPlTimeout').value=c.playlist_save_timeout||600;
   $('#cfgPlRetries').value=c.playlist_save_retries||3;

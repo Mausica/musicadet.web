@@ -55,7 +55,7 @@ def _clean_filename(name: str) -> str:
 def detect_singles(album: Optional[str], title: str) -> str:
     if not album or album == "Unknown Album":
         return "Singles"
-    album_clean = _clean_filename(album).lower().replace(" - single", "").replace(" - ep", "").strip()
+    album_clean = _clean_filename(album).lower().split(" (feat")[0].replace(" - single", "").replace(" - ep", "").strip()
     title_clean = _clean_filename(title).lower().split(" (feat")[0].split(" - ")[0].strip()
     if album_clean == title_clean:
         return "Singles"
@@ -202,21 +202,27 @@ def enforce_primary_artist(
             return True
 
         elif ext == ".mp3":
+            from mutagen.mp3 import MP3
+            from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, APIC, TCON, TDRC, ID3NoHeaderError
             try:
-                audio = ID3(file_path)
-            except Exception:
-                from mutagen.id3 import ID3NoHeaderError
-                audio = ID3()
-            audio.add(TIT2(encoding=3, text=title))
-            audio.add(TPE1(encoding=3, text=primary_artist))
+                audio = MP3(file_path, ID3=ID3)
+                if audio.tags is None:
+                    audio.add_tags()
+            except Exception as e:
+                log.error("Failed to read MP3 %s: %s", file_path, e)
+                return False
+                
+            tags = audio.tags
+            tags.add(TIT2(encoding=3, text=title))
+            tags.add(TPE1(encoding=3, text=primary_artist))
             if album:
-                audio.add(TALB(encoding=3, text=album))
+                tags.add(TALB(encoding=3, text=album))
             if track_number:
-                audio.add(TRCK(encoding=3, text=str(track_number)))
+                tags.add(TRCK(encoding=3, text=str(track_number)))
             
             # Always fix bad/missing genre for mp3
-            existing_genre = str(audio.get("TCON", ""))
-            need_cover = fetch_cover and not audio.getall("APIC")
+            existing_genre = str(tags.get("TCON", ""))
+            need_cover = fetch_cover and not tags.getall("APIC")
             need_genre = _is_bad_genre(existing_genre)
             
             if need_cover or need_genre:
@@ -229,13 +235,11 @@ def enforce_primary_artist(
                 if _is_bad_genre(genre):
                     genre = _fetch_artist_genre(primary_artist)
                 if year:
-                    from mutagen.id3 import TDRC
-                    audio.add(TDRC(encoding=3, text=str(year)))
+                    tags.add(TDRC(encoding=3, text=str(year)))
                 if genre and not _is_bad_genre(genre):
-                    from mutagen.id3 import TCON
-                    audio.add(TCON(encoding=3, text=genre))
+                    tags.add(TCON(encoding=3, text=genre))
                 if need_cover and img_data:
-                    audio.add(APIC(
+                    tags.add(APIC(
                         encoding=3,
                         mime="image/jpeg",
                         type=3,
@@ -243,7 +247,7 @@ def enforce_primary_artist(
                         data=img_data
                     ))
 
-            audio.save(file_path)
+            audio.save(v2_version=3)
             return True
 
         else:
@@ -298,6 +302,7 @@ class YtDlpDownloader:
             ],
             "quiet": quiet,
             "no_warnings": True,
+            "noprogress": True,
             "ignoreerrors": True,
             "retries": 3,
             "fragment_retries": 5,
