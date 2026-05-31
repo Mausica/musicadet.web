@@ -1,102 +1,58 @@
-# Musicadet
+# Musicadet 🎵
 
-Self-hosted intelligent music aggregator and synchronization pipeline with a premium, mobile-responsive web dashboard (HUD).
-
-> [!TIP]
-> Musicadet completely automates the process of discovering artists, cataloging albums into SQLite, and downloading high-quality discographies (`.opus` or `.mp3`) directly from YouTube Music using a robust, multi-threaded `yt-dlp` engine.
-
-## 🚀 Key Features
-
-- **Multi-Threaded Downloader:** Unleashes up to 4 parallel workers to rip tracks blazing fast while keeping individual artist downloads sequential to gracefully bypass YouTube's anti-bot rate limits.
-- **Intelligent Metadata Injection:** Quietly pulls gorgeous **600x600 High-Res Cover Art**, Release Year, and Genre directly from the *iTunes Search API* and permanently embeds them natively into your `.opus` or `.mp3` files via the `mutagen` engine.
-- **Zero Database Locks:** Fully fortified SQLite backend running in `WAL` mode with robust 60-second wait-queues ensures rock-solid stability during aggressive concurrent downloading.
-- **Premium Web Dashboard:** A sleek, dark-mode, mobile-responsive interface featuring single-row navigation, live WebSockets console, pagination, and a beautiful floating Modal to inspect real-time embedded file metadata.
-- **Album Completeness Engine:** Automatically detects if an artist is missing tracks from an album and gracefully fills in the gaps.
+A fully automated, self-hosted music aggregator. It discovers artists from Spotify, rips their discographies from YouTube Music at blazing speeds, and injects beautiful high-res metadata. 
 
 ---
 
-## 🏗 Architecture Schema
+## 🏗 How It Works
 
 ```mermaid
 graph TD
-    subgraph Web Dashboard HUD
-    A[Mobile Responsive UI] -->|WebSockets| B[Live Console Log]
-    A -->|API endpoints| C[FastAPI Backend]
-    C -.->|Reads Metadata| D[File System]
+    subgraph 📱 Premium Web UI
+    A[Dark Mode Dashboard] -->|WebSockets| B[Live Download Console]
+    A -->|API| C[FastAPI Backend]
     end
 
-    subgraph Sync Engine
-    E[Spotify Playlist Parser] -->|Extracts Artists| F[Database SQLite WAL]
-    F -->|Pending Tracks| G[Thread Pool Executor]
-    G -->|Worker 1| H[yt-dlp ytsearch1:]
-    G -->|Worker 2| H
-    G -->|Worker 3| H
-    G -->|Worker 4| H
+    subgraph ⚙️ Sync Engine
+    E[Spotify Playlist] -->|Extract Artists| F[SQLite WAL Database]
+    F -->|4-Worker Thread Pool| G[yt-dlp Downloader]
+    G -->|Concurrent Ripper| H[Sequential per-artist]
     end
 
-    subgraph Post-Processing
-    H -->|Saves .opus / .mp3| I[Mutagen Metadata Embedder]
-    J[iTunes Search API] -.->|600x600 Art, Year, Genre| I
-    I --> D[Jellyfin Media Folder]
+    subgraph 🎨 Post-Processing
+    H -->|Saves .opus / .mp3| I[Mutagen Tag Engine]
+    J[iTunes API] -.->|600x600 Cover, Year, Genre| I
+    I --> D[Jellyfin Music Folder]
     end
 ```
 
 ---
 
-## ⚙️ Install / Update
-
-Run this one-liner as root to clone/update the repository, install dependencies, and register the global `musicadet` CLI and `systemd` services:
+## 🚀 One-Line Install
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Mausica/musicadet.web/main/install.sh)
 ```
 
-## 📱 HUD Web Dashboard
+## ✨ Highlights
 
-Access the beautiful dashboard from any device: **http://SERVER_IP:8800**
+* **Blazing Fast:** 4 concurrent `yt-dlp` background workers.
+* **Smart Metadata:** Automatically embeds gorgeous **600x600 iTunes Cover Art**, Release Year, and Genre directly into your files.
+* **Bulletproof Database:** SQLite runs in `WAL` mode with 60-second timeouts — zero database locks.
+* **Instant Inspection:** Click **Info** on any file in the Web UI to see its embedded cover and metadata in a sleek modal!
 
-- **Dashboard:** At-a-glance metrics for your entire library.
-- **Library & Artists:** Fully paginated exploration of your downloaded catalog.
-- **Files:** Explore the physical disk files, and click **Info** to instantly inspect their embedded High-Res Cover Art, Year, Bitrate, and Genre in a sleek pop-up Modal.
-- **Console:** Watch the 4-worker thread pool rip your tracks in real-time via WebSockets.
-- **Settings:** Configure your output formats (`opus` or `mp3`), Jellyfin folder paths, and more.
+## 📱 Web Dashboard (`http://SERVER_IP:8800`)
 
-## 💻 Global CLI
+* **Library & Artists:** Browse your entire downloaded catalog.
+* **Files:** Inspect physical disk files and their embedded tags.
+* **Console:** Watch the 4-worker thread pool rip tracks in real-time.
+* **Settings:** Configure Jellyfin paths, preferred format (`opus` or `mp3`), and bitrate.
 
-The `musicadet` command is available from anywhere on your server:
-
-```bash
-musicadet                              # Full sync (playlists → scan albums → download)
-musicadet scan                         # Discover new artists from configured playlists
-musicadet scan-artists                 # Scan artist albums into the database
-musicadet scan-artists --new-only      # Only scan newly discovered artists
-musicadet artists-sync                 # Download all pending tracks sequentially
-musicadet download-pending             # Trigger the fast multi-threaded downloader
-musicadet reconcile                    # Re-map physical files ↔ database
-musicadet fix-metadata                 # Re-fetch and embed iTunes covers & tags
-musicadet add "Artist Name"            # Manually force-add an artist
-```
-
-## 🛠 Configuration
-
-Located at `/opt/musicadet/config.json` (also editable via the Settings tab in the HUD):
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `music_dir` | `/mnt/storage_jellyfin/media/music` | Download root folder for Jellyfin |
-| `format` | `opus` | Preferred audio format (`opus` or `mp3`) |
-| `bitrate` | `320k` | Audio quality |
-| `output_template` | `{artist}/{album}/{track:02d} - {title}.{ext}` | Clean physical folder layout |
-| `threads` | `4` | Number of concurrent `yt-dlp` download workers |
-| `hud_port` | `8800` | Port for the web interface |
-
-## 🔄 Systemd Services
-
-Musicadet is fully integrated with `systemd` for seamless background operation:
+## 💻 CLI Commands
 
 ```bash
-systemctl status musicadet.timer       # Daily automated synchronization
-systemctl start musicadet.service      # Trigger an immediate background sync
-systemctl status musicadet-hud.service # Background daemon for the Web UI
-journalctl -u musicadet-hud.service -f # Watch the Web UI logs
+musicadet                              # Run a full automated sync
+musicadet download-pending             # Trigger the 4-worker downloader
+musicadet fix-metadata                 # Re-fetch covers & tags from iTunes
+musicadet add "Artist Name"            # Force-add an artist
 ```

@@ -488,21 +488,21 @@ def api_track_info(path: str):
                 info["bitrate"] = getattr(audio.info, "bitrate", 0)
                 info["length"] = getattr(audio.info, "length", 0)
             if audio.tags:
-            tags = audio.tags
-            if full_path.suffix.lower() == ".opus":
-                info["title"] = tags.get("title", [info["title"]])[0]
-                info["artist"] = tags.get("artist", [""])[0]
-                info["album"] = tags.get("album", [""])[0]
-                info["year"] = tags.get("date", [""])[0]
-                info["genre"] = tags.get("genre", [""])[0]
-                info["has_cover"] = "metadata_block_picture" in tags
-            elif full_path.suffix.lower() == ".mp3":
-                info["title"] = str(tags.get("TIT2", info["title"]))
-                info["artist"] = str(tags.get("TPE1", ""))
-                info["album"] = str(tags.get("TALB", ""))
-                info["year"] = str(tags.get("TDRC", ""))
-                info["genre"] = str(tags.get("TCON", ""))
-                info["has_cover"] = any(k.startswith("APIC") for k in tags)
+                tags = audio.tags
+                if full_path.suffix.lower() == ".opus":
+                    info["title"] = tags.get("title", [info["title"]])[0]
+                    info["artist"] = tags.get("artist", [""])[0]
+                    info["album"] = tags.get("album", [""])[0]
+                    info["year"] = tags.get("date", [""])[0]
+                    info["genre"] = tags.get("genre", [""])[0]
+                    info["has_cover"] = "metadata_block_picture" in tags
+                elif full_path.suffix.lower() == ".mp3":
+                    info["title"] = str(tags.get("TIT2", info["title"]))
+                    info["artist"] = str(tags.get("TPE1", ""))
+                    info["album"] = str(tags.get("TALB", ""))
+                    info["year"] = str(tags.get("TDRC", ""))
+                    info["genre"] = str(tags.get("TCON", ""))
+                    info["has_cover"] = any(k.startswith("APIC") for k in tags)
     except Exception:
         pass
 
