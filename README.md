@@ -1,80 +1,102 @@
-# MusicaDet
+# Musicadet
 
-Self-hosted Spotify → Jellyfin music sync with a web dashboard (HUD).
+Self-hosted intelligent music aggregator and synchronization pipeline with a premium, mobile-responsive web dashboard (HUD).
 
-Discovers artists from Spotify playlists, scans their full album catalogs into SQLite,
-downloads discographies with **spotDL** as **MP3 320 kbps** with embedded cover art,
-lyrics, and ID3 tags, and organizes files for Jellyfin:
+> [!TIP]
+> Musicadet completely automates the process of discovering artists, cataloging albums into SQLite, and downloading high-quality discographies (`.opus` or `.mp3`) directly from YouTube Music using a robust, multi-threaded `yt-dlp` engine.
 
+## 🚀 Key Features
+
+- **Multi-Threaded Downloader:** Unleashes up to 4 parallel workers to rip tracks blazing fast while keeping individual artist downloads sequential to gracefully bypass YouTube's anti-bot rate limits.
+- **Intelligent Metadata Injection:** Quietly pulls gorgeous **600x600 High-Res Cover Art**, Release Year, and Genre directly from the *iTunes Search API* and permanently embeds them natively into your `.opus` or `.mp3` files via the `mutagen` engine.
+- **Zero Database Locks:** Fully fortified SQLite backend running in `WAL` mode with robust 60-second wait-queues ensures rock-solid stability during aggressive concurrent downloading.
+- **Premium Web Dashboard:** A sleek, dark-mode, mobile-responsive interface featuring single-row navigation, live WebSockets console, pagination, and a beautiful floating Modal to inspect real-time embedded file metadata.
+- **Album Completeness Engine:** Automatically detects if an artist is missing tracks from an album and gracefully fills in the gaps.
+
+---
+
+## 🏗 Architecture Schema
+
+```mermaid
+graph TD
+    subgraph Web Dashboard HUD
+    A[Mobile Responsive UI] -->|WebSockets| B[Live Console Log]
+    A -->|API endpoints| C[FastAPI Backend]
+    C -.->|Reads Metadata| D[File System]
+    end
+
+    subgraph Sync Engine
+    E[Spotify Playlist Parser] -->|Extracts Artists| F[Database SQLite WAL]
+    F -->|Pending Tracks| G[Thread Pool Executor]
+    G -->|Worker 1| H[yt-dlp ytsearch1:]
+    G -->|Worker 2| H
+    G -->|Worker 3| H
+    G -->|Worker 4| H
+    end
+
+    subgraph Post-Processing
+    H -->|Saves .opus / .mp3| I[Mutagen Metadata Embedder]
+    J[iTunes Search API] -.->|600x600 Art, Year, Genre| I
+    I --> D[Jellyfin Media Folder]
+    end
 ```
-/mnt/storage_jellyfin/media/music/ARTIST/ALBUM/track.mp3
-```
 
-## Install / update (one-liner, as root)
+---
+
+## ⚙️ Install / Update
+
+Run this one-liner as root to clone/update the repository, install dependencies, and register the global `musicadet` CLI and `systemd` services:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Mausica/musicadet.web/main/install.sh)
 ```
 
-This clones or updates the repo (overwriting any local changes in `/opt/musicadet`),
-installs dependencies, and registers the global `musicadet` CLI.
+## 📱 HUD Web Dashboard
 
-## HUD web dashboard
+Access the beautiful dashboard from any device: **http://SERVER_IP:8800**
 
-After install: **http://SERVER_IP:8800**
+- **Dashboard:** At-a-glance metrics for your entire library.
+- **Library & Artists:** Fully paginated exploration of your downloaded catalog.
+- **Files:** Explore the physical disk files, and click **Info** to instantly inspect their embedded High-Res Cover Art, Year, Bitrate, and Genre in a sleek pop-up Modal.
+- **Console:** Watch the 4-worker thread pool rip your tracks in real-time via WebSockets.
+- **Settings:** Configure your output formats (`opus` or `mp3`), Jellyfin folder paths, and more.
 
-- Dark minimal UI with live console (WebSocket)
-- Dashboard stats: artists, albums, songs, metadata gaps
-- **Library** tab: album download progress, per-song cover/lyrics status
-- **Settings** tab: music folder, format, bitrate, lyrics providers, timeouts
-- Manage artists & playlists; trigger scan / sync / reconcile / fix-metadata
+## 💻 Global CLI
 
-## Global CLI
-
-Works from anywhere after install:
+The `musicadet` command is available from anywhere on your server:
 
 ```bash
-musicadet                              # full sync (playlists → scan albums → download)
-musicadet scan                         # discover artists from playlists
-musicadet scan-artists                 # scan artist albums into DB
-musicadet scan-artists --new-only
-musicadet artists-sync                 # download all active artists
-musicadet artists-sync --new-only
-musicadet reconcile                    # match files ↔ database
-musicadet fix-metadata                 # re-embed tags/cover/lyrics
-musicadet fix-metadata --artist "Name"
-musicadet list-albums
-musicadet add "Artist Name"
-musicadet add "https://open.spotify.com/artist/..."
-musicadet list
+musicadet                              # Full sync (playlists → scan albums → download)
+musicadet scan                         # Discover new artists from configured playlists
+musicadet scan-artists                 # Scan artist albums into the database
+musicadet scan-artists --new-only      # Only scan newly discovered artists
+musicadet artists-sync                 # Download all pending tracks sequentially
+musicadet download-pending             # Trigger the fast multi-threaded downloader
+musicadet reconcile                    # Re-map physical files ↔ database
+musicadet fix-metadata                 # Re-fetch and embed iTunes covers & tags
+musicadet add "Artist Name"            # Manually force-add an artist
 ```
 
-## Config (`/opt/musicadet/config.json`)
+## 🛠 Configuration
+
+Located at `/opt/musicadet/config.json` (also editable via the Settings tab in the HUD):
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `music_dir` | `/mnt/storage_jellyfin/media/music` | Download root (editable in HUD Settings) |
-| `format` | `mp3` | Audio format |
-| `bitrate` | `320k` | MP3 bitrate |
-| `output_template` | `{artist}/{album}/{track-number} - {title}.{output-ext}` | Folder layout |
-| `lyrics_providers` | genius, musixmatch, azlyrics | Lyrics fallback chain |
-| `playlist_save_timeout` | `600` | Seconds for large playlist metadata fetch |
-| `hud_port` | `8800` | Web dashboard port |
+| `music_dir` | `/mnt/storage_jellyfin/media/music` | Download root folder for Jellyfin |
+| `format` | `opus` | Preferred audio format (`opus` or `mp3`) |
+| `bitrate` | `320k` | Audio quality |
+| `output_template` | `{artist}/{album}/{track:02d} - {title}.{ext}` | Clean physical folder layout |
+| `threads` | `4` | Number of concurrent `yt-dlp` download workers |
+| `hud_port` | `8800` | Port for the web interface |
 
-## Systemd
+## 🔄 Systemd Services
+
+Musicadet is fully integrated with `systemd` for seamless background operation:
 
 ```bash
-systemctl status musicadet.timer       # daily auto sync
-systemctl start musicadet.service      # run sync now
-systemctl status musicadet-hud.service
-journalctl -u musicadet-hud.service -f
+systemctl status musicadet.timer       # Daily automated synchronization
+systemctl start musicadet.service      # Trigger an immediate background sync
+systemctl status musicadet-hud.service # Background daemon for the Web UI
+journalctl -u musicadet-hud.service -f # Watch the Web UI logs
 ```
-
-## Migrating from older installs
-
-If you previously used `/opt/music-sync` or `/mnt/storage_jellyfin/media/music/spotify/`:
-
-- `/opt/music-sync` is kept as a symlink to `/opt/musicadet` for compatibility
-- Old `music-sync` CLI is removed; use `musicadet` instead
-- Old systemd units (`music-sync.*`) are replaced by `musicadet.*`
-- Either keep your old `music_dir` in Settings, or move files and run `musicadet reconcile`

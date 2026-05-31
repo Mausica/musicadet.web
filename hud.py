@@ -476,13 +476,18 @@ def api_track_info(path: str):
     
     info = {
         "title": full_path.stem,
-        "artist": "", "album": "", "genre": "", "year": "", "has_cover": False
+        "artist": "", "album": "", "genre": "", "year": "", "has_cover": False,
+        "bitrate": 0, "length": 0.0
     }
     
     try:
         import mutagen
         audio = mutagen.File(full_path)
-        if audio and audio.tags:
+        if audio:
+            if hasattr(audio, "info") and audio.info:
+                info["bitrate"] = getattr(audio.info, "bitrate", 0)
+                info["length"] = getattr(audio.info, "length", 0)
+            if audio.tags:
             tags = audio.tags
             if full_path.suffix.lower() == ".opus":
                 info["title"] = tags.get("title", [info["title"]])[0]
@@ -931,7 +936,7 @@ HTML = r"""<!doctype html>
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .hide { display: none; }
+  .hide { display: none !important; }
   .hint {
     color: var(--muted);
     font-size: 11px;
@@ -1171,17 +1176,21 @@ HTML = r"""<!doctype html>
   </section>
 </main>
 
-<div id="trackModal" class="modal hide">
+<div id="trackModal" class="modal hide" onclick="if(event.target===this) this.classList.add('hide')">
   <div class="modal-content">
-    <button class="modal-close" onclick="$('#trackModal').classList.add('hide')">×</button>
+    <button class="modal-close" onclick="document.getElementById('trackModal').classList.add('hide')">×</button>
     <div class="modal-body" style="display:flex; gap:24px;">
       <img id="tmCover" src="" style="width:200px; height:200px; object-fit:cover; border-radius:12px; background:#111; border: 1px solid var(--border-card);" />
       <div style="flex:1;">
-        <h2 id="tmTitle" style="margin-top:0; font-size:20px; line-height:1.2; margin-bottom:16px;"></h2>
-        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Artist</label><div id="tmArtist" class="val"></div></div>
-        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Album</label><div id="tmAlbum" class="val"></div></div>
-        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Genre</label><div id="tmGenre" class="val"></div></div>
-        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Year</label><div id="tmYear" class="val"></div></div>
+        <h2 id="tmTitle" style="margin-top:0; font-size:28px; line-height:1.1; margin-bottom:16px; font-family: 'Brush Script MT', cursive, sans-serif; background: linear-gradient(135deg, #fff 0%, #a1a1aa 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;"></h2>
+        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Artist</label><div id="tmArtist" class="val" style="font-family:'Inter', sans-serif"></div></div>
+        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Album</label><div id="tmAlbum" class="val" style="font-family:'Inter', sans-serif"></div></div>
+        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Genre</label><div id="tmGenre" class="val" style="font-family:'Inter', sans-serif"></div></div>
+        <div class="field" style="margin-bottom:6px"><label style="margin-bottom:2px">Year</label><div id="tmYear" class="val" style="font-family:'Inter', sans-serif"></div></div>
+        <div style="display:flex; gap:16px;">
+          <div class="field" style="margin-bottom:6px; flex:1;"><label style="margin-bottom:2px">Length</label><div id="tmLength" class="val" style="font-family:'Inter', sans-serif"></div></div>
+          <div class="field" style="margin-bottom:6px; flex:1;"><label style="margin-bottom:2px">Bitrate</label><div id="tmBitrate" class="val" style="font-family:'Inter', sans-serif"></div></div>
+        </div>
       </div>
     </div>
   </div>
@@ -1348,6 +1357,7 @@ async function showTrackInfo(path) {
   $('#tmCover').src=''; $('#tmTitle').textContent='Loading...';
   $('#tmArtist').textContent='-'; $('#tmAlbum').textContent='-';
   $('#tmGenre').textContent='-'; $('#tmYear').textContent='-';
+  $('#tmLength').textContent='-'; $('#tmBitrate').textContent='-';
   $('#trackModal').classList.remove('hide');
   const info=await api('/api/track/info?path='+encodeURIComponent(path));
   if(info.error){ $('#tmTitle').textContent='Error'; return; }
@@ -1356,6 +1366,15 @@ async function showTrackInfo(path) {
   $('#tmAlbum').textContent=info.album||'-';
   $('#tmGenre').textContent=info.genre||'-';
   $('#tmYear').textContent=info.year||'-';
+  
+  if(info.length) {
+    const s = Math.round(info.length);
+    $('#tmLength').textContent=Math.floor(s/60)+':'+(s%60).toString().padStart(2,'0');
+  }
+  if(info.bitrate) {
+    $('#tmBitrate').textContent=Math.round(info.bitrate/1000)+' kbps';
+  }
+
   if(info.has_cover) {
     $('#tmCover').src='/api/track/cover?path='+encodeURIComponent(path)+'&t='+Date.now();
   } else {
