@@ -74,6 +74,7 @@ DEFAULTS: dict = {
     "artist_save_timeout": 900,
     "lyrics_providers": ["genius", "musixmatch", "azlyrics"],
     "generate_lrc": False,
+    "artist_scanner": "ytmusic",
     "scan_concurrency": 4,
     "sync_concurrency": 1,              # sequential artist sync
     "verified_artists": [],             # populated from config.json
@@ -1048,12 +1049,14 @@ def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
     """Scan one artist's discography into albums/songs tables."""
     sid = artist_row["spotify_id"]
     name = artist_row["name"]
+    scanner_type = CFG.get("artist_scanner", "ytmusic")
     
-    if sid.startswith("local:"):
+    if sid.startswith("local:") and scanner_type != "ytmusic":
         log.info("  → Skipping local artist catalog scan: %s", name)
         return 0, 0
-
-    scanner_type = CFG.get("artist_scanner", "spotify")
+    
+    log.info("  → Scanning %s using %s...", name, scanner_type.upper())
+    
     if scanner_type == "ytmusic":
         import ytm_scanner
         songs = ytm_scanner.scan_artist(name)
