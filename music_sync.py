@@ -493,23 +493,39 @@ def _upsert_artist_catalog(db: sqlite3.Connection, artist_id: str, songs: list) 
     now = datetime.now().isoformat(timespec="seconds")
 
     for album_id, info in albums.items():
-        cur = db.execute("""
-            INSERT INTO albums (spotify_id, artist_id, name, release_year, track_count, last_scanned)
-            VALUES (?,?,?,?,?,?)
-            ON CONFLICT(spotify_id) DO UPDATE SET
-                name=excluded.name,
-                release_year=COALESCE(excluded.release_year, albums.release_year),
-                track_count=excluded.track_count,
-                last_scanned=excluded.last_scanned
-        """, (album_id, artist_id, info["name"], info["year"], len(info["tracks"]), now))
-        if cur.rowcount == 1:
-            new_albums += 1
+        existing_album = db.execute(
+            "SELECT spotify_id FROM albums WHERE artist_id=? AND name=?",
+            (artist_id, info["name"])
+        ).fetchone()
+
+        final_album_id = existing_album["spotify_id"] if existing_album else album_id
+
+        if not existing_album:
+            cur = db.execute("""
+                INSERT INTO albums (spotify_id, artist_id, name, release_year, track_count, last_scanned)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(spotify_id) DO UPDATE SET
+                    name=excluded.name,
+                    release_year=COALESCE(excluded.release_year, albums.release_year),
+                    track_count=excluded.track_count,
+                    last_scanned=excluded.last_scanned
+            """, (final_album_id, artist_id, info["name"], info["year"], len(info["tracks"]), now))
+            if cur.rowcount == 1:
+                new_albums += 1
+        else:
+            db.execute("""
+                UPDATE albums SET 
+                    release_year=COALESCE(?, release_year),
+                    track_count=?, 
+                    last_scanned=?
+                WHERE spotify_id=?
+            """, (info["year"], len(info["tracks"]), now, final_album_id))
 
         for song in info["tracks"]:
             song_id = _song_id_from_dict(song)
             if not song_id:
                 digest = hashlib.md5(
-                    f"{album_id}:{_title_from_song(song)}".encode(), usedforsecurity=False
+                    f"{final_album_id}:{_title_from_song(song)}".encode(), usedforsecurity=False
                 ).hexdigest()[:16]
                 song_id = f"trk:{digest}"
 
@@ -528,7 +544,7 @@ def _upsert_artist_catalog(db: sqlite3.Connection, artist_id: str, songs: list) 
                     db.execute("""
                         UPDATE songs SET album_id=?, artist_id=?, title=?, track_number=?, updated_at=?
                         WHERE spotify_id=?
-                    """, (album_id, artist_id, title, track_num, now, song_id))
+                    """, (final_album_id, artist_id, title, track_num, now, song_id))
                     continue
 
             cur = db.execute("""
@@ -539,7 +555,7 @@ def _upsert_artist_catalog(db: sqlite3.Connection, artist_id: str, songs: list) 
                     title=excluded.title,
                     track_number=excluded.track_number,
                     updated_at=excluded.updated_at
-            """, (song_id, album_id, artist_id, title, track_num, now))
+            """, (song_id, final_album_id, artist_id, title, track_num, now))
             if cur.rowcount == 1:
                 new_songs += 1
             elif existing and existing["status"] != "downloaded":
