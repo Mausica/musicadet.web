@@ -8,18 +8,18 @@ A fully automated, self-hosted music aggregator. It discovers artists from Spoti
 
 ```mermaid
 graph TD
-    subgraph 📱 Premium Web UI
+    subgraph UI [📱 Premium Web UI]
     A[Dark Mode Dashboard] -->|WebSockets| B[Live Download Console]
     A -->|API| C[FastAPI Backend]
     end
 
-    subgraph ⚙️ Sync Engine
+    subgraph Engine [⚙️ Sync Engine]
     E[Spotify Playlist] -->|Extract Artists| F[SQLite WAL Database]
     F -->|4-Worker Thread Pool| G[yt-dlp Downloader]
     G -->|Concurrent Ripper| H[Sequential per-artist]
     end
 
-    subgraph 🎨 Post-Processing
+    subgraph PostProcessing [🎨 Post-Processing]
     H -->|Saves .opus / .mp3| I[Mutagen Tag Engine]
     J[iTunes API] -.->|600x600 Cover, Year, Genre| I
     I --> D[Jellyfin Music Folder]
