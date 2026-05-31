@@ -303,7 +303,7 @@ def count_tracks() -> int:
 def api_artists(q: str = "", status: str = "all"):
     sql = """
         SELECT a.spotify_id, a.name, a.source, a.active, a.sync_done, a.last_synced, a.added_at,
-               a.albums_scanned_at, a.max_downloads,
+               a.albums_scanned_at, a.max_downloads, a.is_romanian,
                (SELECT COUNT(*) FROM albums WHERE artist_id=a.spotify_id) AS album_count,
                (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id AND status='downloaded') AS songs_dl,
                (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id) AS songs_total
@@ -321,6 +321,8 @@ def api_artists(q: str = "", status: str = "all"):
         where.append("a.active=1 AND a.sync_done=0")
     elif status == "synced":
         where.append("a.sync_done=1")
+    if q2 := {"romanian": "a.is_romanian=1", "international": "a.is_romanian=0"}.get(status):
+        where.append(q2)
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY a.name COLLATE NOCASE LIMIT 2000"
@@ -420,6 +422,17 @@ async def api_set_artist_limit(spotify_id: str, request: Request):
         else:
             conn.execute("UPDATE artists SET max_downloads = ? WHERE spotify_id=?", (int(limit), spotify_id))
     return {"ok": True}
+
+
+@app.post("/api/artists/{spotify_id}/ro")
+def api_toggle_romanian(spotify_id: str):
+    with db() as conn:
+        row = conn.execute("SELECT is_romanian FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        new = 0 if row["is_romanian"] else 1
+        conn.execute("UPDATE artists SET is_romanian=? WHERE spotify_id=?", (new, spotify_id))
+    return {"ok": True, "is_romanian": new}
 
 
 @app.delete("/api/artists/{spotify_id}")
@@ -692,6 +705,7 @@ ACTIONS = {
     "migrate-structure": (["migrate-structure"], "Migrate library structure"),
     "fix-metadata": (["fix-metadata"], "Fix metadata"),
     "deduplicate": (["deduplicate"], "Deduplicate"),
+    "mark-romanian": (["mark-romanian"], "Mark Romanian Artists"),
     "full": ([], "Full sync"),
 }
 
@@ -1266,6 +1280,7 @@ HTML = r"""<!doctype html>
         <button class="btn ghost" onclick="action('migrate-structure')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Migrate Structure</button>
         <button class="btn ghost" onclick="action('fix-metadata')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg> Fix Metadata</button>
         <button class="btn ghost danger-text" onclick="if(confirm('This will deduplicate all artists, tracks, and 1-track albums in the database and filesystem. Proceed?')) action('deduplicate')" style="color: #ff4b4b;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg> Deduplicate</button>
+        <button class="btn ghost" onclick="action('mark-romanian')" title="Auto-detect Romanian artists using MusicBrainz API — run once after adding artists">🇷🇴 Mark Romanian</button>
         <button class="btn danger" onclick="stop()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"></polygon><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg> Stop</button>
       </div>
       <div class="gradient-sep"></div>
@@ -1317,7 +1332,10 @@ HTML = r"""<!doctype html>
       <div class="row" style="margin-bottom:14px">
         <input id="artistSearch" placeholder="Search..." oninput="loadArtists()"/>
         <select id="artistFilter" onchange="loadArtists()">
-          <option value="all">All</option><option value="active">Active</option>
+          <option value="all">All</option>
+          <option value="romanian">🇷🇴 Romanian</option>
+          <option value="international">🌍 International</option>
+          <option value="active">Active</option>
           <option value="pending">Pending</option><option value="synced">Synced</option>
           <option value="disabled">Disabled</option>
         </select>
@@ -1569,7 +1587,9 @@ function renderArtists(){
     const sync=r.sync_done?'<span class="pill done">synced</span>':'<span class="pill pend">pending</span>';
     const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
     const prog=(r.songs_dl||0)+'/'+(r.songs_total||0);
-    return `<tr><td>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
+    const roFlag = r.is_romanian ? '🇷🇴' : '🌍';
+    const roTitle = r.is_romanian ? 'Mark as International' : 'Mark as Romanian';
+    return `<tr style="${r.is_romanian ? 'border-left: 2px solid #0057b7;' : ''}"><td><span title="${roTitle}" style="cursor:pointer; margin-right:6px; opacity:${r.is_romanian?'1':'0.3'}; transition:opacity 0.2s" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity='${r.is_romanian?1:0.3}'" onclick="toggleRo('${r.spotify_id}')">${roFlag}</span>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
       <td>
         <div style="display:flex; gap:6px; align-items:center;">
           <select class="sm" style="width:85px; padding: 2px 4px; border: 1px solid var(--border-card); background: #111; color: var(--txt); border-radius: 4px;" onchange="setArtistLimit('${r.spotify_id}', this.value)" title="Max Downloads">
@@ -1591,6 +1611,7 @@ async function addArtist(){
   $('#artistEntry').value='';toast('Adding — see console');showConsole();
 }
 async function toggleArtist(id){await api(`/api/artists/${id}/toggle`,{method:'POST'});loadArtists();}
+async function toggleRo(id){await api(`/api/artists/${id}/ro`,{method:'POST'});loadArtists();}
 async function setArtistLimit(id, limit){
   await api(`/api/artists/${id}/limit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:limit})});
 }

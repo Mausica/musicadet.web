@@ -140,6 +140,8 @@ def _migrate_columns(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE artists ADD COLUMN albums_scanned_at TEXT")
     if "max_downloads" not in artist_cols:
         db.execute("ALTER TABLE artists ADD COLUMN max_downloads INTEGER")
+    if "is_romanian" not in artist_cols:
+        db.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
 
     song_cols = {r[1] for r in db.execute("PRAGMA table_info(songs)")}
     if "youtube_url" not in song_cols:
@@ -218,7 +220,173 @@ def db_init():
                         SET name=excluded.name, url=excluded.url
                 """, (pid, pl["name"], pl["url"]))
 
+    _auto_mark_romanian_artists()
     log.info("DB ready: %s", CFG["db_path"])
+
+
+# Comprehensive list of known Romanian artists (normalized, lowercase, no punctuation)
+_ROMANIAN_ARTISTS = {
+    # Mainstream / Pop / Hip-Hop
+    "smiley", "babasha", "themotans", "carlascreams", "irina rimes", "irinarimes",
+    "nosfe", "morometzii", "bodo", "connect r", "connectr", "akcent", "morandi",
+    "voltaj", "holograf", "phoenix", "iris", "cargo", "proconsul", "taxi",
+    "tranda", "maximtb", "delia", "inna", "alexandra stan", "alexandrastan",
+    "elena gheorghe", "elenagheorghe", "antonia", "jessie j", "dr alban",
+    "lala band", "lalaband", "loredana", "loredanagroza", "nicoleta guta", "nicoletabogda",
+    "florin salam", "florinsalam", "nicolae guta", "nicolaeguta", "cristi dules", "cristidules",
+    "claudia ionas", "claudiaionas", "jador", "dorian popa", "dorianpopa",
+    "sore", "what s up", "whatsup", "the motans", "subcarpati", "hie",
+    "grasu xxl", "grasuxxl", "lino golden", "linogolden", "alex velea", "alexvelea",
+    "mario fresh", "mariofresh", "matteo", "edward sanda", "edwardsanda",
+    "emilian", "iamreal", "bvcovia", "la familia", "lafamilia",
+    "nane", "dragos becker", "dragosbecker", "b o r k", "bork",
+    "guess who", "guesswho", "cheloo", "parazitiitraditionali", "parazitii",
+    "mahia beldo", "mahiabeldo", "ami", "andreea banica", "andreeabanica",
+    "andreea antonescu", "andreeaantonescu", "andreea ignat", "andreeaignat",
+    "cleopatra stratan", "cleopatrastratan", "abi talent", "abitalent",
+    "catalin josan", "catalinjosan", "mr juve", "mrjuve", "mr ghita",
+    "nicolae botgros", "nicolaebotgros", "silvia dumitrescu", "silviadumitrescu",
+    "benone sinulescu", "benonesinulescu", "gheorghe dinca", "gheorghedinca",
+    "stefan banica jr", "stefanbanicajr", "mihai margineanu", "mihaimargineanu",
+    "mihai eminescu", "cristi minculescu", "cristiminculescu",
+    "what s up", "whatsup", "sisu tudor", "sisutudor",
+    # Rap / Trap / Urban
+    "azteca", "amuly", "tzanca uraganu", "tzancauraganu", "tzanca uraganul",
+    "florin peste", "florinpeste", "johnny romano", "johnnyromano",
+    "ionut cercel", "ionutcercel", "guta", "nicolae guta",
+    "tata vlad", "tatavlad", "daz dillinger", "dj project", "djproject",
+    "keed", "lvbel c5", "lvbelc5", "petre stefan", "petrestefan",
+    "robert toma", "roberttoma", "bogdan dragos", "bogdandragos",
+    "vunk", "mirela petrean", "mirela retegan", "mirelapetrean",
+    "alina eremia", "alinaeremia", "antonia", "corina", "madalina ghenea",
+    # Rock / Metal / Alternative  
+    "byron", "partizan", "timpuri noi", "timpurinoi", "cerbul de aur",
+    "directia 5", "directia5", "robin and the backstabbers", "robinandthebackstabbers",
+    "cargo", "phoenix", "compact", "metropolitan", "celelalte cuvinte",
+    "implant pentru refuz", "implantpentrurefuz", "goodbye to gravity",
+    "goodbye gravity", "the mono jacks", "themonojacks",
+    "jurjak", "luna amara", "lunaamara", "ro ala", "roala",
+    # Folk / Ethno  
+    "maria tanase", "mariatanase", "nicu alifantis", "nicuaifantis",
+    "grigore lese", "grigorelese", "mircea vintila", "mirceaintila",
+    "pasarea colibri", "pasareacolibri", "fanfare ciocarlia", "fanfareciocarlia",
+    "taraf de haidouks", "tarafddehaidouks",
+    # Electronic / Dance
+    "edward maya", "edwardmaya", "dj project", "dj sava", "djsava",
+    "dj fly", "djfly", "dj dark", "djdark", "dj gigi", "djgigi",
+    "dj paul", "djpaul", "dj rynno", "djrynno", "sylvio", "play aj",
+    "playaj", "frissco", "dj dan", "djdan",
+    # Manele / Etno
+    "florin salam", "florinsalam", "nicolae guta", "nicolaeguta",
+    "liviu pustiu", "liviupustiu", "mr juve", "mrjuve", "sorinel pustiu",
+    "sorinelpustiu", "denisa", "vali vijelie", "valivijelie",
+    "costi ionita", "costiionita", "adi de vito", "adidevito",
+    "bianca de la tulcea", "biancadelatulcea", "sandu ciorba", "sanduciorba",
+    "copilul de aur", "copiluldeaur", "geo de la timisoara",
+    # Recent / New Gen
+    "renvtø", "renvto", "two feet", "el nino", "elnino",
+    "kapushon", "carlisstyle", "vlad babos", "vladbabos",
+    "alex fitzu", "alexfitzu", "stres", "bug mafia", "bugmafia",
+    "AG Remix", "agremix", "al rafaelo", "alrafaelo",
+    "hm", "radu sirbu", "radusirbu", "ala bala portocala",
+}
+
+
+def _is_romanian_fuzzy(norm: str) -> bool:
+    """Check if a normalized artist name fuzzy-matches any known Romanian artist."""
+    from difflib import SequenceMatcher
+    for ro_name in _ROMANIAN_ARTISTS:
+        # Only fuzzy-match names of similar length (avoid false positives)
+        if abs(len(norm) - len(ro_name)) <= 3:
+            ratio = SequenceMatcher(None, norm, ro_name).ratio()
+            if ratio >= 0.88:
+                return True
+    return False
+
+
+_mb_cache: dict = {}  # Cache MusicBrainz results to avoid repeated calls
+
+def _check_musicbrainz(artist_name: str) -> bool:
+    """Query MusicBrainz API to check if artist is from Romania. Cached."""
+    import urllib.request, json, time
+    if artist_name in _mb_cache:
+        return _mb_cache[artist_name]
+    try:
+        query = urllib.parse.quote(artist_name)
+        url = f"https://musicbrainz.org/ws/2/artist/?query=artist:{query}&fmt=json&limit=3"
+        req = urllib.request.Request(url, headers={"User-Agent": "Musicadet/1.0 (musicadet@local)"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        artists = data.get("artists", [])
+        for a in artists:
+            # Check score confidence (MusicBrainz returns 0-100 score)
+            if int(a.get("score", 0)) >= 85:
+                country = (a.get("country") or "").upper()
+                area = (a.get("area") or {}).get("name", "").lower()
+                if country == "RO" or "romania" in area:
+                    _mb_cache[artist_name] = True
+                    time.sleep(0.3)  # Respect MusicBrainz rate limit (1 req/sec)
+                    return True
+        _mb_cache[artist_name] = False
+        time.sleep(0.3)
+    except Exception:
+        _mb_cache[artist_name] = False
+    return False
+
+
+def _auto_mark_romanian_artists():
+    """Automatically mark Romanian artists using 3-tier detection:
+    1. Exact match against curated list
+    2. Fuzzy match (typos, diacritics, suffixes like ' - Topic')
+    3. MusicBrainz API lookup (for unknowns not in our list)
+    """
+    import urllib.parse
+    try:
+        with db_connect() as db:
+            # Only process artists not yet manually set (is_romanian IS NULL means never checked)
+            # We use is_romanian=0 as "not marked" — but we don't re-check already marked ones
+            artists = db.execute(
+                "SELECT spotify_id, name FROM artists WHERE active >= 0 AND is_romanian = 0"
+            ).fetchall()
+
+            marked = 0
+            mb_checked = 0
+            for art in artists:
+                name = art["name"]
+                norm = re.sub(r'[^a-z0-9 ]', '', name.lower()).strip()
+                norm_nospace = re.sub(r'[^a-z0-9]', '', name.lower()).strip()
+
+                is_ro = False
+
+                # Tier 1: Exact match
+                if norm in _ROMANIAN_ARTISTS or norm_nospace in _ROMANIAN_ARTISTS:
+                    is_ro = True
+                    log.debug("RO (exact): %s", name)
+
+                # Tier 2: Fuzzy match (handles ' - Topic', diacritics, typos)
+                if not is_ro:
+                    if _is_romanian_fuzzy(norm) or _is_romanian_fuzzy(norm_nospace):
+                        is_ro = True
+                        log.debug("RO (fuzzy): %s", name)
+
+                # Tier 3: MusicBrainz API (only for artists not in our list)
+                if not is_ro and mb_checked < 200:  # Cap API calls per run
+                    is_ro = _check_musicbrainz(name)
+                    mb_checked += 1
+                    if is_ro:
+                        log.debug("RO (MusicBrainz): %s", name)
+
+                if is_ro:
+                    db.execute(
+                        "UPDATE artists SET is_romanian=1 WHERE spotify_id=?",
+                        (art["spotify_id"],)
+                    )
+                    marked += 1
+
+            if marked:
+                log.info("Auto-marked %d Romanian artists (checked %d via MusicBrainz)", marked, mb_checked)
+    except Exception as e:
+        log.warning("Auto-mark Romanian artists failed: %s", e)
 
 
 def _extract_id_from_url(url: str, kind: str) -> Optional[str]:
