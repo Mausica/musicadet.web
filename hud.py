@@ -546,6 +546,28 @@ def api_track_cover(path: str):
     return Response(status_code=404)
 
 
+@app.get("/api/track/download")
+def api_track_download(path: str):
+    music_dir = Path(load_cfg()["music_dir"])
+    full_path = music_dir / path
+    if not full_path.exists():
+        return Response(status_code=404)
+    
+    import mimetypes
+    mime = mimetypes.guess_type(str(full_path))[0] or "application/octet-stream"
+    filename = full_path.name
+    
+    data = full_path.read_bytes()
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(data)),
+        }
+    )
+
+
 ACTIONS = {
     "scan": (["scan"], "Scan playlists"),
     "scan-artists": (["scan-artists"], "Scan artist albums"),
@@ -1358,7 +1380,7 @@ async function loadTracks(){
   const q=encodeURIComponent($('#trackSearch').value||'');
   const rows=await api(`/api/tracks?q=${q}&limit=300`);
   $('#trackRows').innerHTML=rows.map(r=>`<tr><td>${esc(r.artist)}</td><td class="muted">${esc(r.album)}</td><td>${esc(r.title)}</td>
-    <td style="text-align:right;"><button class="btn ghost sm" onclick="showTrackInfo('${esc(r.path)}')">Info</button></td></tr>`).join('')
+    <td style="text-align:right; white-space:nowrap; display:flex; gap:6px; justify-content:flex-end;"><a class="btn ghost sm" href="/api/track/download?path=${encodeURIComponent(r.path)}" download title="Download"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></a><button class="btn ghost sm" onclick="showTrackInfo('${esc(r.path)}')">Info</button></td></tr>`).join('')
     ||'<tr><td colspan=4 class="muted">No files found.</td></tr>';
   $('#trackHint').textContent=rows.length+' files shown';
 }

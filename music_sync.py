@@ -1373,7 +1373,6 @@ def cmd_fix_metadata(args):
                 SELECT DISTINCT a.* FROM artists a
                 JOIN songs s ON s.artist_id = a.spotify_id
                 WHERE a.active=1 AND s.status='downloaded'
-                  AND (s.has_cover=0 OR s.has_core_tags=0)
             """).fetchall()
 
     if not artists:
