@@ -280,6 +280,316 @@ def cmd_clean_ytm(args):
     log.info("  - Reset artist scan status. You can now re-run 'Scan artist albums' with the Spotify scanner.")
 
 
+def _normalize_artist_name(name: str) -> str:
+    s = name.lower()
+    if s.endswith(" - topic"):
+        s = s[:-8]
+    elif s.endswith(" topic"):
+        s = s[:-6]
+    s = re.sub(r'[^a-z0-9]', '', s)
+    return s.strip()
+
+
+def _normalize_song_title(title: str) -> str:
+    s = title.lower()
+    # Remove featuring/feat/ft
+    s = re.split(r'\b(feat|featuring|ft)\b', s)[0]
+    # Remove extra punctuation/spaces
+    s = re.sub(r'[^a-z0-9]', '', s)
+    return s.strip()
+
+
+def _merge_folders(src: Path, dst: Path):
+    import shutil
+    if not src.exists() or src == dst:
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        target = dst / item.name
+        if item.is_dir():
+            if target.exists() and target.is_dir():
+                _merge_folders(item, target)
+            else:
+                shutil.move(str(item), str(target))
+        else:
+            if target.exists():
+                if item.stat().st_size > target.stat().st_size:
+                    try:
+                        target.unlink()
+                        shutil.move(str(item), str(target))
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        item.unlink()
+                    except Exception:
+                        pass
+            else:
+                shutil.move(str(item), str(target))
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+
+
+def cmd_deduplicate(args):
+    """
+    Merge duplicate artists, deduplicate tracks under canonical artists,
+    and clean up 1-track albums that are duplicates of tracks in full albums.
+    """
+    from collections import defaultdict
+    import shutil
+    
+    log.info("Starting Deduplication Engine...")
+    
+    with db_connect() as db:
+        # Avoid thread lock issues by using Row factory locally
+        db.row_factory = sqlite3.Row
+        
+        # 1. ARTIST DEDUPLICATION & MERGING
+        artists = db.execute("SELECT spotify_id, name, active, last_synced, added_at FROM artists").fetchall()
+        
+        # Group by normalized name
+        groups = defaultdict(list)
+        for art in artists:
+            norm = _normalize_artist_name(art["name"])
+            if norm:
+                groups[norm].append(art)
+                
+        for norm_name, group_artists in groups.items():
+            if len(group_artists) > 1:
+                # Determine canonical
+                def artist_sort_key(art):
+                    aid = art["spotify_id"]
+                    if aid.startswith("local:"):
+                        rank = 1
+                    elif aid.startswith("q:"):
+                        rank = 2
+                    else:
+                        rank = 3
+                    return (rank, art["active"] or 0, aid)
+                    
+                sorted_group = sorted(group_artists, key=artist_sort_key, reverse=True)
+                canonical_artist = sorted_group[0]
+                canonical_id = canonical_artist["spotify_id"]
+                
+                # Choose the cleanest canonical name (preferring one that doesn't end with " - Topic")
+                names = [a["name"] for a in sorted_group]
+                clean_names = [n for n in names if not n.lower().endswith(" - topic") and not n.lower().endswith(" topic")]
+                if clean_names:
+                    canonical_name = clean_names[0]
+                else:
+                    canonical_name = canonical_artist["name"]
+                    if canonical_name.lower().endswith(" - topic"):
+                        canonical_name = canonical_name[:-8]
+                    elif canonical_name.lower().endswith(" topic"):
+                        canonical_name = canonical_name[:-6]
+                
+                log.info("Artist Group '%s': canonical is '%s' (%s)", norm_name, canonical_name, canonical_id)
+                
+                duplicate_artists = sorted_group[1:]
+                for dup in duplicate_artists:
+                    dup_id = dup["spotify_id"]
+                    dup_name = dup["name"]
+                    log.info("  Merging duplicate artist '%s' (%s) -> '%s' (%s)", dup_name, dup_id, canonical_name, canonical_id)
+                    
+                    # Merge playlist_artists
+                    playlist_ids = [r[0] for r in db.execute("SELECT playlist_id FROM playlist_artists WHERE artist_id = ?", (dup_id,)).fetchall()]
+                    for pl_id in playlist_ids:
+                        exists = db.execute("SELECT 1 FROM playlist_artists WHERE playlist_id = ? AND artist_id = ?", (pl_id, canonical_id)).fetchone()
+                        if not exists:
+                            db.execute("INSERT INTO playlist_artists (playlist_id, artist_id) VALUES (?, ?)", (pl_id, canonical_id))
+                    db.execute("DELETE FROM playlist_artists WHERE artist_id = ?", (dup_id,))
+                    
+                    # Merge albums
+                    dup_albums = db.execute("SELECT spotify_id, name, release_year, track_count, downloaded_count, last_scanned FROM albums WHERE artist_id = ?", (dup_id,)).fetchall()
+                    for da in dup_albums:
+                        da_id = da["spotify_id"]
+                        da_name = da["name"]
+                        
+                        canonical_match = db.execute(
+                            "SELECT spotify_id, track_count, downloaded_count FROM albums WHERE artist_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))",
+                            (canonical_id, da_name)
+                        ).fetchone()
+                        
+                        if canonical_match:
+                            cm_id = canonical_match["spotify_id"]
+                            log.info("    Merging duplicate album '%s' (%s) -> canonical album (%s)", da_name, da_id, cm_id)
+                            da_songs = db.execute("SELECT spotify_id, title, track_number, status, file_path, youtube_url FROM songs WHERE album_id = ?", (da_id,)).fetchall()
+                            for ds in da_songs:
+                                ds_id = ds["spotify_id"]
+                                song_by_id = db.execute("SELECT spotify_id, status, file_path FROM songs WHERE spotify_id = ?", (ds_id,)).fetchone()
+                                if song_by_id:
+                                    if ds["status"] == "downloaded" and song_by_id["status"] != "downloaded":
+                                        db.execute("UPDATE songs SET status='downloaded', file_path=?, youtube_url=? WHERE spotify_id=?",
+                                                   (ds["file_path"], ds["youtube_url"], ds_id))
+                                    elif ds["status"] == "downloaded" and song_by_id["status"] == "downloaded":
+                                        if ds["file_path"] and song_by_id["file_path"] and ds["file_path"] != song_by_id["file_path"]:
+                                            try:
+                                                Path(ds["file_path"]).unlink(missing_ok=True)
+                                            except Exception:
+                                                pass
+                                    if ds_id != song_by_id["spotify_id"]:
+                                        db.execute("DELETE FROM songs WHERE spotify_id = ?", (ds_id,))
+                                else:
+                                    db.execute("UPDATE songs SET artist_id = ?, album_id = ? WHERE spotify_id = ?",
+                                               (canonical_id, cm_id, ds_id))
+                            
+                            # Count tracks dynamically
+                            tot_count = db.execute("SELECT COUNT(*) FROM songs WHERE album_id = ?", (cm_id,)).fetchone()[0]
+                            dl_count = db.execute("SELECT COUNT(*) FROM songs WHERE album_id = ? AND status='downloaded'", (cm_id,)).fetchone()[0]
+                            db.execute("UPDATE albums SET track_count = ?, downloaded_count = ? WHERE spotify_id = ?",
+                                       (max(tot_count, canonical_match["track_count"] or 0), dl_count, cm_id))
+                            
+                            db.execute("DELETE FROM albums WHERE spotify_id = ?", (da_id,))
+                        else:
+                            log.info("    Moving album '%s' (%s) to canonical artist", da_name, da_id)
+                            db.execute("UPDATE albums SET artist_id = ? WHERE spotify_id = ?", (canonical_id, da_id))
+                            db.execute("UPDATE songs SET artist_id = ? WHERE album_id = ?", (canonical_id, da_id))
+                    
+                    # Move physical files
+                    dup_folder = Path(CFG["music_dir"]) / _clean_filename(dup_name)
+                    canonical_folder = Path(CFG["music_dir"]) / _clean_filename(canonical_name)
+                    if dup_folder.exists() and dup_folder.is_dir() and dup_folder.resolve() != canonical_folder.resolve():
+                        log.info("    Moving files from '%s' to '%s'", dup_folder.name, canonical_folder.name)
+                        _merge_folders(dup_folder, canonical_folder)
+                        
+                    # Delete duplicate artist
+                    db.execute("DELETE FROM artists WHERE spotify_id = ?", (dup_id,))
+                    
+                # Update canonical name
+                db.execute("UPDATE artists SET name = ?, active = 1 WHERE spotify_id = ?", (canonical_name, canonical_id))
+        
+        # 2. TRACK DEDUPLICATION
+        active_artists = db.execute("SELECT spotify_id, name FROM artists WHERE active = 1").fetchall()
+        for art in active_artists:
+            art_id = art["spotify_id"]
+            art_name = art["name"]
+            
+            songs = db.execute("""
+                SELECT s.spotify_id, s.album_id, s.title, s.track_number, s.status, s.file_path, s.youtube_url,
+                       al.name as album_name
+                FROM songs s
+                JOIN albums al ON s.album_id = al.spotify_id
+                WHERE s.artist_id = ?
+            """, (art_id,)).fetchall()
+            
+            by_title = defaultdict(list)
+            for s in songs:
+                by_title[_normalize_song_title(s["title"])].append(s)
+                
+            for title_norm, group_songs in by_title.items():
+                if len(group_songs) > 1:
+                    def song_sort_key(s):
+                        is_dl = 1 if s["status"] == "downloaded" else 0
+                        is_real = 1 if (s["album_name"] and s["album_name"].lower() not in ("singles", "unknown album", "")) else 0
+                        has_file = 1 if (s["file_path"] and os.path.exists(s["file_path"])) else 0
+                        return (is_dl, is_real, has_file, s["spotify_id"])
+                        
+                    sorted_songs = sorted(group_songs, key=song_sort_key, reverse=True)
+                    canonical_song = sorted_songs[0]
+                    discarded_songs = sorted_songs[1:]
+                    
+                    log.info("Deduplicating tracks for %s: keeping '%s' (%s, status: %s)",
+                             art_name, canonical_song["title"], canonical_song["spotify_id"], canonical_song["status"])
+                             
+                    for ds in discarded_songs:
+                        if ds["file_path"] and os.path.exists(ds["file_path"]):
+                            if canonical_song["status"] != "downloaded":
+                                src_p = Path(ds["file_path"])
+                                res_alb = custom_dl.detect_singles(canonical_song["album_name"], canonical_song["title"]) if custom_dl else canonical_song["album_name"]
+                                dest_dir = Path(CFG["music_dir"]) / _clean_filename(art_name) / _clean_filename(res_alb)
+                                dest_dir.mkdir(parents=True, exist_ok=True)
+                                dest_p = dest_dir / src_p.name
+                                try:
+                                    shutil.move(str(src_p), str(dest_p))
+                                    db.execute("UPDATE songs SET file_path = ?, status = 'downloaded' WHERE spotify_id = ?",
+                                               (str(dest_p), canonical_song["spotify_id"]))
+                                    canonical_song["status"] = "downloaded"
+                                    canonical_song["file_path"] = str(dest_p)
+                                except Exception as e:
+                                    log.warning("    Failed to move file %s -> canonical: %s", src_p, e)
+                            else:
+                                src_p = Path(ds["file_path"])
+                                can_p = Path(canonical_song["file_path"]) if canonical_song["file_path"] else None
+                                if can_p and src_p.exists() and can_p.exists() and src_p.resolve() != can_p.resolve():
+                                    try:
+                                        src_p.unlink()
+                                    except Exception as e:
+                                        log.warning("    Failed to delete duplicate file %s: %s", src_p, e)
+                                        
+                        db.execute("DELETE FROM songs WHERE spotify_id = ?", (ds["spotify_id"],))
+                        
+        # 3. 1-TRACK ALBUM CLEANUP
+        for art in active_artists:
+            art_id = art["spotify_id"]
+            art_name = art["name"]
+            albums = db.execute("SELECT spotify_id, name FROM albums WHERE artist_id = ?", (art_id,)).fetchall()
+            for alb in albums:
+                alb_id = alb["spotify_id"]
+                alb_name = alb["name"]
+                
+                songs_in_alb = db.execute("SELECT spotify_id, title, status, file_path FROM songs WHERE album_id = ?", (alb_id,)).fetchall()
+                if len(songs_in_alb) == 1:
+                    song = songs_in_alb[0]
+                    norm_title = _normalize_song_title(song["title"])
+                    
+                    other_songs = db.execute("""
+                        SELECT s.spotify_id, s.album_id, s.title, s.status, s.file_path, al.name as album_name
+                        FROM songs s
+                        JOIN albums al ON s.album_id = al.spotify_id
+                        WHERE s.artist_id = ? AND s.album_id != ?
+                    """, (art_id, alb_id)).fetchall()
+                    
+                    other_match = None
+                    for os_row in other_songs:
+                        if _normalize_song_title(os_row["title"]) == norm_title:
+                            other_match = os_row
+                            break
+                            
+                    if other_match:
+                        log.info("1-Track Album Cleanup for %s: removing '%s' (Album: %s) because it exists in '%s'",
+                                 art_name, song["title"], alb_name, other_match["album_name"])
+                                 
+                        if song["file_path"] and os.path.exists(song["file_path"]):
+                            if other_match["status"] != "downloaded":
+                                src_p = Path(song["file_path"])
+                                res_alb = custom_dl.detect_singles(other_match["album_name"], other_match["title"]) if custom_dl else other_match["album_name"]
+                                dest_dir = Path(CFG["music_dir"]) / _clean_filename(art_name) / _clean_filename(res_alb)
+                                dest_dir.mkdir(parents=True, exist_ok=True)
+                                dest_p = dest_dir / src_p.name
+                                try:
+                                    shutil.move(str(src_p), str(dest_p))
+                                    db.execute("UPDATE songs SET file_path = ?, status = 'downloaded' WHERE spotify_id = ?",
+                                               (str(dest_p), other_match["spotify_id"]))
+                                except Exception as e:
+                                    log.warning("    Failed to move 1-track album file to canonical album: %s", e)
+                            else:
+                                src_p = Path(song["file_path"])
+                                can_p = Path(other_match["file_path"]) if other_match["file_path"] else None
+                                if can_p and src_p.exists() and can_p.exists() and src_p.resolve() != can_p.resolve():
+                                    try:
+                                        src_p.unlink()
+                                    except Exception as e:
+                                        log.warning("    Failed to delete duplicate 1-track file: %s", e)
+                                        
+                        db.execute("DELETE FROM songs WHERE spotify_id = ?", (song["spotify_id"],))
+                        db.execute("DELETE FROM albums WHERE spotify_id = ?", (alb_id,))
+                        
+        # 4. RECALCULATE ALBUM STATS
+        log.info("Recalculating album track and download stats...")
+        all_albums = db.execute("SELECT spotify_id FROM albums").fetchall()
+        for alb in all_albums:
+            alb_id = alb["spotify_id"]
+            tot_count = db.execute("SELECT COUNT(*) FROM songs WHERE album_id = ?", (alb_id,)).fetchone()[0]
+            dl_count = db.execute("SELECT COUNT(*) FROM songs WHERE album_id = ? AND status='downloaded'", (alb_id,)).fetchone()[0]
+            db.execute("UPDATE albums SET track_count = ?, downloaded_count = ? WHERE spotify_id = ?", (tot_count, dl_count, alb_id))
+            
+        db.commit()
+        
+    log.info("Deduplication complete.")
+
+
 def _album_id_from_song(song: dict, artist_id: str) -> str:
     aid = _normalize_spotify_id(song.get("album_id") or song.get("albumId"))
     if aid:
@@ -679,6 +989,29 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
             now = datetime.now().isoformat(timespec="seconds")
             if found:
                 rel = str(found.relative_to(music_dir))
+                current_artist_folder = Path(rel).parts[0] if len(Path(rel).parts) > 0 else ""
+                expected_artist = display_name if custom_dl is None else custom_dl._clean_filename(display_name)
+                
+                # Auto-rename / move if it's in the wrong artist folder (e.g. B A B A S H A -> Babasha)
+                if current_artist_folder and current_artist_folder.lower() != expected_artist.lower():
+                    if custom_dl:
+                        expected_album = custom_dl._clean_filename(album_name)
+                        safe_title = custom_dl._clean_filename(song["title"])
+                        if expected_album.lower() == safe_title.lower() or expected_album in ("Unknown Album", ""):
+                            expected_album = "Singles"
+                        new_folder = music_dir / expected_artist / expected_album
+                        new_folder.mkdir(parents=True, exist_ok=True)
+                        new_path = new_folder / found.name
+                        if found != new_path:
+                            import shutil
+                            try:
+                                shutil.move(str(found), str(new_path))
+                                log.info("  [Auto-Merge] Moved %s from %s to %s", found.name, current_artist_folder, expected_artist)
+                                found = new_path
+                                rel = str(found.relative_to(music_dir))
+                            except Exception as e:
+                                log.warning("Could not auto-move %s: %s", found, e)
+
                 meta = verify_song_metadata(found)
                 db.execute("""
                     UPDATE songs SET status='downloaded', file_path=?,
@@ -1628,6 +1961,7 @@ Examples:
     en_.add_argument("artist")
 
     sub = subparsers.add_parser("clean-ytm", help="Wipe all pending YouTube Music data to revert to Spotify scanner")
+    subparsers.add_parser("deduplicate", help="Merge duplicate artists and tracks")
 
     args = p.parse_args()
 
@@ -1650,6 +1984,7 @@ Examples:
         "disable":           cmd_disable,
         "enable":            cmd_enable,
         "clean-ytm":         cmd_clean_ytm,
+        "deduplicate":       cmd_deduplicate,
     }
 
     fn = routes.get(args.cmd)

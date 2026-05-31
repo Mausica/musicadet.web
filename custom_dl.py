@@ -66,8 +66,21 @@ def detect_singles(album: Optional[str], title: str) -> str:
 # Metadata embedding (Mutagen)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Garbage genre values that should be replaced with proper genres or removed
+GARBAGE_GENRES = {
+    "-", "Music", "Music Video", "Unknown", "Other", "Video", "",
+    "music", "music video", "unknown", "other", "video",
+    "Entertainment", "entertainment", "People & Blogs", "people & blogs",
+    "Howto & Style", "Comedy", "News & Politics", "Film & Animation",
+    "music videos", "unknown genre", "various", "various artists"
+}
+
 def _is_bad_genre(g: str) -> bool:
-    return not g or g.lower() in ("music", "music videos", "music video", "")
+    if not g:
+        return True
+    g_clean = str(g).strip().lower()
+    return g_clean in {x.lower() for x in GARBAGE_GENRES} or not g_clean
+
 
 def _fetch_itunes_cover(artist: str, title: str) -> tuple[Optional[bytes], Optional[str], Optional[str]]:
     import urllib.request, urllib.parse, json
@@ -170,7 +183,7 @@ def enforce_primary_artist(
                 audio["tracknumber"] = [str(track_number)]
             
             # Always fix bad/missing genre
-            existing_genre = audio.get("genre", [""])[0]
+            existing_genre = audio.get("genre", [""])[0] if "genre" in audio else ""
             need_cover = fetch_cover and "metadata_block_picture" not in audio
             need_genre = _is_bad_genre(existing_genre)
             
@@ -188,6 +201,8 @@ def enforce_primary_artist(
                     audio["date"] = [str(year)]
                 if genre and not _is_bad_genre(genre):
                     audio["genre"] = [genre]
+                elif _is_bad_genre(existing_genre) and "genre" in audio:
+                    del audio["genre"]
                 if need_cover and img_data:
                     from mutagen.flac import Picture
                     import base64
@@ -238,6 +253,8 @@ def enforce_primary_artist(
                     tags.add(TDRC(encoding=3, text=str(year)))
                 if genre and not _is_bad_genre(genre):
                     tags.add(TCON(encoding=3, text=genre))
+                elif _is_bad_genre(existing_genre) and "TCON" in tags:
+                    tags.pop("TCON", None)
                 if need_cover and img_data:
                     tags.add(APIC(
                         encoding=3,
@@ -262,6 +279,18 @@ def enforce_primary_artist(
                     audio["album"] = album
                 if track_number:
                     audio["tracknumber"] = str(track_number)
+                
+                # Genre check/fix for fallback
+                existing_genre = audio.get("genre", [""])[0] if "genre" in audio else ""
+                if _is_bad_genre(existing_genre):
+                    img_data, year, genre = _fetch_itunes_cover(primary_artist, title)
+                    if _is_bad_genre(genre):
+                        genre = _fetch_artist_genre(primary_artist)
+                    if genre and not _is_bad_genre(genre):
+                        audio["genre"] = [genre]
+                    elif "genre" in audio:
+                        del audio["genre"]
+                        
                 audio.save()
                 return True
 
