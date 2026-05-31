@@ -320,6 +320,11 @@ def count_tracks() -> int:
     return n
 
 
+def _decode_artist_id(spotify_id: str) -> str:
+    from urllib.parse import unquote
+    return unquote(spotify_id)
+
+
 def _artist_filters(q: str, status: str) -> tuple[list[str], list]:
     where, params = ["a.active >= 0"], []
     if q:
@@ -501,7 +506,6 @@ def api_bulk_artists(body: BulkArtistsIn):
     allowed = {"enable", "disable", "ro_on", "ro_off", "limit"}
     if body.action not in allowed:
         return JSONResponse({"error": "invalid action"}, status_code=400)
-
     with db() as conn:
         if body.ids:
             target_ids = list(dict.fromkeys(body.ids))
@@ -516,7 +520,6 @@ def api_bulk_artists(body: BulkArtistsIn):
             ]
         if not target_ids:
             return {"ok": True, "updated": 0}
-
         placeholders = ",".join("?" * len(target_ids))
         if body.action == "enable":
             conn.execute(
@@ -549,6 +552,7 @@ def api_bulk_artists(body: BulkArtistsIn):
                     f"UPDATE artists SET max_downloads=? WHERE spotify_id IN ({placeholders})",
                     [int(body.limit)] + target_ids,
                 )
+        conn.commit()
     return {"ok": True, "updated": len(target_ids)}
 
 
@@ -563,6 +567,7 @@ async def api_add_artist(body: ArtistIn):
 
 @app.post("/api/artists/{spotify_id}/toggle")
 def api_toggle_artist(spotify_id: str):
+    spotify_id = _decode_artist_id(spotify_id)
     with db() as conn:
         row = conn.execute("SELECT active FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
         if not row:
@@ -574,18 +579,31 @@ def api_toggle_artist(spotify_id: str):
 
 @app.post("/api/artists/{spotify_id}/limit")
 async def api_set_artist_limit(spotify_id: str, request: Request):
-    data = await request.json()
+    spotify_id = _decode_artist_id(spotify_id)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
     limit = data.get("limit")
     with db() as conn:
+        if not conn.execute("SELECT 1 FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone():
+            return JSONResponse({"error": "not found"}, status_code=404)
         if limit is None or limit == "":
             conn.execute("UPDATE artists SET max_downloads = NULL WHERE spotify_id=?", (spotify_id,))
-        else:
-            conn.execute("UPDATE artists SET max_downloads = ? WHERE spotify_id=?", (int(limit), spotify_id))
-    return {"ok": True}
+            conn.commit()
+            return {"ok": True, "max_downloads": None}
+        try:
+            val = int(limit)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "invalid limit"}, status_code=400)
+        conn.execute("UPDATE artists SET max_downloads = ? WHERE spotify_id=?", (val, spotify_id))
+        conn.commit()
+    return {"ok": True, "max_downloads": val}
 
 
 @app.post("/api/artists/{spotify_id}/ro")
 async def api_set_romanian(spotify_id: str, request: Request):
+    spotify_id = _decode_artist_id(spotify_id)
     try:
         body = await request.json()
     except Exception:
@@ -607,37 +625,42 @@ async def api_set_romanian(spotify_id: str, request: Request):
     return {"ok": True, "is_romanian": new}
 
 
-@app.delete("/api/artists/{spotify_id}")
-def api_delete_artist(spotify_id: str, delete_files: bool = False):
-    import shutil
+def _purge_artist_data(spotify_id: str, artist_name: str, delete_files: bool) -> None:
+    """Remove albums/songs (and optionally files) after artist is hidden from the HUD."""
     import re
+    import shutil
     from pathlib import Path
-    
+
+    with db() as conn:
+        conn.execute("DELETE FROM songs WHERE artist_id=?", (spotify_id,))
+        conn.execute("DELETE FROM albums WHERE artist_id=?", (spotify_id,))
+    if delete_files:
+        music_dir = Path(load_cfg()["music_dir"])
+
+        def clean_name(name: str) -> str:
+            return re.sub(r'[\\/*?:"<>|]', "", str(name)).strip().strip(".")
+
+        artist_folder = music_dir / clean_name(artist_name)
+        if artist_folder.exists() and artist_folder.is_dir():
+            try:
+                shutil.rmtree(str(artist_folder))
+                _tracks_index_cache["ts"] = 0.0
+            except Exception:
+                pass
+
+
+@app.delete("/api/artists/{spotify_id}")
+async def api_delete_artist(spotify_id: str, delete_files: bool = False):
+    spotify_id = _decode_artist_id(spotify_id)
     with db() as conn:
         row = conn.execute("SELECT name FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
-        if row:
-            artist_name = row["name"]
-            # Soft-delete artist from database so they are ignored in future playlist syncs
-            conn.execute("UPDATE artists SET active=-1 WHERE spotify_id=?", (spotify_id,))
-            # Delete their albums and songs to clean up the DB
-            conn.execute("DELETE FROM albums WHERE artist_id=?", (spotify_id,))
-            conn.execute("DELETE FROM songs WHERE artist_id=?", (spotify_id,))
-            
-            if delete_files:
-                # Physically delete the artist folder from storage
-                cfg = load_cfg()
-                music_dir = Path(cfg["music_dir"])
-                
-                # Sanitize name helper matching music_sync.py
-                def clean_name(name: str) -> str:
-                    return re.sub(r'[\\/*?:"<>|]', "", str(name)).strip().strip(".")
-                    
-                artist_folder = music_dir / clean_name(artist_name)
-                if artist_folder.exists() and artist_folder.is_dir():
-                    try:
-                        shutil.rmtree(str(artist_folder))
-                    except Exception:
-                        pass
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        artist_name = row["name"]
+        conn.execute("UPDATE artists SET active=-1 WHERE spotify_id=?", (spotify_id,))
+    asyncio.create_task(
+        asyncio.to_thread(_purge_artist_data, spotify_id, artist_name, delete_files)
+    )
     return {"ok": True}
 
 
@@ -1455,37 +1478,75 @@ HTML = r"""<!doctype html>
     margin-left: 8px;
   }
   .db-summary {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px 16px;
-    font-size: 12px;
+    font-size: 11px;
     color: var(--muted);
-    margin-bottom: 14px;
-    padding: 10px 12px;
-    background: rgba(255, 255, 255, 0.02);
-    border: 1px solid var(--border-card);
-    border-radius: 10px;
+    margin-bottom: 12px;
+    letter-spacing: 0.02em;
   }
   .db-summary b { color: var(--txt); font-weight: 600; }
-  .bulk-bar {
+  .sel-bar {
     display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
     align-items: center;
-    margin-bottom: 12px;
-    padding: 10px 12px;
-    background: rgba(0, 87, 183, 0.08);
-    border: 1px solid rgba(0, 87, 183, 0.35);
-    border-radius: 10px;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-card);
   }
-  .bulk-bar .bulk-count {
-    font-size: 12px;
-    font-weight: 600;
-    margin-right: 8px;
+  .sel-bar.hide { display: none; }
+  .sel-count {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--muted);
+    margin-right: 4px;
+    min-width: 14px;
+  }
+  .sel-btn {
+    border: 1px solid var(--border-card);
+    background: transparent;
+    color: var(--txt);
+    padding: 4px 9px;
+    border-radius: 6px;
+    font: 600 11px 'Inter', sans-serif;
+    cursor: pointer;
+    line-height: 1.2;
+  }
+  .sel-btn:hover { background: rgba(255, 255, 255, 0.06); }
+  .sel-btn.ro { border-color: #0057b7; color: #9ec5ff; }
+  .sel-btn.ghost { color: var(--muted); border-color: transparent; }
+  .sel-limit {
+    padding: 4px 6px;
+    min-width: 52px;
+    width: auto;
+    font-size: 11px;
+  }
+  .btn-select-mode.active {
+    border-color: #9ec5ff;
     color: #9ec5ff;
+    background: rgba(0, 87, 183, 0.12);
   }
-  .chk-col { width: 32px; text-align: center; }
-  input.art-chk { width: auto; min-width: 0; padding: 0; margin: 0; cursor: pointer; }
+  .chk-col { width: 26px; text-align: center; padding-left: 8px !important; }
+  input.row-chk {
+    width: 14px;
+    height: 14px;
+    min-width: 0;
+    padding: 0;
+    margin: 0;
+    accent-color: #7eb8ff;
+    cursor: pointer;
+  }
+  tr.row-picked td { background: rgba(0, 87, 183, 0.05); }
+  .row .toolbar-select {
+    padding: 6px 12px;
+    font-size: 12px;
+    border-radius: 8px;
+    min-width: 130px;
+    width: auto;
+    line-height: 1.25;
+    box-sizing: border-box;
+  }
   .hint {
     color: var(--muted);
     font-size: 11px;
@@ -1670,26 +1731,6 @@ HTML = r"""<!doctype html>
     </div>
     <div class="card" style="margin-top:16px">
       <div id="dbSummary" class="db-summary muted">Loading database stats…</div>
-      <div id="artistBulkBar" class="bulk-bar hide">
-        <span class="bulk-count" id="bulkCount">0 selected</span>
-        <button type="button" class="btn ghost sm" onclick="bulkArtists('enable')">Enable</button>
-        <button type="button" class="btn ghost sm" onclick="bulkArtists('disable')">Disable</button>
-        <button type="button" class="btn-ro sm" onclick="bulkArtists('ro_on')">RO on</button>
-        <button type="button" class="btn ghost sm" onclick="bulkArtists('ro_off')">RO off</button>
-        <select id="bulkLimit" class="sm" style="width:90px;padding:4px 6px;font-size:12px">
-          <option value="">Limit…</option>
-          <option value="global">Global</option>
-          <option value="10">Max 10</option>
-          <option value="50">Max 50</option>
-          <option value="100">Max 100</option>
-          <option value="150">Max 150</option>
-          <option value="0">Unlimited</option>
-        </select>
-        <button type="button" class="btn ghost sm" onclick="bulkArtists('limit')">Apply limit</button>
-        <button type="button" class="btn ghost sm" onclick="bulkArtists('enable',true)" title="All artists matching search + filter">Filter → Enable</button>
-        <button type="button" class="btn ghost sm" onclick="bulkArtists('disable',true)">Filter → Disable</button>
-        <button type="button" class="btn ghost sm" onclick="clearArtistSelection()">Clear</button>
-      </div>
       <div class="row" style="margin-bottom:14px">
         <input id="artistSearch" placeholder="Search..." oninput="debouncedLoadArtists()"/>
         <div class="filter-chips" id="artistFilterChips" role="group" aria-label="Filter artists">
@@ -1701,17 +1742,36 @@ HTML = r"""<!doctype html>
           <button type="button" class="chip" data-value="synced">Synced</button>
           <button type="button" class="chip" data-value="disabled">Disabled</button>
         </div>
-        <select id="artistSort" onchange="loadArtists()" title="Sort artists" style="min-width:130px">
-          <option value="name">Name A–Z</option>
-          <option value="songs_desc">Songs ↓ most first</option>
-          <option value="songs_asc">Songs ↑ fewest first</option>
+        <select id="artistSort" class="toolbar-select" onchange="loadArtists()" title="Sort">
+          <option value="name">A–Z</option>
+          <option value="songs_desc">Songs ↓</option>
+          <option value="songs_asc">Songs ↑</option>
         </select>
-        <button class="btn ghost sm" onclick="loadArtists()">Refresh</button>
-        <button type="button" class="btn-ro" onclick="action('mark-romanian')" title="Auto-detect Romanian artists (list + MusicBrainz). Manual RO flags are kept.">RO</button>
+        <button type="button" id="btnSelectMode" class="btn ghost sm btn-select-mode" onclick="toggleSelectMode()" title="Multi-select">Select</button>
+        <button class="btn ghost sm" onclick="loadArtists()">↻</button>
+        <button type="button" class="btn-ro" onclick="action('mark-romanian')" title="Detect Romanian">RO</button>
+      </div>
+      <div id="selectionBar" class="sel-bar hide">
+        <span id="selCount" class="sel-count">0</span>
+        <button type="button" class="sel-btn" onclick="bulkSel('enable')">On</button>
+        <button type="button" class="sel-btn" onclick="bulkSel('disable')">Off</button>
+        <button type="button" class="sel-btn ro" onclick="bulkSel('ro_on')">RO+</button>
+        <button type="button" class="sel-btn" onclick="bulkSel('ro_off')">RO−</button>
+        <select id="bulkLimit" class="toolbar-select sel-limit" title="Limit">
+          <option value="">—</option>
+          <option value="10">10</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="150">150</option>
+          <option value="0">∞</option>
+        </select>
+        <button type="button" class="sel-btn" onclick="bulkSel('limit')">Lim</button>
+        <button type="button" class="sel-btn ghost" onclick="pickPage()">Page</button>
+        <button type="button" class="sel-btn ghost" onclick="clearSel()" title="Clear">✕</button>
       </div>
       <div style="overflow-x:auto;">
       <table class="table"><thead><tr>
-        <th class="chk-col"><input type="checkbox" class="art-chk" id="artSelectPage" title="Select this page" onchange="toggleSelectPage(this.checked)"/></th>
+        <th class="chk-col sel-col hide"><input type="checkbox" class="row-chk" id="artPickPage" title="Page" onchange="pickPage(this.checked)"/></th>
         <th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody id="artistRows"></tbody></table>
       </div>
@@ -1845,14 +1905,18 @@ let artistsLoadGen=0, libLoadGen=0, tracksLoadGen=0;
 let artistTotal=0, libTotal=0, trackTotal=0;
 let trackPage=0;
 let curPl=[];
+let selectMode=false;
 let selectedArtists=new Set();
+function artistUrl(id,action){return `/api/artists/${encodeURIComponent(id)}/${action}`;}
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
 function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
 function skeletonRows(cols,n=10){return Array.from({length:n},()=>'<tr class="skeleton-row">'+Array.from({length:cols},()=>'<td><span class="skel"></span></td>').join('')+'</tr>').join('');}
 async function api(path,opts={},signal){
   const r=await fetch(path,{...opts,signal});
-  if(!r.ok)throw new Error('HTTP '+r.status);
-  return r.json();
+  let data={};
+  try{data=await r.json();}catch(_){}
+  if(!r.ok)throw new Error(data.error||data.detail||('HTTP '+r.status));
+  return data;
 }
 function esc(s){return (s==null?'':s).toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function artistById(id){return curArt.find(a=>a.spotify_id===id);}
@@ -2023,67 +2087,60 @@ function artistsBaseUrl(){
 async function loadDbSummary(){
   try{
     const s=await api('/api/db/summary');
-    $('#dbSummary').innerHTML=[
-      ['Artists',`<b>${s.artists_active}</b> active · <b>${s.artists_disabled}</b> off · <b>${s.artists_pending_sync}</b> pending sync`],
-      ['RO',`<b>${s.artists_romanian}</b> Romanian`],
-      ['Albums',`<b>${s.albums_incomplete}</b> incomplete / <b>${s.albums_total}</b> total`],
-      ['Songs',`<b>${s.songs_pending}</b> pending · <b>${s.songs_failed}</b> failed / <b>${s.songs_total}</b> total`],
-    ].map(([k,v])=>`<span>${k}: ${v}</span>`).join('');
-  }catch(e){$('#dbSummary').textContent='Stats unavailable';}
+    $('#dbSummary').innerHTML=`<b>${s.artists_active}</b> on · <b>${s.artists_pending_sync}</b> pending · <b>${s.artists_romanian}</b> ro · <b>${s.albums_incomplete}</b> albums left`;
+  }catch(e){$('#dbSummary').textContent='';}
 }
-function updateBulkBar(){
+function syncSelBar(){
   const n=selectedArtists.size;
-  $('#bulkCount').textContent=n?`${n} selected`:'0 selected';
-  $('#artistBulkBar').classList.toggle('hide',n===0);
+  $('#selCount').textContent=n||'';
+  $('#selectionBar').classList.toggle('hide',!selectMode&&!n);
+  document.querySelectorAll('.sel-col').forEach(el=>el.classList.toggle('hide',!selectMode));
 }
-function toggleArtistSelect(id,on){
+function toggleSelectMode(){
+  selectMode=!selectMode;
+  $('#btnSelectMode').classList.toggle('active',selectMode);
+  if(!selectMode){selectedArtists.clear();const p=$('#artPickPage');if(p)p.checked=false;}
+  syncSelBar();renderArtists();
+}
+function togglePick(id,on){
   if(on)selectedArtists.add(id);else selectedArtists.delete(id);
-  updateBulkBar();
+  syncSelBar();renderArtists();
 }
-function toggleSelectPage(on){
+function pickPage(forceOn){
   const start=artPage*100,end=start+100;
-  curArt.slice(start,end).forEach(a=>{
+  const page=curArt.slice(start,end);
+  const allPicked=page.length>0&&page.every(a=>selectedArtists.has(a.spotify_id));
+  const on=typeof forceOn==='boolean'?forceOn:!allPicked;
+  page.forEach(a=>{
     if(on)selectedArtists.add(a.spotify_id);else selectedArtists.delete(a.spotify_id);
   });
-  renderArtists();updateBulkBar();
+  const p=$('#artPickPage');if(p)p.checked=on;
+  renderArtists();
 }
-function clearArtistSelection(){
+function clearSel(){
   selectedArtists.clear();
-  const cb=$('#artSelectPage');if(cb)cb.checked=false;
-  updateBulkBar();renderArtists();
+  const p=$('#artPickPage');if(p)p.checked=false;
+  syncSelBar();renderArtists();
 }
-async function bulkArtists(action,useFilter=false){
-  let body={action};
+async function bulkSel(action){
+  if(!selectedArtists.size){toast('Pick artists');return;}
+  const body={action,ids:[...selectedArtists]};
   if(action==='limit'){
     const v=$('#bulkLimit').value;
-    if(!v){toast('Pick a limit first');return;}
-    body.limit=v==='global'?null:parseInt(v,10);
-  }
-  if(useFilter){
-    const label=artistFilter==='all'?'all artists':`filter “${artistFilter}”`;
-    const q=$('#artistSearch').value.trim();
-    const extra=q?` matching “${q}”`:'';
-    if(!confirm(`Apply “${action}” to ${label}${extra}?`))return;
-    body.q=q;body.status=artistFilter;body.ids=[];
-  }else{
-    body.ids=[...selectedArtists];
-    if(!body.ids.length){toast('Select artists first (checkboxes)');return;}
-    if(!confirm(`Apply “${action}” to ${body.ids.length} selected artist(s)?`))return;
+    if(v===''){toast('Limit?');return;}
+    body.limit=parseInt(v,10);
   }
   try{
     const r=await api('/api/artists/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    toast(`Updated ${r.updated} artist(s)`);
-    clearArtistSelection();
-    loadDbSummary();
-    loadArtists();
-  }catch(e){toast('Bulk update failed');}
+    toast(String(r.updated));
+    clearSel();loadDbSummary();loadArtists();
+  }catch(e){toast(e.message||'Failed');}
 }
 async function loadArtists(){
   const gen=++artistsLoadGen;
   artPage=0;
   curArt=[];
   artistTotal=0;
-  const cb=$('#artSelectPage');if(cb)cb.checked=false;
   $('#artistRows').innerHTML=skeletonRows(5);
   $('#artPageInfo').innerHTML='Loading<span class="loading-hint">…</span>';
   try{
@@ -2096,8 +2153,13 @@ async function loadArtists(){
       curArt=items;artistTotal=total;renderArtists();
     },curArt,curArt.length);
   }catch(e){
-    if(gen===artistsLoadGen)$('#artistRows').innerHTML='<tr><td colspan=6 class="muted">Load failed.</td></tr>';
+    if(gen===artistsLoadGen)$('#artistRows').innerHTML=`<tr><td colspan="${selectMode?6:5}" class="muted">Load failed.</td></tr>`;
   }
+}
+function artistLimitSelected(r,val){
+  const m=r.max_downloads;
+  if(val==='')return m==null||m===undefined;
+  return Number(m)===Number(val);
 }
 function renderArtists(){
   const start=artPage*100, end=start+100;
@@ -2112,24 +2174,26 @@ function renderArtists(){
     const roCls = r.is_romanian ? 'on' : '';
     const roTitle = r.is_romanian ? 'Clear Romanian flag' : 'Mark as Romanian';
     const rowCls = r.is_romanian ? 'row-ro' : '';
-    const sel=selectedArtists.has(r.spotify_id)?'checked':'';
-    return `<tr class="${rowCls}" data-aid="${r.spotify_id}"><td class="chk-col"><input type="checkbox" class="art-chk" ${sel} onchange="toggleArtistSelect('${r.spotify_id}',this.checked)"/></td><td><button type="button" class="ro-toggle ${roCls}" title="${roTitle}" onclick="setRomanian('${r.spotify_id}', ${r.is_romanian?0:1})">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
+    const id=JSON.stringify(r.spotify_id);
+    const picked=selectedArtists.has(r.spotify_id);
+    const chk=selectMode?`<td class="chk-col sel-col"><input type="checkbox" class="row-chk" ${picked?'checked':''} onchange="togglePick(${id},this.checked)"/></td>`:'';
+    return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td><button type="button" class="ro-toggle ${roCls}" title="${roTitle}" onclick="setRomanian(${id}, ${r.is_romanian?0:1})">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
       <td>
         <div style="display:flex; gap:6px; align-items:center;">
-          <select class="sm" style="width:85px; padding: 2px 4px; border: 1px solid var(--border-card); background: #111; color: var(--txt); border-radius: 4px;" onchange="setArtistLimit('${r.spotify_id}', this.value)" title="Max Downloads">
-            <option value="" ${r.max_downloads==null?'selected':''}>Global</option>
-            <option value="10" ${r.max_downloads===10?'selected':''}>10</option>
-            <option value="50" ${r.max_downloads===50?'selected':''}>50</option>
-            <option value="100" ${r.max_downloads===100?'selected':''}>100</option>
-            <option value="150" ${r.max_downloads===150?'selected':''}>150</option>
-            <option value="0" ${r.max_downloads===0?'selected':''}>Unlimit</option>
+          <select class="toolbar-select" style="width:85px; min-width:85px;" onchange="setArtistLimit(${id}, this.value)" title="Max Downloads">
+            <option value="" ${artistLimitSelected(r,'')?'selected':''}>Global</option>
+            <option value="10" ${artistLimitSelected(r,10)?'selected':''}>10</option>
+            <option value="50" ${artistLimitSelected(r,50)?'selected':''}>50</option>
+            <option value="100" ${artistLimitSelected(r,100)?'selected':''}>100</option>
+            <option value="150" ${artistLimitSelected(r,150)?'selected':''}>150</option>
+            <option value="0" ${artistLimitSelected(r,0)?'selected':''}>Unlimit</option>
           </select>
-          <button class="btn ghost sm" onclick="toggleArtist('${r.spotify_id}')">${r.active?'Off':'On'}</button>
-          <button class="btn danger sm" onclick="delArtist('${r.spotify_id}')">×</button>
+          <button class="btn ghost sm" onclick="toggleArtist(${id})">${r.active?'Off':'On'}</button>
+          <button class="btn danger sm" title="Remove from database (fast). Shift+click: also delete files on disk." onclick="delArtist(${id}, event)">×</button>
         </div>
       </td></tr>`;
-  }).join('')||'<tr><td colspan=6 class="muted">No artists yet.</td></tr>';
-  updateBulkBar();
+  }).join('')||`<tr><td colspan="${selectMode?6:5}" class="muted">No artists yet.</td></tr>`;
+  syncSelBar();
 }
 async function addArtist(){
   const v=$('#artistEntry').value.trim();if(!v)return;
@@ -2142,10 +2206,10 @@ async function toggleArtist(id){
   a.active=prev?0:1;
   renderArtists();flashArtistRow(id);
   try{
-    const r=await api(`/api/artists/${id}/toggle`,{method:'POST'});
+    const r=await api(artistUrl(id,'toggle'),{method:'POST'});
     a.active=r.active?1:0;
     renderArtists();
-  }catch(e){a.active=prev;renderArtists();toast('Update failed');}
+  }catch(e){a.active=prev;renderArtists();toast(e.message||'Update failed');}
 }
 async function setRomanian(id, val){
   const a=artistById(id);if(!a)return;
@@ -2153,14 +2217,14 @@ async function setRomanian(id, val){
   a.is_romanian=val?1:0;
   renderArtists();flashArtistRow(id);
   try{
-    const r=await api(`/api/artists/${id}/ro`,{
+    const r=await api(artistUrl(id,'ro'),{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({is_romanian:!!val}),
     });
     a.is_romanian=r.is_romanian?1:0;
     renderArtists();
-  }catch(e){a.is_romanian=prev?1:0;renderArtists();toast('Update failed');}
+  }catch(e){a.is_romanian=prev?1:0;renderArtists();toast(e.message||'Update failed');}
 }
 async function setArtistLimit(id, limit){
   const a=artistById(id);if(!a)return;
@@ -2168,14 +2232,39 @@ async function setArtistLimit(id, limit){
   a.max_downloads=limit===''?null:parseInt(limit,10);
   renderArtists();flashArtistRow(id);
   try{
-    await api(`/api/artists/${id}/limit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:limit})});
-  }catch(e){a.max_downloads=prev;renderArtists();toast('Update failed');}
+    const r=await api(artistUrl(id,'limit'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:limit})});
+    if(r.error)throw new Error(r.error);
+    a.max_downloads=r.max_downloads;
+    renderArtists();
+  }catch(e){a.max_downloads=prev;renderArtists();toast(e.message||'Update failed');}
 }
-async function delArtist(id){
-  if(!confirm('Remove artist from database?'))return;
-  const delFiles=confirm('Do you also want to physically delete all downloaded files/folders for this artist from storage?');
-  await api(`/api/artists/${id}?delete_files=${delFiles}`,{method:'DELETE'});
-  loadArtists();
+async function delArtist(id,ev){
+  const a=artistById(id);
+  if(!a)return;
+  const delFiles=!!(ev&&ev.shiftKey);
+  const msg=delFiles
+    ?`Remove “${a.name}” and delete their music folder on disk?`
+    :`Remove “${a.name}” from the database? (albums/songs cleaned up in background)`;
+  if(!confirm(msg))return;
+  const idx=curArt.findIndex(x=>x.spotify_id===id);
+  const backup=idx>=0?curArt[idx]:null;
+  if(idx>=0){
+    curArt.splice(idx,1);
+    artistTotal=Math.max(0,artistTotal-1);
+    renderArtists();
+  }
+  try{
+    await api(`/api/artists/${encodeURIComponent(id)}?delete_files=${delFiles}`,{method:'DELETE'});
+    toast(delFiles?'Removed (+ files deleting)':'Removed');
+    loadDbSummary();
+  }catch(e){
+    if(backup&&idx>=0){
+      curArt.splice(idx,0,backup);
+      artistTotal++;
+      renderArtists();
+    }
+    toast('Remove failed');
+  }
 }
 function renderPlaylists(){
   $('#playlistRows').innerHTML=curPl.map(r=>{
