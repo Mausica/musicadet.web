@@ -181,6 +181,14 @@ def _run_ensure_db_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
     if "romanian_manual" not in cols:
         conn.execute("ALTER TABLE artists ADD COLUMN romanian_manual INTEGER DEFAULT 0")
+    if "ytmusic_name" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN ytmusic_name TEXT")
+    if "ytmusic_browse_id" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN ytmusic_browse_id TEXT")
+    if "ytmusic_status" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN ytmusic_status TEXT DEFAULT 'unknown'")
+    if "ytmusic_notes" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN ytmusic_notes TEXT")
     conn.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
@@ -526,7 +534,7 @@ def api_artists(
     """
     sql = f"""
         SELECT a.spotify_id, a.name, a.source, a.active, a.sync_done, a.last_synced, a.added_at,
-               a.albums_scanned_at, a.max_downloads, a.is_romanian,
+               a.albums_scanned_at, a.max_downloads, a.is_romanian, a.ytmusic_status, a.ytmusic_name, a.ytmusic_notes,
                COALESCE(ac.album_count, 0) AS album_count,
                COALESCE(sc.songs_dl, 0) AS songs_dl,
                COALESCE(sc.songs_total, 0) AS songs_total
@@ -764,6 +772,89 @@ async def api_set_romanian(spotify_id: str, request: Request):
             (new, spotify_id),
         )
     return {"ok": True, "is_romanian": new}
+
+
+@app.post("/api/artists/{spotify_id:path}/ytmusic")
+async def api_mark_artist_ytmusic(spotify_id: str, request: Request):
+    """Mark artist as found, not found, or manually mapped on YouTube Music."""
+    _db_ready()
+    spotify_id = _decode_artist_id(spotify_id)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    status = body.get("status")  # 'found', 'not_found', 'manually_mapped'
+    ytmusic_name = body.get("ytmusic_name")  # New name if manually mapped
+    notes = body.get("notes", "")
+    
+    if status not in ("found", "not_found", "manually_mapped"):
+        return JSONResponse({"error": "invalid status"}, status_code=400)
+    
+    with db_tx() as conn:
+        _ensure_artist_schema(conn)
+        row = conn.execute("SELECT name FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        
+        updates = {"ytmusic_status": status}
+        if ytmusic_name:
+            updates["ytmusic_name"] = ytmusic_name
+        if notes:
+            updates["ytmusic_notes"] = notes
+        
+        update_sql = "UPDATE artists SET " + ", ".join(f"{k}=?" for k in updates.keys()) + " WHERE spotify_id=?"
+        conn.execute(update_sql, list(updates.values()) + [spotify_id])
+    
+    return {"ok": True, "status": status, "ytmusic_name": ytmusic_name or row["name"]}
+
+
+@app.post("/api/artists/{spotify_id:path}/edit")
+async def api_edit_artist(spotify_id: str, request: Request):
+    """Edit artist name/metadata (for manual corrections and marking as manually added)."""
+    _db_ready()
+    spotify_id = _decode_artist_id(spotify_id)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    new_name = body.get("name")
+    is_manually_mapped = body.get("manually_mapped", False)
+    
+    if not new_name or not new_name.strip():
+        return JSONResponse({"error": "name required"}, status_code=400)
+    
+    new_name = new_name.strip()
+    
+    with db_tx() as conn:
+        _ensure_artist_schema(conn)
+        row = conn.execute("SELECT name, ytmusic_name FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        
+        updates = {}
+        
+        # If the new name differs from current, update the name
+        if new_name != row["name"]:
+            updates["name"] = new_name
+        
+        # Mark as manually mapped on YT Music if requested
+        if is_manually_mapped:
+            updates["ytmusic_status"] = "manually_mapped"
+            updates["ytmusic_name"] = new_name
+            updates["ytmusic_notes"] = "Manually corrected by user"
+        
+        if updates:
+            update_sql = "UPDATE artists SET " + ", ".join(f"{k}=?" for k in updates.keys()) + " WHERE spotify_id=?"
+            conn.execute(update_sql, list(updates.values()) + [spotify_id])
+    
+    return {
+        "ok": True, 
+        "name": new_name,
+        "ytmusic_status": "manually_mapped" if is_manually_mapped else None,
+        "message": f"Artist updated {'and marked as manually mapped' if is_manually_mapped else ''}"
+    }
 
 
 def _purge_artist_data(spotify_id: str, artist_name: str, delete_files: bool) -> None:

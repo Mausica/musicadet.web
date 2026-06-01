@@ -147,6 +147,17 @@ def _migrate_columns(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE artists ADD COLUMN is_romanian INTEGER DEFAULT 0")
     if "romanian_manual" not in artist_cols:
         db.execute("ALTER TABLE artists ADD COLUMN romanian_manual INTEGER DEFAULT 0")
+    if "ytmusic_name" not in artist_cols:
+        db.execute("ALTER TABLE artists ADD COLUMN ytmusic_name TEXT")
+    if "ytmusic_browse_id" not in artist_cols:
+        db.execute("ALTER TABLE artists ADD COLUMN ytmusic_browse_id TEXT")
+    if "ytmusic_searched_at" not in artist_cols:
+        db.execute("ALTER TABLE artists ADD COLUMN ytmusic_searched_at TEXT")
+    if "ytmusic_status" not in artist_cols:
+        db.execute("ALTER TABLE artists ADD COLUMN ytmusic_status TEXT DEFAULT 'unknown'")
+        # Status values: 'found', 'not_found', 'manually_mapped', 'duplicate', 'unknown'
+    if "ytmusic_notes" not in artist_cols:
+        db.execute("ALTER TABLE artists ADD COLUMN ytmusic_notes TEXT")
 
     song_cols = {r[1] for r in db.execute("PRAGMA table_info(songs)")}
     if "youtube_url" not in song_cols:
@@ -1301,9 +1312,36 @@ def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
     
     log.info("  → Scanning %s using %s...", name, scanner_type.upper())
     
+    matched_name = None
+    browse_id = None
+    
     if scanner_type == "ytmusic":
         import ytm_scanner
-        songs = ytm_scanner.scan_artist(name)
+        
+        # Check if we have cached YouTube Music artist data
+        cached_ytmusic_name = artist_row.get("ytmusic_name")
+        cached_ytmusic_browse_id = artist_row.get("ytmusic_browse_id")
+        
+        if cached_ytmusic_browse_id:
+            log.info("  → Using cached YT Music ID for %s", name)
+        
+        # Get songs and save the matched name + browse_id
+        songs, matched_name, browse_id = ytm_scanner.scan_artist_with_metadata(
+            name,
+            cached_browse_id=cached_ytmusic_browse_id
+        )
+        
+        # If we got new metadata (from search), cache it
+        if matched_name and browse_id and (not cached_ytmusic_name or not cached_ytmusic_browse_id):
+            log.info("  → Caching YT Music mapping: '%s' → '%s' (ID: %s)", name, matched_name, browse_id)
+            with db_connect() as db:
+                db.execute(
+                    "UPDATE artists SET ytmusic_name=?, ytmusic_browse_id=?, ytmusic_searched_at=datetime('now'), ytmusic_status='found' WHERE spotify_id=?",
+                    (matched_name, browse_id, sid),
+                )
+            # If the matched name differs from search name, log it prominently
+            if matched_name.lower().replace(" ", "").replace("-", "") != name.lower().replace(" ", "").replace("-", ""):
+                log.warning("  ⚠️  Auto-detected name: '%s' → '%s' on YT Music", name, matched_name)
     else:
         target = _artist_target(sid, name)
         timeout = int(CFG.get("artist_save_timeout", 900))
@@ -1311,6 +1349,13 @@ def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
     
     if not songs:
         log.warning("  → No songs returned for %s", name)
+        # Mark as not found on YT Music if using ytmusic scanner
+        if scanner_type == "ytmusic":
+            with db_connect() as db:
+                db.execute(
+                    "UPDATE artists SET ytmusic_status='not_found', ytmusic_notes='Failed to find artist on YouTube Music' WHERE spotify_id=?",
+                    (sid,),
+                )
         return 0, 0
 
     with db_connect() as db:
@@ -1384,7 +1429,7 @@ def cmd_mark_romanian(args):
 def cmd_list(args):
     with db_connect() as db:
         rows = db.execute("""
-            SELECT name, spotify_id, source, active, sync_done, last_synced, albums_scanned_at
+            SELECT name, spotify_id, source, active, sync_done, last_synced, albums_scanned_at, ytmusic_status
             FROM artists ORDER BY name COLLATE NOCASE
         """).fetchall()
         pl_count = db.execute("SELECT COUNT(*) FROM playlists WHERE active=1").fetchone()[0]
@@ -1395,17 +1440,88 @@ def cmd_list(args):
     total = len(rows)
     synced = sum(1 for r in rows if r["sync_done"])
     disabled = sum(1 for r in rows if not r["active"])
+    manually_mapped = sum(1 for r in rows if r.get("ytmusic_status") == "manually_mapped")
 
-    print(f"\n{'Artist':<42} {'Source':<26} {'Sync':>4}  Last synced")
-    print("─" * 88)
+    print(f"\n{'Artist':<42} {'Source':<15} {'YTM Status':<18} {'Sync':>4}  Last synced")
+    print("─" * 105)
     for r in rows:
         done = "✓" if r["sync_done"] else "·"
         last = (r["last_synced"] or "never")[:10]
         flag = " [off]" if not r["active"] else ""
-        print(f"{r['name']:<42} {r['source']:<26} {done:>4}  {last}{flag}")
+        status = r.get("ytmusic_status") or "—"
+        status_icon = "🔧" if status == "manually_mapped" else ("⚠️" if status == "not_found" else " ")
+        print(f"{status_icon} {r['name']:<40} {r['source']:<15} {status:<18} {done:>4}  {last}{flag}")
 
-    print(f"\n{total} artists ({synced} synced, {total - synced - disabled} pending, {disabled} disabled)")
+    print(f"\n{total} artists ({synced} synced, {total - synced - disabled} pending, {disabled} disabled, {manually_mapped} manually mapped)")
     print(f"{pl_count} playlists | {album_count} albums | {song_dl}/{song_total} songs downloaded")
+
+
+def cmd_artists_issues(args):
+    """List and manage artists with YouTube Music lookup issues."""
+    # Handle --fix flag
+    if getattr(args, "fix", None):
+        parts = args.fix.split(":", 1)
+        if len(parts) != 2:
+            log.error("--fix format: artist_id:new_ytmusic_name")
+            return
+        artist_id, new_name = parts
+        new_name = new_name.strip()
+        with db_connect() as db:
+            artist = db.execute("SELECT name FROM artists WHERE spotify_id=?", (artist_id,)).fetchone()
+            if not artist:
+                log.error("Artist not found: %s", artist_id)
+                return
+            db.execute(
+                "UPDATE artists SET ytmusic_name=?, ytmusic_status='manually_mapped', ytmusic_notes='Manually mapped by user', sync_done=1, last_synced=datetime('now') WHERE spotify_id=?",
+                (new_name, artist_id),
+            )
+        log.info("✓ Marked '%s' as manually mapped to '%s' (skips downloads, marked as synced)", artist["name"], new_name)
+        return
+    
+    # Handle --remove flag
+    if getattr(args, "remove", None):
+        artist_id = args.remove
+        with db_connect() as db:
+            artist = db.execute("SELECT name FROM artists WHERE spotify_id=?", (artist_id,)).fetchone()
+            if not artist:
+                log.error("Artist not found: %s", artist_id)
+                return
+            db.execute("UPDATE artists SET active=-1 WHERE spotify_id=?", (artist_id,))
+        log.info("✓ Removed artist: %s", artist["name"])
+        return
+    
+    # List artists with issues
+    with db_connect() as db:
+        issues = db.execute("""
+            SELECT spotify_id, name, ytmusic_status, ytmusic_name, ytmusic_notes
+            FROM artists
+            WHERE active=1 AND (ytmusic_status IN ('not_found', 'unknown') OR ytmusic_status IS NULL)
+            ORDER BY name COLLATE NOCASE
+        """).fetchall()
+    
+    if not issues:
+        log.info("✓ No YouTube Music lookup issues found!")
+        return
+    
+    print(f"\n{'⚠️  YouTube Music Lookup Issues'}:")
+    print(f"{'─' * 120}")
+    print(f"{'Artist':<35} {'Spotify ID':<25} {'Status':<15} {'YT Music Name':<30}")
+    print("─" * 120)
+    
+    for issue in issues:
+        status = issue["ytmusic_status"] or "unknown"
+        ytm_name = issue["ytmusic_name"] or "—"
+        icon = "✗" if status == "not_found" else "?"
+        print(f"{icon} {issue['name']:<33} {issue['spotify_id']:<25} {status:<15} {ytm_name:<30}")
+        if issue["ytmusic_notes"]:
+            print(f"   → {issue['ytmusic_notes']}")
+    
+    print(f"\n{len(issues)} artist(s) with lookup issues")
+    print(f"\nUsage:")
+    print(f"  Mark with correct YT Music name (skips downloads):")
+    print(f"    musicadet artists-issues --fix SPOTIFY_ID:NewName")
+    print(f"\n  Remove artist entirely:")
+    print(f"    musicadet artists-issues --remove SPOTIFY_ID")
 
 
 def cmd_scan(args):
@@ -1499,11 +1615,34 @@ def _sync_artist_with_ytdlp(
         log.error("custom_dl module not available — cannot download")
         return False
 
+    # Check if we're rate-limited before starting
+    rate_wait = custom_dl.check_rate_limit()
+    if rate_wait is not None:
+        log.error("[%d/%d] %s — RATE-LIMITED. Wait %d seconds before retrying.", 
+                  index, total, name, rate_wait)
+        return False
+
     music_dir = Path(CFG["music_dir"])
     db_path = Path(CFG["db_path"])
     fmt = CFG.get("format", "opus")
 
     downloader = _make_ytdlp_downloader(music_dir, fmt)
+
+    # Check if artist is marked as manually_mapped (user-corrected) — skip download phase
+    with db_connect() as db:
+        artist_row = db.execute(
+            "SELECT ytmusic_status, ytmusic_name FROM artists WHERE spotify_id=?",
+            (sid,),
+        ).fetchone()
+    
+    if artist_row and artist_row.get("ytmusic_status") == "manually_mapped":
+        log.info("[%d/%d] %s — marked as manually mapped, skipping download phase", index, total, name)
+        with db_connect() as db:
+            db.execute(
+                "UPDATE artists SET sync_done=1, last_synced=datetime('now') WHERE spotify_id=?",
+                (sid,),
+            )
+        return True
 
     if allowed_song_ids is not None and len(allowed_song_ids) == 0:
         log.info("[%d/%d] %s — at download cap, skipping", index, total, name)
@@ -1544,6 +1683,13 @@ def _sync_artist_with_ytdlp(
 
     success = True
     for s in pending_rows:
+        # Check if rate-limited before each track
+        rate_wait = custom_dl.check_rate_limit()
+        if rate_wait is not None:
+            log.error("    ✗ YouTube rate-limited mid-download. Pausing. Wait %d seconds.", rate_wait)
+            success = False
+            break
+        
         track_num = s["track_number"]
         album_name = s["album_name"] or "Unknown Album"
         
@@ -1647,6 +1793,12 @@ def cmd_artists_sync(args):
     enforce_all_download_caps(quiet_if_none=True)
     ok = failed = 0
     for i, a in enumerate(artists, 1):
+        # Check if we're rate-limited before syncing this artist
+        rate_wait = custom_dl.check_rate_limit()
+        if rate_wait is not None:
+            log.error("RATE-LIMIT DETECTED. Pausing downloads. Wait %d seconds before retrying.", rate_wait)
+            break
+        
         sid, name = a["spotify_id"], a["name"]
         with db_connect() as db_conn:
             keep_ids, skip_album = _apply_artist_download_cap(
@@ -2742,6 +2894,10 @@ Examples:
 
     subparsers.add_parser("init-db", help="Create/migrate database schema only (no Romanian detection)")
     subparsers.add_parser("list", help="List all artists in the DB")
+    
+    ytm_issues = subparsers.add_parser("artists-issues", help="List/manage artists with YouTube Music lookup issues")
+    ytm_issues.add_argument("--fix", type=str, help="Mark artist with new YT Music name (use: artist_id:new_name)", metavar="ARTIST_ID:NEW_NAME")
+    ytm_issues.add_argument("--remove", type=str, help="Remove artist", metavar="ARTIST_ID")
 
     dis_ = subparsers.add_parser("disable", help="Disable an artist")
     dis_.add_argument("artist")
@@ -2777,6 +2933,7 @@ Examples:
         "import":            cmd_import,
         "init-db":           lambda _a: None,
         "list":              cmd_list,
+        "artists-issues":    cmd_artists_issues,
         "disable":           cmd_disable,
         "enable":            cmd_enable,
         "clean-ytm":         cmd_clean_ytm,

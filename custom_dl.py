@@ -45,6 +45,26 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Rate limiting
+# ─────────────────────────────────────────────────────────────────────────────
+
+import time
+RATE_LIMITED_UNTIL = 0.0  # Unix timestamp when rate limit expires (0 = not rate-limited)
+
+def is_rate_limited() -> bool:
+    """Check if we are currently rate-limited by YouTube."""
+    return time.time() < RATE_LIMITED_UNTIL
+
+def check_rate_limit() -> Optional[int]:
+    """
+    If rate-limited, return seconds remaining. Otherwise return None.
+    """
+    if is_rate_limited():
+        return int(RATE_LIMITED_UNTIL - time.time()) + 1
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Filename sanitation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -445,6 +465,12 @@ class YtDlpDownloader:
             log.error("yt-dlp not installed — cannot download")
             return None
 
+        # Check if we're rate-limited
+        rate_wait = check_rate_limit()
+        if rate_wait is not None:
+            log.error("    ✗ YouTube rate-limited. Wait %d seconds before retrying.", rate_wait)
+            return None
+
         # Build the output path
         resolved_album = detect_singles(album, title)
         artist_folder = self.music_dir / _clean_filename(artist)
@@ -486,8 +512,8 @@ class YtDlpDownloader:
             # Detect YouTube rate limiting
             err_msg = str(e).lower()
             if "rate-limited" in err_msg or "video unavailable" in err_msg:
-                import time
-                custom_dl.RATE_LIMITED_UNTIL = time.time() + 3600  # 1 hour
+                global RATE_LIMITED_UNTIL
+                RATE_LIMITED_UNTIL = time.time() + 3600  # 1 hour
                 log.error("    ✗ yt-dlp rate limit encountered, pausing downloads for 1 hour")
             else:
                 log.error("    ✗ yt-dlp error for %s: %s", title, e)
@@ -521,6 +547,12 @@ class YtDlpDownloader:
         Returns the number of successfully downloaded tracks.
         """
         if yt_dlp is None:
+            return 0
+
+        # Check if we're rate-limited
+        rate_wait = check_rate_limit()
+        if rate_wait is not None:
+            log.error("  ✗ YouTube rate-limited. Wait %d seconds before retrying.", rate_wait)
             return 0
 
         query = f"ytsearch1:{artist} {album} full album"

@@ -36,47 +36,113 @@ def _artist_matches(expected: str, actual: str) -> bool:
     return e == a or e in a or a in e
 
 
+def _try_alternative_searches(artist_name: str, ytm) -> Optional[tuple[str, str]]:
+    """
+    Try fuzzy/alternative search queries to find the artist.
+    Returns (browse_id, matched_name) or None if all fail.
+    """
+    alternatives = [
+        artist_name,  # Original
+        artist_name.replace(" - Topic", "").strip(),  # Remove Topic suffix
+        artist_name.replace(" Topic", "").strip(),
+        artist_name.replace(" -", "").strip(),  # Remove dashes
+        re.sub(r'\s+', ' ', artist_name).strip(),  # Normalize spaces
+    ]
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    alternatives = [x for x in alternatives if not (x in seen or seen.add(x))]
+    
+    for alt_name in alternatives:
+        if not alt_name:
+            continue
+        try:
+            results = ytm.search(alt_name, filter="artists", limit=5)
+            for r in results:
+                candidate_name = r.get("artist", r.get("name", ""))
+                if _artist_matches(artist_name, candidate_name):
+                    browse_id = r.get("browseId")
+                    if browse_id:
+                        return browse_id, candidate_name
+        except Exception:
+            continue
+    
+    return None
+
+
 def scan_artist(artist_name: str, ytmusic_instance=None) -> List[Dict]:
     """Fetch full catalog for *artist_name* from YouTube Music."""
+    songs, _, _ = scan_artist_with_metadata(artist_name, ytmusic_instance)
+    return songs
+
+
+def scan_artist_with_metadata(
+    artist_name: str,
+    ytmusic_instance=None,
+    cached_browse_id: Optional[str] = None,
+) -> tuple[List[Dict], Optional[str], Optional[str]]:
+    """
+    Fetch full catalog for *artist_name* from YouTube Music.
+    
+    Returns: (songs, matched_artist_name, browse_id)
+    - songs: list of track dicts
+    - matched_artist_name: the actual artist name from YT Music (e.g., "TwistaTv" if we searched "TWISTA")
+    - browse_id: the YouTube Music browse ID for this artist (for future cached lookups)
+    """
     if YTMusic is None:
         log.error("ytmusicapi not installed — pip install ytmusicapi")
-        return []
+        return [], None, None
 
     ytm = ytmusic_instance or YTMusic()
-    log.info("Searching YTMusic for artist: %s", artist_name)
+    
+    # If we have a cached browse_id, skip the search step
+    if cached_browse_id:
+        log.info("Using cached YT Music artist ID for: %s", artist_name)
+        browse_id = cached_browse_id
+        matched_name = artist_name
+    else:
+        log.info("Searching YTMusic for artist: %s", artist_name)
 
-    try:
-        results = ytm.search(artist_name, filter="artists", limit=3)
-    except Exception as e:
-        log.warning("YTMusic search failed for %s: %s", artist_name, e)
-        return []
+        try:
+            results = ytm.search(artist_name, filter="artists", limit=3)
+        except Exception as e:
+            log.warning("YTMusic search failed for %s: %s", artist_name, e)
+            return [], None, None
 
-    if not results:
-        log.warning("No YTMusic results for %s", artist_name)
-        return []
+        if not results:
+            log.warning("No YTMusic results for %s", artist_name)
+            return [], None, None
 
-    # Find best matching artist from results
-    browse_id = None
-    matched_name = None
-    for r in results:
-        candidate_name = r.get("artist", r.get("name", ""))
-        if _artist_matches(artist_name, candidate_name):
-            browse_id = r.get("browseId")
-            matched_name = candidate_name
-            break
+        # Find best matching artist from results
+        browse_id = None
+        matched_name = None
+        for r in results:
+            candidate_name = r.get("artist", r.get("name", ""))
+            if _artist_matches(artist_name, candidate_name):
+                browse_id = r.get("browseId")
+                matched_name = candidate_name
+                break
 
-    if not browse_id:
-        log.warning("No matching YTMusic artist for '%s' (got: %s)",
-                    artist_name, [r.get("artist", r.get("name")) for r in results[:3]])
-        return []
+        # If no match in primary results, try alternative searches
+        if not browse_id:
+            log.info("No exact match for '%s', trying alternative searches...", artist_name)
+            alt_result = _try_alternative_searches(artist_name, ytm)
+            if alt_result:
+                browse_id, matched_name = alt_result
+                log.info("Found via alternative search: %s → %s", artist_name, matched_name)
 
-    log.info("Fetching catalog for %s (ID: %s)", matched_name, browse_id)
+        if not browse_id:
+            log.warning("No matching YTMusic artist for '%s' (got: %s)",
+                        artist_name, [r.get("artist", r.get("name")) for r in results[:3]])
+            return [], None, None
+
+    log.info("Fetching catalog for %s (ID: %s)", matched_name or artist_name, browse_id)
 
     try:
         artist_data = ytm.get_artist(browse_id)
     except Exception as e:
         log.warning("Failed to get artist data for %s: %s", artist_name, e)
-        return []
+        return [], None, None
 
     songs: List[Dict] = []
     singles_tracks: List[Dict] = []  # Collect singles separately
@@ -165,7 +231,7 @@ def scan_artist(artist_name: str, ytmusic_instance=None) -> List[Dict]:
              len(songs),
              len({s["album_id"] for s in songs}),
              artist_name)
-    return songs
+    return songs, matched_name, browse_id
 
 
 def _strip_topic_suffix(name: str) -> str:
