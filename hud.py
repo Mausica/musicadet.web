@@ -1288,6 +1288,169 @@ HTML = r"""<!doctype html>
     text-transform: uppercase;
     letter-spacing: .06em;
   }
+  .stat-label {
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+  .stat-main {
+    font-size: 32px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+    color: var(--txt);
+  }
+  .stat-sub {
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 8px;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+  .artist-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .artist-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    padding: 12px 14px;
+  }
+  .artist-card.row-picked {
+    border-color: #525252;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .artist-card.row-ro {
+    border-left: 2px solid #525252;
+  }
+  .artist-card-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-weight: 600;
+    font-size: 15px;
+    line-height: 1.3;
+  }
+  .artist-card-meta {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 10px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+  .artist-card-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .artist-card-actions select {
+    width: 100%;
+    min-width: 0;
+  }
+  .artist-card-actions .btn-row {
+    display: flex;
+    gap: 8px;
+  }
+  .artist-card-actions .btn-row .btn {
+    flex: 1;
+    justify-content: center;
+  }
+  .lib-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .lib-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .lib-card-title {
+    font-weight: 600;
+    font-size: 14px;
+    line-height: 1.3;
+  }
+  .lib-card-artist {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .lib-card-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .lib-card-progress {
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .song-modal-content {
+    max-width: 520px;
+    max-height: min(85vh, 640px);
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    overflow: hidden;
+  }
+  .song-modal-content h2 {
+    margin: 0;
+    padding: 16px 48px 12px 16px;
+    font-size: 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .song-modal-list {
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 8px 0;
+    flex: 1;
+    min-height: 0;
+  }
+  .song-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .song-item:last-child { border-bottom: none; }
+  .song-num {
+    width: 24px;
+    flex-shrink: 0;
+    color: var(--muted);
+    font-size: 12px;
+    text-align: right;
+  }
+  .song-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .song-meta {
+    flex-shrink: 0;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    font-size: 11px;
+    color: var(--muted);
+  }
   .btn {
     border: 1px solid var(--primary);
     border-radius: var(--radius);
@@ -1566,7 +1729,8 @@ HTML = r"""<!doctype html>
     0% { background-position: 100% 0; }
     100% { background-position: -100% 0; }
   }
-  tr.row-flash td {
+  tr.row-flash td,
+  .artist-card.row-flash {
     animation: row-flash 0.45s ease;
   }
   @keyframes row-flash {
@@ -1787,6 +1951,25 @@ HTML = r"""<!doctype html>
       flex: none !important;
     }
     .pager .btn { min-height: 40px; min-width: 72px; }
+    .grid.stats {
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+    .stat-main { font-size: 26px; }
+    .stat-sub { font-size: 12px; }
+    .card.stat { padding: 14px 16px !important; }
+    .song-modal-content {
+      width: 100%;
+      max-width: none;
+      max-height: 92vh;
+      margin: 0;
+      border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+      align-self: flex-end;
+    }
+    #songModal.modal {
+      align-items: flex-end;
+      padding: 0;
+    }
   }
 </style>
 </head>
@@ -1844,8 +2027,9 @@ HTML = r"""<!doctype html>
         </select>
         <button type="button" class="btn ghost sm" onclick="loadLibrary()">Refresh</button>
       </div>
-      <div class="table-scroll">
-      <table class="table"><thead><tr><th>Artist</th><th>Album</th><th>Progress</th><th>Action</th></tr></thead>
+      <div id="libCards" class="lib-cards hide"></div>
+      <div class="table-scroll lib-table-wrap">
+      <table class="table lib-table"><thead><tr><th>Artist</th><th>Album</th><th>Progress</th><th>Action</th></tr></thead>
       <tbody id="libRows"></tbody></table>
       </div>
       <div class="pager">
@@ -1853,11 +2037,6 @@ HTML = r"""<!doctype html>
         <span id="libPageInfo" class="muted">Page 1</span>
         <button type="button" class="btn ghost sm" onclick="libNext()">Next →</button>
       </div>
-    </div>
-    <div class="card hide" id="songPanel" style="margin-top:16px">
-      <h2 id="songPanelTitle">Songs</h2>
-      <table><thead><tr><th>#</th><th>Title</th><th>Status</th><th>Cover</th><th>Lyrics</th></tr></thead>
-      <tbody id="songRows"></tbody></table>
     </div>
   </section>
 
@@ -1888,7 +2067,7 @@ HTML = r"""<!doctype html>
           <option value="songs_asc">Songs ↑</option>
         </select>
         <button type="button" id="btnSelectMode" class="btn ghost sm btn-select-mode" onclick="toggleSelectMode()" title="Multi-select">Select</button>
-        <button class="btn ghost sm" onclick="loadArtists()">↻</button>
+        <button type="button" class="btn ghost sm" onclick="loadArtists()">Refresh</button>
         <button type="button" class="btn-ro" onclick="action('mark-romanian')" title="Detect Romanian">RO</button>
       </div>
       <div id="selectionBar" class="sel-bar hide">
@@ -1909,8 +2088,9 @@ HTML = r"""<!doctype html>
         <button type="button" class="sel-btn ghost" onclick="pickPage()">Page</button>
         <button type="button" class="sel-btn ghost" onclick="clearSel()" title="Clear">✕</button>
       </div>
-      <div class="table-scroll">
-      <table class="table"><thead><tr>
+      <div id="artistCards" class="artist-cards hide"></div>
+      <div class="table-scroll artist-table-wrap">
+      <table class="table artists-table"><thead><tr>
         <th class="chk-col sel-col hide"><input type="checkbox" class="row-chk" id="artPickPage" title="Page" onchange="pickPage(this.checked)"/></th>
         <th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody id="artistRows"></tbody></table>
@@ -2014,6 +2194,14 @@ HTML = r"""<!doctype html>
   </section>
 </main>
 
+<div id="songModal" class="modal hide" onclick="if(event.target===this) closeSongModal()">
+  <div class="modal-content song-modal-content" onclick="event.stopPropagation()">
+    <button type="button" class="modal-close" onclick="closeSongModal()">×</button>
+    <h2 id="songModalTitle">Songs</h2>
+    <div class="song-modal-list" id="songModalList"></div>
+  </div>
+</div>
+
 <div id="trackModal" class="modal hide" onclick="if(event.target===this) this.classList.add('hide')">
   <div class="modal-content">
     <button class="modal-close" onclick="document.getElementById('trackModal').classList.add('hide')">×</button>
@@ -2062,6 +2250,18 @@ function toast(m,isErr){
 }
 function toastErr(m){toast(m,true);}
 function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
+const mobileMq=window.matchMedia('(max-width:640px)');
+function isMobile(){return mobileMq.matches;}
+function syncMobileLists(){
+  const m=isMobile();
+  $('#artistCards')?.classList.toggle('hide',!m);
+  document.querySelector('.artist-table-wrap')?.classList.toggle('hide',m);
+  $('#libCards')?.classList.toggle('hide',!m);
+  document.querySelector('.lib-table-wrap')?.classList.toggle('hide',m);
+}
+mobileMq.addEventListener('change',()=>{syncMobileLists();renderArtists();renderLibrary();});
+syncMobileLists();
+function closeSongModal(){$('#songModal')?.classList.add('hide');}
 function skeletonRows(cols,n=10){return Array.from({length:n},()=>'<tr class="skeleton-row">'+Array.from({length:cols},()=>'<td><span class="skel"></span></td>').join('')+'</tr>').join('');}
 async function api(path,opts={},signal){
   const r=await fetch(path,{...opts,signal});
@@ -2088,8 +2288,10 @@ async function api(path,opts={},signal){
 function esc(s){return (s==null?'':s).toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function artistById(id){return curArt.find(a=>a.spotify_id===id);}
 function flashArtistRow(id){
-  const tr=document.querySelector(`tr[data-aid="${CSS.escape(id)}"]`);
-  if(tr){tr.classList.remove('row-flash');void tr.offsetWidth;tr.classList.add('row-flash');}
+  const sel=`[data-aid="${CSS.escape(id)}"]`;
+  document.querySelectorAll(`tr${sel}, .artist-card${sel}`).forEach(el=>{
+    el.classList.remove('row-flash');void el.offsetWidth;el.classList.add('row-flash');
+  });
 }
 document.querySelectorAll('header nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('header nav button').forEach(x=>x.classList.remove('active'));
@@ -2113,12 +2315,10 @@ async function loadStats(){
     { title: 'Songs', main: total_songs, sub: `${s.songs_downloaded} / ${total_songs} downloaded` }
   ];
   $('#statCards').innerHTML=cards.map(c=>`
-    <div class="card stat" style="padding: 20px 24px;">
-      <div class="n" style="display:flex; align-items:baseline; gap:12px; margin-bottom: 8px;">
-        <span style="font-size: 1.1em;">${c.main}</span>
-        <span style="font-size:0.45em; color:var(--muted); font-weight:normal; letter-spacing: 0.5px;">${c.sub}</span>
-      </div>
-      <div class="l" style="font-weight: 600; letter-spacing: 1px; text-transform: uppercase; font-size: 0.75em; color: var(--txt); opacity: 0.9;">${c.title}</div>
+    <div class="card stat">
+      <div class="stat-label">${c.title}</div>
+      <div class="stat-main">${c.main}</div>
+      <div class="stat-sub">${c.sub}</div>
     </div>
   `).join('');
   const busy=!!s.running;
@@ -2180,7 +2380,8 @@ function libBaseUrl(){
 async function loadLibrary(reset=true){
   if(reset)libPage=0;
   const gen=++libLoadGen;
-  $('#libRows').innerHTML=skeletonRows(4);
+  if(isMobile())$('#libCards').innerHTML='<div class="muted" style="padding:12px">Loading…</div>';
+  else $('#libRows').innerHTML=skeletonRows(4);
   $('#libPageInfo').textContent='…';
   try{
     const off=libPage*LIB_PAGE;
@@ -2192,6 +2393,7 @@ async function loadLibrary(reset=true){
   }catch(e){
     if(gen===libLoadGen){
       $('#libRows').innerHTML='<tr><td colspan=4 class="muted">Load failed.</td></tr>';
+      $('#libCards').innerHTML='<div class="muted" style="padding:12px">Load failed.</div>';
       toastErr('Library: '+(e.message||e));
     }
   }
@@ -2201,27 +2403,41 @@ function libNext(){if((libPage+1)*LIB_PAGE<libTotal){libPage++;loadLibrary(false
 function renderLibrary(){
   const pages=Math.max(1,Math.ceil(libTotal/LIB_PAGE));
   $('#libPageInfo').textContent=`${libPage+1} / ${pages} · ${libTotal} albums`;
-  $('#libRows').innerHTML=curLib.map(r=>{
+  const empty='<tr><td colspan=4 class="muted">No albums yet — run Scan Albums.</td></tr>';
+  const emptyCards='<div class="muted" style="padding:12px">No albums yet — run Scan Albums.</div>';
+  const rows=curLib.map(r=>{
     const pct=r.track_count?Math.round(100*r.downloaded_count/r.track_count):0;
-    const bar=`<div style="height:4px;background:rgba(255,255,255,.1);border-radius:99px;overflow:hidden;width:60px;display:inline-block;vertical-align:middle;margin-left:6px"><div style="height:100%;width:${pct}%;background:#ffffff;border-radius:99px"></div></div>`;
+    const bar=`<div style="height:4px;background:rgba(255,255,255,.08);border-radius:99px;overflow:hidden;flex:1;max-width:120px"><div style="height:100%;width:${pct}%;background:#ededed;border-radius:99px"></div></div>`;
     const pill=r.downloaded_count>=r.track_count&&r.track_count>0?'<span class="pill done">done</span>':'<span class="pill pend">'+pct+'%</span>';
-    return `<tr><td data-label="Artist">${esc(r.artist_name)}</td><td data-label="Album">${esc(r.name)}</td><td data-label="Progress" class="progress">${r.downloaded_count}/${r.track_count} ${bar} ${pill}</td>
-      <td data-label="Action"><button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button></td></tr>`;
-  }).join('')||'<tr><td colspan=4 class="muted">No albums yet — run Scan Albums.</td></tr>';
+    const prog=`${r.downloaded_count}/${r.track_count}`;
+  return {r,pct,bar,pill,prog};
+  });
+  $('#libRows').innerHTML=rows.length?rows.map(({r,bar,pill,prog})=>`<tr><td>${esc(r.artist_name)}</td><td>${esc(r.name)}</td><td class="progress">${prog} ${bar} ${pill}</td>
+      <td><button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button></td></tr>`).join(''):empty;
+  $('#libCards').innerHTML=rows.length?rows.map(({r,pill,prog})=>`<div class="lib-card">
+      <div class="lib-card-artist">${esc(r.artist_name)}</div>
+      <div class="lib-card-title">${esc(r.name)}</div>
+      <div class="lib-card-foot">
+        <span class="lib-card-progress">${prog} ${pill}</span>
+        <button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button>
+      </div>
+    </div>`).join(''):emptyCards;
+  syncMobileLists();
 }
 async function showSongs(albumId,albumName){
-  $('#songPanelTitle').textContent='Songs — '+albumName;
-  $('#songPanel').classList.remove('hide');
-  $('#songRows').innerHTML=skeletonRows(5,6);
+  $('#songModalTitle').textContent=albumName;
+  $('#songModalList').innerHTML='<div class="muted" style="padding:16px">Loading…</div>';
+  $('#songModal').classList.remove('hide');
   let res;
   try{res=await api(`/api/songs?album_id=${encodeURIComponent(albumId)}`);}
-  catch(e){$('#songRows').innerHTML='<tr><td colspan=5 class="muted">Load failed.</td></tr>';toastErr(e.message||'Songs failed');return;}
+  catch(e){$('#songModalList').innerHTML='<div class="muted" style="padding:16px">Load failed.</div>';toastErr(e.message||'Songs failed');return;}
   const rows=Array.isArray(res)?res:(res.items||[]);
-  const meta=v=>v?'<span class="meta-ok">✓</span>':'<span class="meta-no">—</span>';
-  $('#songRows').innerHTML=rows.map(r=>{
+  const meta=v=>v?'<span title="Cover">Cv</span>':'';
+  const metaL=v=>v?'<span title="Lyrics">Lr</span>':'';
+  $('#songModalList').innerHTML=rows.length?rows.map(r=>{
     const st=r.status==='downloaded'?'<span class="pill done">ok</span>':'<span class="pill pend">'+r.status+'</span>';
-    return `<tr><td class="muted">${r.track_number||''}</td><td>${esc(r.title)}</td><td>${st}</td><td>${meta(r.has_cover)}</td><td>${meta(r.has_lyrics)}</td></tr>`;
-  }).join('')||'<tr><td colspan=5 class="muted">No songs.</td></tr>';
+    return `<div class="song-item"><span class="song-num">${r.track_number||''}</span><span class="song-title">${esc(r.title)}</span><span class="song-meta">${st}${meta(r.has_cover)}${metaL(r.has_lyrics)}</span></div>`;
+  }).join(''):'<div class="muted" style="padding:16px">No songs.</div>';
 }
 let curArt = [], artPage = 0, artistFilter = 'all';
 document.getElementById('artistFilterChips')?.addEventListener('click', e => {
@@ -2291,7 +2507,8 @@ async function bulkSel(action){
 async function loadArtists(reset=true){
   if(reset){artPage=0;selectedArtists.clear();}
   const gen=++artistsLoadGen;
-  $('#artistRows').innerHTML=skeletonRows(5);
+  if(isMobile())$('#artistCards').innerHTML='<div class="muted" style="padding:12px">Loading…</div>';
+  else $('#artistRows').innerHTML=skeletonRows(5);
   $('#artPageInfo').textContent='…';
   try{
     const off=artPage*ART_PAGE;
@@ -2303,6 +2520,7 @@ async function loadArtists(reset=true){
   }catch(e){
     if(gen===artistsLoadGen){
       $('#artistRows').innerHTML=`<tr><td colspan="${selectMode?6:5}" class="muted">Load failed.</td></tr>`;
+      $('#artistCards').innerHTML='<div class="muted" style="padding:12px">Load failed.</div>';
       toastErr('Artists: '+(e.message||e));
     }
   }
@@ -2314,35 +2532,74 @@ function artistLimitSelected(r,val){
   if(val==='')return m==null||m===undefined;
   return Number(m)===Number(val);
 }
+function artistLimitSelectHtml(r){
+  return `<select class="toolbar-select" data-limit data-aid="${esc(r.spotify_id)}" title="Max Downloads">
+    <option value="" ${artistLimitSelected(r,'')?'selected':''}>Global</option>
+    <option value="10" ${artistLimitSelected(r,10)?'selected':''}>10</option>
+    <option value="50" ${artistLimitSelected(r,50)?'selected':''}>50</option>
+    <option value="100" ${artistLimitSelected(r,100)?'selected':''}>100</option>
+    <option value="150" ${artistLimitSelected(r,150)?'selected':''}>150</option>
+    <option value="0" ${artistLimitSelected(r,0)?'selected':''}>Unlimit</option>
+  </select>`;
+}
+function artistRowHtml(r){
+  const sync=r.sync_done?'<span class="pill done">synced</span>':'<span class="pill pend">pending</span>';
+  const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
+  const prog=(r.songs_dl||0)+'/'+(r.songs_total||0);
+  const roCls=r.is_romanian?'on':'';
+  const roTitle=r.is_romanian?'Clear Romanian flag':'Mark as Romanian';
+  const rowCls=r.is_romanian?'row-ro':'';
+  const picked=selectedArtists.has(r.spotify_id);
+  const chk=selectMode?`<td class="chk-col sel-col"><input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/></td>`:'';
+  return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td><button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
+    <td class="td-actions"><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${artistLimitSelectHtml(r)}
+      <button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
+      <button type="button" class="btn danger sm" data-del title="Remove from database. Shift+click: delete files.">×</button></div></td></tr>`;
+}
+function artistCardHtml(r){
+  const sync=r.sync_done?'<span class="pill done">synced</span>':'<span class="pill pend">pending</span>';
+  const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
+  const prog=(r.songs_dl||0)+'/'+(r.songs_total||0);
+  const roCls=r.is_romanian?'on':'';
+  const roTitle=r.is_romanian?'Clear Romanian flag':'Mark as Romanian';
+  const rowCls=r.is_romanian?'row-ro':'';
+  const picked=selectedArtists.has(r.spotify_id);
+  const chk=selectMode?`<input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/>`:'';
+  return `<div class="artist-card ${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">
+    <div class="artist-card-head">${chk}<button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button><span>${esc(r.name)}</span></div>
+    <div class="artist-card-meta"><span>${r.album_count||0} albums</span><span>${prog} songs</span>${act}${sync}</div>
+    <div class="artist-card-actions">${artistLimitSelectHtml(r)}
+      <div class="btn-row"><button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
+      <button type="button" class="btn danger sm" data-del title="Remove. Shift+click: delete files.">Remove</button></div></div></div>`;
+}
 function renderArtists(){
   const pages=Math.max(1,Math.ceil(artistTotal/ART_PAGE));
   $('#artPageInfo').textContent=`${artPage+1} / ${pages} · ${artistTotal}`;
-  $('#artistRows').innerHTML=curArt.map(r=>{
-    const sync=r.sync_done?'<span class="pill done">synced</span>':'<span class="pill pend">pending</span>';
-    const act=r.active?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
-    const prog=(r.songs_dl||0)+'/'+(r.songs_total||0);
-    const roCls = r.is_romanian ? 'on' : '';
-    const roTitle = r.is_romanian ? 'Clear Romanian flag' : 'Mark as Romanian';
-    const rowCls = r.is_romanian ? 'row-ro' : '';
-    const picked=selectedArtists.has(r.spotify_id);
-    const chk=selectMode?`<td class="chk-col sel-col" data-label=""><input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/></td>`:'';
-    return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td data-label="Artist"><button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button>${esc(r.name)}</td><td data-label="Albums" class="muted">${r.album_count||0}</td><td data-label="Songs" class="muted">${prog}</td><td data-label="Status">${act} ${sync}</td>
-      <td class="td-actions" data-label="Actions">
-        <div style="display:flex; gap:6px; align-items:center;">
-          <select class="toolbar-select" data-limit data-aid="${esc(r.spotify_id)}" style="width:85px; min-width:85px;" title="Max Downloads">
-            <option value="" ${artistLimitSelected(r,'')?'selected':''}>Global</option>
-            <option value="10" ${artistLimitSelected(r,10)?'selected':''}>10</option>
-            <option value="50" ${artistLimitSelected(r,50)?'selected':''}>50</option>
-            <option value="100" ${artistLimitSelected(r,100)?'selected':''}>100</option>
-            <option value="150" ${artistLimitSelected(r,150)?'selected':''}>150</option>
-            <option value="0" ${artistLimitSelected(r,0)?'selected':''}>Unlimit</option>
-          </select>
-          <button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
-          <button type="button" class="btn danger sm" data-del title="Remove from database (fast). Shift+click: also delete files on disk.">×</button>
-        </div>
-      </td></tr>`;
-  }).join('')||`<tr><td colspan="${selectMode?6:5}" class="muted">No artists yet.</td></tr>`;
+  const empty=`<tr><td colspan="${selectMode?6:5}" class="muted">No artists yet.</td></tr>`;
+  const emptyCards='<div class="muted" style="padding:12px">No artists yet.</div>';
+  if(!curArt.length){
+    $('#artistRows').innerHTML=empty;
+    $('#artistCards').innerHTML=emptyCards;
+  }else{
+    $('#artistRows').innerHTML=curArt.map(artistRowHtml).join('');
+    $('#artistCards').innerHTML=curArt.map(artistCardHtml).join('');
+  }
+  syncMobileLists();
   syncSelBar();
+}
+function onArtistListClick(e){
+  const card=e.target.closest('.artist-card');
+  const tr=e.target.closest('tr[data-aid]');
+  const root=card||tr;
+  if(!root)return;
+  const id=root.dataset.aid;
+  if(e.target.closest('button[data-ro]')){setRomanian(id,parseInt(e.target.closest('button[data-ro]').dataset.val,10));return;}
+  if(e.target.closest('button[data-toggle]')){toggleArtist(id);return;}
+  if(e.target.closest('button[data-del]')){delArtist(id,e);return;}
+}
+function onArtistListChange(e){
+  if(e.target.matches('select[data-limit]'))setArtistLimit(e.target.dataset.aid,e.target.value);
+  if(e.target.matches('input.row-chk'))togglePick(e.target.dataset.aid,e.target.checked);
 }
 async function addArtist(){
   const v=$('#artistEntry').value.trim();if(!v)return;
@@ -2589,23 +2846,17 @@ function connectWS(){
 $('#consoleOut').addEventListener('scroll',e=>{
   const el=e.target;autoscroll=(el.scrollHeight-el.scrollTop-el.clientHeight)<40;
 });
-document.getElementById('artistRows')?.addEventListener('click',e=>{
-  const tr=e.target.closest('tr[data-aid]');
-  if(!tr)return;
-  const id=tr.dataset.aid;
-  if(e.target.closest('button[data-ro]')){setRomanian(id,parseInt(e.target.closest('button[data-ro]').dataset.val,10));return;}
-  if(e.target.closest('button[data-toggle]')){toggleArtist(id);return;}
-  if(e.target.closest('button[data-del]')){delArtist(id,e);return;}
-});
-document.getElementById('artistRows')?.addEventListener('change',e=>{
-  if(e.target.matches('select[data-limit]'))setArtistLimit(e.target.dataset.aid,e.target.value);
-  if(e.target.matches('input.row-chk'))togglePick(e.target.dataset.aid,e.target.checked);
-});
-document.getElementById('libRows')?.addEventListener('click',e=>{
+document.getElementById('artistRows')?.addEventListener('click',onArtistListClick);
+document.getElementById('artistCards')?.addEventListener('click',onArtistListClick);
+document.getElementById('artistRows')?.addEventListener('change',onArtistListChange);
+document.getElementById('artistCards')?.addEventListener('change',onArtistListChange);
+function onLibSongsClick(e){
   const b=e.target.closest('button[data-album]');
   if(!b)return;
   showSongs(b.dataset.album,b.dataset.albumName||'').catch(err=>toastErr(err.message||'Songs failed'));
-});
+}
+document.getElementById('libRows')?.addEventListener('click',onLibSongsClick);
+document.getElementById('libCards')?.addEventListener('click',onLibSongsClick);
 document.getElementById('playlistRows')?.addEventListener('click',e=>{
   const sync=e.target.closest('[data-pl-sync]');
   if(sync){syncPl(sync.dataset.url).catch(err=>toastErr(err.message||'Sync failed'));return;}
