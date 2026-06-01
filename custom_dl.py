@@ -14,7 +14,8 @@ Album completeness check:
   - If an album has downloaded_count < track_count, try to download it
     from YouTube Music using a "ytsearch" album query, all tracks, sequentially.
 
-No Spotify client-ID, no YouTube login, no cookies needed.
+Optional YouTube cookies (config: youtube_cookies_file or youtube_cookies_from_browser)
+help when YouTube returns “Sign in to confirm you're not a bot”.
 """
 
 import logging
@@ -303,23 +304,47 @@ def enforce_primary_artist(
 # yt-dlp downloader
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _build_cookie_opts(
+    cookies_file: Optional[str] = None,
+    cookies_from_browser: Optional[str] = None,
+) -> dict:
+    """yt-dlp cookie options from config (file path and/or browser name)."""
+    opts: dict = {}
+    if cookies_file:
+        path = Path(cookies_file).expanduser()
+        if path.is_file():
+            opts["cookiefile"] = str(path)
+        else:
+            log.warning("youtube_cookies_file not found: %s", path)
+    browser = (cookies_from_browser or "").strip()
+    if browser:
+        opts["cookiesfrombrowser"] = (browser,)
+    return opts
+
+
 class YtDlpDownloader:
     """
     Thin wrapper around yt-dlp that:
       - Searches YouTube Music for a track by "artist - title" query.
       - Downloads the best audio stream as Opus.
       - Optionally downloads a full album by searching "artist album full album".
-    No authentication required.
     """
 
-    def __init__(self, music_dir: Path, fmt: str = "opus"):
+    def __init__(
+        self,
+        music_dir: Path,
+        fmt: str = "opus",
+        cookies_file: Optional[str] = None,
+        cookies_from_browser: Optional[str] = None,
+    ):
         self.music_dir = music_dir
         self.fmt = fmt
+        self._cookie_opts = _build_cookie_opts(cookies_file, cookies_from_browser)
 
     # ── internal: build ydl_opts ────────────────────────────────────────────
 
     def _ydl_opts(self, out_template: str, quiet: bool = True) -> dict:
-        return {
+        opts = {
             "format": "bestaudio/best",
             "outtmpl": out_template,
             "postprocessors": [
@@ -341,6 +366,20 @@ class YtDlpDownloader:
             # Prefer YouTube Music results when using ytsearch
             "default_search": "https://music.youtube.com/search?q=",
         }
+        opts.update(self._cookie_opts)
+        return opts
+
+    def _base_opts(self, quiet: bool = True) -> dict:
+        """Search/extract-only options (includes cookies when configured)."""
+        opts = {
+            "quiet": quiet,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "retries": 3,
+            "fragment_retries": 5,
+        }
+        opts.update(self._cookie_opts)
+        return opts
 
     # ── search → first result URL ────────────────────────────────────────────
 
@@ -349,8 +388,7 @@ class YtDlpDownloader:
         if yt_dlp is None:
             return None
         opts = {
-            "quiet": True,
-            "no_warnings": True,
+            **self._base_opts(),
             "extract_flat": True,       # don't download, just extract info
             "default_search": "ytsearch1",
         }
@@ -459,8 +497,7 @@ class YtDlpDownloader:
 
         # First, search for a playlist/album result
         search_opts = {
-            "quiet": True,
-            "no_warnings": True,
+            **self._base_opts(),
             "extract_flat": True,
         }
         playlist_url = None
@@ -514,13 +551,18 @@ def check_and_complete_artist_albums(
     artist_id: str,
     artist_name: str,
     downloader: YtDlpDownloader,
+    enabled: bool = True,
 ) -> int:
     """
     For a given artist, look at all their albums in the DB.
     If an album has fewer downloaded tracks than expected, queue a full album
     download via yt-dlp.
     Returns the number of albums that were (re-)downloaded.
+    Set enabled=False when the artist has a per-track download cap (album mode
+    would fetch entire albums and bypass the limit).
     """
+    if not enabled:
+        return 0
     conn = sqlite3.connect(db_path, timeout=60.0)
     conn.row_factory = sqlite3.Row
 

@@ -78,6 +78,9 @@ DEFAULTS: dict = {
     "scan_concurrency": 4,
     "sync_concurrency": 1,              # sequential artist sync
     "verified_artists": [],             # populated from config.json
+    "max_downloads_per_artist": 0,      # 0 = unlimited (per-artist override in DB)
+    "youtube_cookies_file": "",         # path to Netscape cookies.txt (optional)
+    "youtube_cookies_from_browser": "", # e.g. chrome, firefox, edge (optional)
     "playlists": [
         {"name": "Today's Top Hits", "url": "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"},
         {"name": "Top 50 Romania", "url": "https://open.spotify.com/playlist/37i9dQZEVXbNZbJ6TZelCq"},
@@ -1434,7 +1437,15 @@ def cmd_scan_artists(args):
     log.info("Artist catalog scan complete")
 
 
-def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total: int, allowed_song_ids: set = None) -> bool:
+def _sync_artist_with_ytdlp(
+    sid: str,
+    name: str,
+    songs: list,
+    index: int,
+    total: int,
+    allowed_song_ids: set = None,
+    skip_album_completeness: bool = False,
+) -> bool:
     """
     Core sequential download loop for one artist.
 
@@ -1453,7 +1464,11 @@ def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total:
     db_path = Path(CFG["db_path"])
     fmt = CFG.get("format", "opus")
 
-    downloader = custom_dl.YtDlpDownloader(music_dir, fmt=fmt)
+    downloader = _make_ytdlp_downloader(music_dir, fmt)
+
+    if allowed_song_ids is not None and len(allowed_song_ids) == 0:
+        log.info("[%d/%d] %s — at download cap, skipping", index, total, name)
+        return True
 
     # Build a lookup: spotify_id → yt_url from spotdl JSON
     # spotdl save stores the YouTube URL in the 'download_url' field
@@ -1553,7 +1568,12 @@ def _sync_artist_with_ytdlp(sid: str, name: str, songs: list, index: int, total:
     log.info("  ↳ Checking album completeness for: %s", name)
     reconcile_artist_downloads(sid, name)
     fixed = custom_dl.check_and_complete_artist_albums(
-        db_path, music_dir, sid, name, downloader
+        db_path,
+        music_dir,
+        sid,
+        name,
+        downloader,
+        enabled=not skip_album_completeness,
     )
     if fixed:
         log.info("  ↳ Downloaded %d missing album(s) for %s", fixed, name)
@@ -1583,27 +1603,175 @@ def cmd_artists_sync(args):
     log.info("Artists to sync%s: %d (sequential)", tag, len(artists))
     total = len(artists)
 
+    max_dl = int(CFG.get("max_downloads_per_artist", 0))
+    log.info("▶ Enforcing caps before artist sync")
+    enforce_all_download_caps(quiet_if_none=True)
     ok = failed = 0
     for i, a in enumerate(artists, 1):
         sid, name = a["spotify_id"], a["name"]
+        with db_connect() as db_conn:
+            keep_ids, skip_album = _apply_artist_download_cap(
+                db_conn, sid, name, a["max_downloads"], max_dl, prune_skipped=True
+            )
 
-        # Step 2: Download pending tracks + album completeness check
-        result = _sync_artist_with_ytdlp(sid, name, [], i, total)
+        # Download pending tracks (+ album completeness only when uncapped)
+        result = _sync_artist_with_ytdlp(
+            sid, name, [], i, total,
+            allowed_song_ids=keep_ids,
+            skip_album_completeness=skip_album,
+        )
         if result:
             ok += 1
         else:
             failed += 1
 
     log.info("Artists sync done — ✓ %d  ✗ %d", ok, failed)
+    log.info("▶ Final cap enforcement")
+    enforce_all_download_caps(quiet_if_none=True)
 
-def _get_top_songs_for_artist(artist_name: str, limit: int) -> set:
+
+def _artist_effective_limit(artist_max_downloads, global_max: int) -> int:
+    """Per-artist cap; NULL in DB falls back to global config (0 = unlimited)."""
+    if artist_max_downloads is not None:
+        return int(artist_max_downloads or 0)
+    return int(global_max or 0)
+
+
+def _pending_songs_for_artist(db_conn, sid: str) -> list:
+    return db_conn.execute(
+        """
+        SELECT s.spotify_id, s.title
+        FROM songs s
+        JOIN albums al ON s.album_id = al.spotify_id
+        WHERE s.artist_id = ? AND s.status != 'downloaded'
+        ORDER BY al.release_year DESC, al.name, s.track_number
+        """,
+        (sid,),
+    ).fetchall()
+
+
+def _apply_artist_download_cap(
+    db_conn,
+    sid: str,
+    name: str,
+    artist_max_downloads,
+    global_max: int,
+    *,
+    prune_skipped: bool = False,
+) -> tuple[set | None, bool]:
+    """
+    Choose which pending song IDs may be downloaded under max_downloads.
+
+    Returns (allowed_song_ids, skip_album_completeness).
+      - allowed_song_ids None → no cap
+      - empty set → already at cap, nothing to download
+    """
+    limit = _artist_effective_limit(artist_max_downloads, global_max)
+    if limit <= 0:
+        return None, False
+
+    downloaded = db_conn.execute(
+        "SELECT COUNT(*) FROM songs WHERE artist_id=? AND status='downloaded'",
+        (sid,),
+    ).fetchone()[0]
+
+    pending_songs = _pending_songs_for_artist(db_conn, sid)
+    if downloaded >= limit:
+        if prune_skipped and pending_songs:
+            skip_ids = [ps["spotify_id"] for ps in pending_songs]
+            db_conn.execute(
+                f"DELETE FROM songs WHERE spotify_id IN ({','.join(['?'] * len(skip_ids))})",
+                skip_ids,
+            )
+            log.info(
+                "  -> %s: at cap (%d downloaded); removed %d pending tracks from queue",
+                name, limit, len(skip_ids),
+            )
+        return set(), True
+
+    remaining = limit - downloaded
+    if not pending_songs:
+        return set(), True
+
+    if len(pending_songs) <= remaining:
+        return {ps["spotify_id"] for ps in pending_songs}, True
+
+    top_titles = _get_top_songs_for_artist(name, remaining)
+    if top_titles:
+        matched, unmatched = [], []
+        for ps in pending_songs:
+            if _normalize_song_title(ps["title"]) in top_titles:
+                matched.append(ps)
+            else:
+                unmatched.append(ps)
+        final_list = matched + unmatched
+        log.info(
+            "  -> %s: matched %d top-viewed tracks; keeping %d of %d pending (cap %d, %d already downloaded)",
+            name, len(matched), remaining, len(pending_songs), limit, downloaded,
+        )
+    else:
+        final_list = pending_songs
+        log.info(
+            "  -> %s: no YT Music top list; keeping newest %d of %d pending (cap %d)",
+            name, remaining, len(pending_songs), limit,
+        )
+
+    keep_ids = {ps["spotify_id"] for ps in final_list[:remaining]}
+    skip_ids = [ps["spotify_id"] for ps in final_list[remaining:]]
+    if prune_skipped and skip_ids:
+        db_conn.execute(
+            f"DELETE FROM songs WHERE spotify_id IN ({','.join(['?'] * len(skip_ids))})",
+            skip_ids,
+        )
+        log.info("  -> Deleted %d skipped pending songs for %s", len(skip_ids), name)
+    return keep_ids, True
+
+
+def _youtube_cookies_candidates() -> list[Path]:
+    """Paths checked in order (first existing file wins)."""
+    explicit = (CFG.get("youtube_cookies_file") or "").strip()
+    if explicit:
+        return [Path(explicit).expanduser()]
+    paths = [
+        Path(CFG.get("sync_dir", DEFAULTS["sync_dir"])) / "youtube-cookies.txt",
+        BASE / "sync-data" / "youtube-cookies.txt",  # in-repo: git pull on server
+    ]
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for p in paths:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique
+
+
+def _resolve_youtube_cookies_file() -> Optional[str]:
+    for path in _youtube_cookies_candidates():
+        if path.is_file():
+            return str(path)
+    return None
+
+
+def _make_ytdlp_downloader(music_dir: Path, fmt: str) -> "custom_dl.YtDlpDownloader":
+    return custom_dl.YtDlpDownloader(
+        music_dir,
+        fmt=fmt,
+        cookies_file=_resolve_youtube_cookies_file(),
+        cookies_from_browser=CFG.get("youtube_cookies_from_browser") or None,
+    )
+
+
+def _get_top_song_titles_ordered(artist_name: str, limit: int) -> list[str]:
+    """YouTube Music artist page songs section, most-viewed first."""
     try:
         from ytmusicapi import YTMusic
         import ytm_scanner
         ytm = YTMusic()
         results = ytm.search(artist_name, filter="artists", limit=3)
-        if not results: return set()
-        
+        if not results:
+            return []
+
         browse_id = None
         for r in results:
             if ytm_scanner._artist_matches(artist_name, r.get("artist", "")):
@@ -1611,19 +1779,331 @@ def _get_top_songs_for_artist(artist_name: str, limit: int) -> set:
                 break
         if not browse_id:
             browse_id = results[0]["browseId"]
-            
+
         artist_data = ytm.get_artist(browse_id)
-        top_titles = set()
+        ordered: list[str] = []
         if "songs" in artist_data and "results" in artist_data["songs"]:
             for song in artist_data["songs"]["results"][:limit]:
-                top_titles.add(_normalize_song_title(song.get("title", "")))
-        return top_titles
+                norm = _normalize_song_title(song.get("title", ""))
+                if norm and norm not in ordered:
+                    ordered.append(norm)
+        return ordered
     except Exception as e:
         log.warning("Failed to get top songs for %s: %s", artist_name, e)
-        return set()
+        return []
+
+
+def _get_top_songs_for_artist(artist_name: str, limit: int) -> set:
+    return set(_get_top_song_titles_ordered(artist_name, limit))
+
+
+def _rank_songs_for_cap(songs: list, top_ordered: list[str], limit: int) -> tuple[list, list]:
+    """Split song rows into keep (up to limit) and drop using top-viewed order."""
+    if limit <= 0 or not songs:
+        return list(songs), []
+
+    by_title: dict[str, list] = {}
+    for s in songs:
+        key = _normalize_song_title(s["title"])
+        by_title.setdefault(key, []).append(s)
+
+    keep: list = []
+    used_ids: set[str] = set()
+
+    for norm in top_ordered:
+        for row in by_title.get(norm, []):
+            if row["spotify_id"] not in used_ids:
+                keep.append(row)
+                used_ids.add(row["spotify_id"])
+            if len(keep) >= limit:
+                return keep, [s for s in songs if s["spotify_id"] not in used_ids]
+
+    rest = [s for s in songs if s["spotify_id"] not in used_ids]
+    rest.sort(
+        key=lambda r: (r["release_year"] or 0, r["title"] or ""),
+        reverse=True,
+    )
+    for row in rest:
+        if len(keep) >= limit:
+            break
+        keep.append(row)
+        used_ids.add(row["spotify_id"])
+
+    drop = [s for s in songs if s["spotify_id"] not in used_ids]
+    return keep, drop
+
+
+def _delete_song_file(music_dir: Path, file_path: Optional[str]) -> bool:
+    if not file_path:
+        return False
+    fp = Path(file_path)
+    if not fp.is_absolute():
+        fp = music_dir / fp
+    if not fp.is_file():
+        return False
+    try:
+        fp.unlink()
+        parent = fp.parent
+        for _ in range(4):
+            if parent == music_dir or not parent.is_dir():
+                break
+            try:
+                if not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
+                else:
+                    break
+            except OSError:
+                break
+        return True
+    except OSError as e:
+        log.warning("Could not delete %s: %s", fp, e)
+        return False
+
+
+def _sweep_orphan_artist_files(music_dir: Path, artist_name: str, kept_rels: set[str]) -> int:
+    """Remove audio files on disk for this artist that are not in kept_rels."""
+    if not custom_dl:
+        return 0
+    folder = music_dir / custom_dl._clean_filename(artist_name)
+    if not folder.is_dir():
+        return 0
+    removed = 0
+    for f in folder.rglob("*"):
+        if f.suffix.lower() not in AUDIO_EXTS or not f.is_file():
+            continue
+        try:
+            rel = str(f.relative_to(music_dir)).replace("\\", "/")
+        except ValueError:
+            continue
+        if rel not in kept_rels:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError as e:
+                log.warning("Could not delete orphan %s: %s", f, e)
+    return removed
+
+
+def prune_artist_to_cap(
+    db_conn,
+    sid: str,
+    name: str,
+    artist_max_downloads,
+    global_max: int,
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Keep only top-viewed tracks up to max_downloads; delete other files and DB rows.
+    """
+    stats = {"kept": 0, "removed_files": 0, "removed_db": 0, "orphan_files": 0}
+    limit = _artist_effective_limit(artist_max_downloads, global_max)
+    if limit <= 0:
+        return stats
+
+    rows = db_conn.execute(
+        """
+        SELECT s.spotify_id, s.title, s.file_path, s.status,
+               al.release_year
+        FROM songs s
+        JOIN albums al ON s.album_id = al.spotify_id
+        WHERE s.artist_id = ?
+        """,
+        (sid,),
+    ).fetchall()
+    if not rows:
+        return stats
+
+    downloaded = [r for r in rows if r["status"] == "downloaded"]
+    if len(downloaded) <= limit and len(rows) == len(downloaded):
+        stats["kept"] = len(downloaded)
+        return stats
+
+    top_ordered = _get_top_song_titles_ordered(name, limit)
+    keep, drop = _rank_songs_for_cap(list(rows), top_ordered, limit)
+    drop_ids = {s["spotify_id"] for s in drop}
+    if not drop_ids:
+        stats["kept"] = len(keep)
+        return stats
+
+    music_dir = Path(CFG["music_dir"])
+    kept_rels: set[str] = set()
+
+    if top_ordered:
+        log.info(
+            "  %s: keeping %d / %d tracks (top %d by YT Music views)%s",
+            name, len(keep), len(rows), limit, " [dry-run]" if dry_run else "",
+        )
+    else:
+        log.info(
+            "  %s: keeping %d / %d tracks (newest fallback; YT top list unavailable)%s",
+            name, len(keep), len(rows), limit, " [dry-run]" if dry_run else "",
+        )
+
+    for s in keep:
+        if s["file_path"]:
+            rel = str(s["file_path"]).replace("\\", "/")
+            if not Path(rel).is_absolute():
+                kept_rels.add(rel)
+
+    for s in drop:
+        if s["status"] == "downloaded" and s["file_path"]:
+            rel = str(s["file_path"]).replace("\\", "/")
+            if not dry_run and _delete_song_file(music_dir, rel):
+                stats["removed_files"] += 1
+            elif dry_run:
+                stats["removed_files"] += 1
+
+    if not dry_run:
+        db_conn.execute(
+            f"DELETE FROM songs WHERE spotify_id IN ({','.join(['?'] * len(drop_ids))})",
+            list(drop_ids),
+        )
+        stats["removed_db"] = len(drop_ids)
+        stats["orphan_files"] = _sweep_orphan_artist_files(music_dir, name, kept_rels)
+
+        for album_id_row in db_conn.execute(
+            "SELECT spotify_id FROM albums WHERE artist_id=?", (sid,)
+        ).fetchall():
+            album_id = album_id_row["spotify_id"]
+            row = db_conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN status='downloaded' THEN 1 ELSE 0 END) AS done
+                FROM songs WHERE album_id=?
+                """,
+                (album_id,),
+            ).fetchone()
+            db_conn.execute(
+                "UPDATE albums SET track_count=?, downloaded_count=? WHERE spotify_id=?",
+                (row["total"], row["done"] or 0, album_id),
+            )
+    else:
+        stats["removed_db"] = len(drop_ids)
+
+    stats["kept"] = len(keep)
+    return stats
+
+
+def cmd_cookies_check(_args):
+    """Verify YouTube cookies file is present and accepted by yt-dlp."""
+    path = _resolve_youtube_cookies_file()
+    browser = (CFG.get("youtube_cookies_from_browser") or "").strip()
+    repo_path = BASE / "sync-data" / "youtube-cookies.txt"
+
+    if not path and not browser:
+        log.error("No cookies configured.")
+        log.info("Easiest via Git: commit this file in your repo (private repo only):")
+        log.info("  %s", repo_path)
+        log.info("Then on the server: git pull && musicadet cookies-check")
+        log.info("Or copy to sync_dir: %s", Path(CFG.get("sync_dir", DEFAULTS["sync_dir"])) / "youtube-cookies.txt")
+        log.info("Export from PC with browser extension 'Get cookies.txt LOCALLY'.")
+        return
+
+    if path:
+        log.info("Using cookies file: %s", path)
+    if browser:
+        log.info("Using cookies from browser: %s", browser)
+
+    if not custom_dl or not custom_dl.yt_dlp:
+        log.error("yt-dlp not installed")
+        return
+
+    downloader = _make_ytdlp_downloader(Path(CFG["music_dir"]), CFG.get("format", "opus"))
+    test_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # short public video
+    opts = {**downloader._base_opts(), "extract_flat": True}
+    try:
+        with custom_dl.yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(test_url, download=False)
+        if info:
+            log.info("Cookies OK — YouTube returned metadata for a test video.")
+        else:
+            log.warning("Test returned no info; cookies may be expired.")
+    except Exception as e:
+        err = str(e).lower()
+        if "bot" in err or "sign in" in err:
+            log.error("Cookies rejected (bot check). Re-export cookies from your browser.")
+        else:
+            log.error("Cookie test failed: %s", e)
+
+
+def enforce_all_download_caps(
+    artist_filter: Optional[str] = None,
+    *,
+    dry_run: bool = False,
+    quiet_if_none: bool = False,
+) -> dict:
+    """
+    Keep only top-viewed tracks per artist cap; delete other files and DB rows.
+    Called automatically before/after download and after reconcile.
+    """
+    global_max = int(CFG.get("max_downloads_per_artist", 0))
+    summary = {"artists": 0, "removed_files": 0, "removed_db": 0, "orphan_files": 0}
+
+    with db_connect() as db:
+        if artist_filter:
+            artists = db.execute(
+                "SELECT spotify_id, name, max_downloads FROM artists WHERE active=1 "
+                "AND (name LIKE ? OR spotify_id=?)",
+                (f"%{artist_filter}%", artist_filter),
+            ).fetchall()
+        else:
+            artists = db.execute(
+                "SELECT spotify_id, name, max_downloads FROM artists WHERE active=1"
+            ).fetchall()
+
+    capped = [
+        a for a in artists
+        if _artist_effective_limit(a["max_downloads"], global_max) > 0
+    ]
+    if not capped:
+        if not quiet_if_none:
+            log.info("No download caps set (per-artist limit or max_downloads_per_artist).")
+        return summary
+
+    log.info(
+        "Enforcing top-viewed caps for %d artist(s)%s",
+        len(capped), " [dry-run]" if dry_run else "",
+    )
+    for a in capped:
+        with db_connect() as db:
+            stats = prune_artist_to_cap(
+                db, a["spotify_id"], a["name"], a["max_downloads"], global_max, dry_run=dry_run
+            )
+        if stats["removed_files"] or stats["removed_db"] or stats["orphan_files"]:
+            log.info(
+                "  %s: kept %d — removed %d file(s), %d DB row(s), %d orphan file(s)",
+                a["name"], stats["kept"], stats["removed_files"],
+                stats["removed_db"], stats["orphan_files"],
+            )
+        summary["artists"] += 1
+        summary["removed_files"] += stats["removed_files"]
+        summary["removed_db"] += stats["removed_db"]
+        summary["orphan_files"] += stats["orphan_files"]
+
+    if summary["removed_files"] or summary["removed_db"] or summary["orphan_files"]:
+        log.info(
+            "Cap enforcement done — %d file(s), %d DB row(s), %d orphan file(s) removed",
+            summary["removed_files"], summary["removed_db"], summary["orphan_files"],
+        )
+    return summary
+
+
+def cmd_prune_caps(args):
+    """Delete downloaded tracks (and files) over per-artist max_downloads (top viewed)."""
+    enforce_all_download_caps(
+        getattr(args, "artist", None),
+        dry_run=getattr(args, "dry_run", False),
+    )
+
 
 def cmd_download_pending(args):
-    """Bypasses SpotDL entirely and just downloads pending songs currently in the DB."""
+    """Download pending tracks (top viewed only when artist has a cap)."""
+    nested = getattr(args, "_nested", False)
+    if not nested:
+        log.info("▶ Enforcing caps before download (keeps top viewed, deletes the rest)")
+    enforce_all_download_caps(quiet_if_none=True)
     with db_connect() as db:
         # Get artists that actually have pending songs
         artists = db.execute("""
@@ -1643,46 +2123,17 @@ def cmd_download_pending(args):
     def _dl_worker(i_a):
         i, a = i_a
         sid, name, artist_limit = a["spotify_id"], a["name"], a["max_downloads"]
-        
-        limit = artist_limit if artist_limit is not None else max_dl
-        
-        # Determine the pending tracks we will download for this artist
         with db_connect() as db_conn:
-            pending_songs = db_conn.execute("""
-                SELECT s.spotify_id, s.title
-                FROM songs s
-                JOIN albums al ON s.album_id = al.spotify_id
-                WHERE s.artist_id = ? AND s.status != 'downloaded'
-                ORDER BY al.release_year DESC, al.name, s.track_number
-            """, (sid,)).fetchall()
-            
-            if limit > 0 and len(pending_songs) > limit:
-                top_titles = _get_top_songs_for_artist(name, limit)
-                if top_titles:
-                    matched = []
-                    unmatched = []
-                    for ps in pending_songs:
-                        if _normalize_song_title(ps["title"]) in top_titles:
-                            matched.append(ps)
-                        else:
-                            unmatched.append(ps)
-                    final_list = matched + unmatched
-                    keep_ids = {ps["spotify_id"] for ps in final_list[:limit]}
-                    skip_ids = [ps["spotify_id"] for ps in final_list[limit:]]
-                    log.info("[%d/%d] %s: Matched %d Top Songs by views, limiting download to %d tracks (out of %d pending)", i, total, name, len(matched), limit, len(pending_songs))
-                else:
-                    keep_ids = {ps["spotify_id"] for ps in pending_songs[:limit]}
-                    skip_ids = [ps["spotify_id"] for ps in pending_songs[limit:]]
-                    log.info("[%d/%d] %s: Limiting download to newest %d tracks (out of %d pending)", i, total, name, limit, len(pending_songs))
-                
-                # Clean the waiting list by deleting skipped songs
-                if skip_ids:
-                    db_conn.execute(f"DELETE FROM songs WHERE spotify_id IN ({','.join(['?']*len(skip_ids))})", skip_ids)
-                    log.info("  -> Deleted %d skipped pending songs for %s to keep the queue clean", len(skip_ids), name)
-            else:
-                keep_ids = None
-                
-        return _sync_artist_with_ytdlp(sid, name, [], i, total, allowed_song_ids=keep_ids)
+            keep_ids, skip_album = _apply_artist_download_cap(
+                db_conn, sid, name, artist_limit, max_dl, prune_skipped=True
+            )
+        if keep_ids is not None:
+            log.info("[%d/%d] %s: download cap active (%d track(s) queued)", i, total, name, len(keep_ids))
+        return _sync_artist_with_ytdlp(
+            sid, name, [], i, total,
+            allowed_song_ids=keep_ids,
+            skip_album_completeness=skip_album,
+        )
 
     ok = failed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1693,6 +2144,10 @@ def cmd_download_pending(args):
         else: failed += 1
 
     log.info("Download pending complete — ✓ %d  ✗ %d", ok, failed)
+    if not nested:
+        log.info("▶ Enforcing caps after download")
+    enforce_all_download_caps(quiet_if_none=True)
+
 
 def cmd_sync_playlist(args):
     """
@@ -1716,7 +2171,7 @@ def cmd_sync_playlist(args):
     music_dir = Path(CFG["music_dir"])
     db_path = Path(CFG["db_path"])
     fmt = CFG.get("format", "opus")
-    downloader = custom_dl.YtDlpDownloader(music_dir, fmt=fmt)
+    downloader = _make_ytdlp_downloader(music_dir, fmt)
 
     # ── Step 1: SpotDL fetch ─────────────────────────────────────────────────
     log.info("\n▶ Step 1 — Fetching playlist metadata via SpotDL")
@@ -1824,13 +2279,23 @@ def cmd_sync_playlist(args):
 
     # ── Step 4: Album completeness for each unique artist ────────────────────
     log.info("\n▶ Step 4 — Checking album completeness for %d artist(s)", len(artist_ids_found))
+    global_max_dl = int(CFG.get("max_downloads_per_artist", 0))
     for artist_sid, artist_name in sorted(artist_ids_found, key=lambda x: x[1]):
         log.info("  Artist: %s", artist_name)
+        with db_connect() as db:
+            row = db.execute(
+                "SELECT max_downloads FROM artists WHERE spotify_id=?", (artist_sid,)
+            ).fetchone()
+            artist_cap = row["max_downloads"] if row else None
+        skip_album = _artist_effective_limit(artist_cap, global_max_dl) > 0
         fixed = custom_dl.check_and_complete_artist_albums(
-            db_path, music_dir, artist_sid, artist_name, downloader
+            db_path, music_dir, artist_sid, artist_name, downloader, enabled=not skip_album
         )
         if fixed:
             reconcile_artist_downloads(artist_sid, artist_name)
+
+    for artist_sid, artist_name in sorted(artist_ids_found, key=lambda x: x[1]):
+        enforce_all_download_caps(artist_sid, quiet_if_none=True)
 
     log.info("\n━" * 60)
     log.info("  PLAYLIST SYNC COMPLETE — ✓ %d downloaded, ✗ %d failed", ok, failed)
@@ -1853,7 +2318,7 @@ def cmd_download_direct(args):
 
     music_dir = Path(CFG["music_dir"])
     fmt = CFG.get("format", "opus")
-    downloader = custom_dl.YtDlpDownloader(music_dir, fmt=fmt)
+    downloader = _make_ytdlp_downloader(music_dir, fmt)
 
     # Auto-detect source
     if "spotify.com" in url:
@@ -2024,6 +2489,9 @@ def cmd_reconcile(args):
         stats = reconcile_artist_downloads(a["spotify_id"], a["name"], file_index=file_index)
         log.info("  → %d downloaded, %d pending", stats["downloaded"], stats["pending"])
 
+    log.info("▶ Enforcing caps after reconcile (delete non–top-viewed over limit)")
+    enforce_all_download_caps(artist_filter, quiet_if_none=True)
+
 
 def cmd_fix_metadata(args):
     artist_filter = getattr(args, "artist", None)
@@ -2137,11 +2605,14 @@ def cmd_full_sync(args):
     log.info("\n▶ Step 1 / 3 — Scanning playlists")
     cmd_scan(argparse.Namespace())
 
-    log.info("\n▶ Step 2 / 3 — Scanning artist albums")
+    log.info("\n▶ Step 2 / 4 — Scanning artist albums")
     cmd_scan_artists(argparse.Namespace(new_only=False))
 
-    log.info("\n▶ Step 3 / 3 — Syncing artist discographies")
-    cmd_artists_sync(argparse.Namespace(new_only=False))
+    log.info("\n▶ Step 3 / 4 — Enforcing top-viewed caps (trim library)")
+    enforce_all_download_caps(quiet_if_none=True)
+
+    log.info("\n▶ Step 4 / 4 — Downloading top tracks only (respects per-artist limits)")
+    cmd_download_pending(argparse.Namespace(_nested=True))
 
     with db_connect() as db:
         albums = db.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
@@ -2201,6 +2672,15 @@ Examples:
 
     subparsers.add_parser("download-pending", help="Directly download all pending tracks without SpotDL fetches")
 
+    subparsers.add_parser("cookies-check", help="Test YouTube cookies (uploaded file or browser)")
+
+    pr = subparsers.add_parser(
+        "prune-caps",
+        help="Delete tracks/files over max_downloads (keeps top viewed on YouTube Music)",
+    )
+    pr.add_argument("--artist", help="Only this artist (name substring or spotify id)")
+    pr.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
+
     # New: playlist-first sync command
     sp = subparsers.add_parser(
         "sync-playlist",
@@ -2257,6 +2737,8 @@ Examples:
         "scan-artists":      cmd_scan_artists,
         "artists-sync":      cmd_artists_sync,
         "download-pending":  cmd_download_pending,
+        "cookies-check":     cmd_cookies_check,
+        "prune-caps":        cmd_prune_caps,
         "sync-playlist":     cmd_sync_playlist,
         "download":          cmd_download_direct,
         "reconcile":         cmd_reconcile,

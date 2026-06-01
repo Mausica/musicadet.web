@@ -53,6 +53,36 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Mausica/musicadet.web/main/i
 ```bash
 musicadet                              # Run a full automated sync
 musicadet download-pending             # Trigger the 4-worker downloader
+musicadet prune-caps                   # Delete extra tracks (keeps top-viewed per artist limit)
+musicadet cookies-check                # Verify YouTube cookies on the server
 musicadet fix-metadata                 # Re-fetch covers & tags from iTunes
 musicadet add "Artist Name"            # Force-add an artist
 ```
+
+### YouTube cookies (via GitHub — easiest if you already deploy with `git pull`)
+
+**Use a private repository only.** The cookies file is a login key; anyone with it can use your YouTube account.
+
+1. On your **PC**, install **Get cookies.txt LOCALLY** and export cookies while on youtube.com.
+2. Save the export as `sync-data/youtube-cookies.txt` inside this project (next to `youtube-cookies.txt.example`).
+3. Commit and push:
+
+   ```bash
+   git add sync-data/youtube-cookies.txt
+   git commit -m "Update YouTube cookies"
+   git push
+   ```
+
+4. On the **server**, pull and test:
+
+   ```bash
+   cd /path/to/musicadet.web
+   git pull
+   musicadet cookies-check
+   ```
+
+No `config.json` change needed — the app checks `sync-data/youtube-cookies.txt` in the repo after pull.
+
+Cookies expire every few weeks — repeat steps 1–4.
+
+**Alternative:** `scp` to `/opt/musicadet/sync-data/youtube-cookies.txt` if you prefer not to store cookies in git.

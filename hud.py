@@ -51,6 +51,7 @@ CONFIG_KEYS = [
     "music_dir", "sync_dir", "db_path", "log_dir", "format", "download_format", "bitrate", "threads",
     "output_template", "artist_scanner", "playlist_save_timeout", "playlist_save_retries",
     "artist_save_timeout", "lyrics_providers", "generate_lrc", "hud_port", "max_downloads_per_artist",
+    "youtube_cookies_file", "youtube_cookies_from_browser",
 ]
 
 AUDIO_EXTS = {".opus", ".mp3", ".m4a", ".flac", ".ogg", ".wav", ".aac", ".webm"}
@@ -1008,18 +1009,21 @@ def api_track_download(path: str):
 
 
 ACTIONS = {
+    "full": ([], "Update library"),
+    "download-pending": (["download-pending"], "Download top tracks"),
+    "reconcile": (["reconcile"], "Refresh files"),
+    "fix-metadata": (["fix-metadata"], "Fix tags & covers"),
+    "mark-romanian": (["mark-romanian"], "Mark Romanian artists"),
+    "deduplicate": (["deduplicate"], "Deduplicate library"),
+    "migrate-structure": (["migrate-structure"], "Migrate folders"),
+    # Legacy / advanced (not shown on dashboard)
     "scan": (["scan"], "Scan playlists"),
     "scan-artists": (["scan-artists"], "Scan artist albums"),
     "scan-artists-new": (["scan-artists", "--new-only"], "Scan new artists"),
     "artists-sync": (["artists-sync"], "Sync all artists"),
     "artists-sync-new": (["artists-sync", "--new-only"], "Sync new artists"),
-    "download-pending": (["download-pending"], "Download pending tracks"),
-    "reconcile": (["reconcile"], "Reconcile files"),
-    "migrate-structure": (["migrate-structure"], "Migrate library structure"),
-    "fix-metadata": (["fix-metadata"], "Fix metadata"),
-    "deduplicate": (["deduplicate"], "Deduplicate"),
-    "mark-romanian": (["mark-romanian"], "Mark Romanian Artists"),
-    "full": ([], "Full sync"),
+    "prune-caps": (["prune-caps"], "Enforce caps only"),
+    "cookies-check": (["cookies-check"], "Test YouTube cookies"),
 }
 
 
@@ -1821,6 +1825,49 @@ HTML = r"""<!doctype html>
     grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
     gap: 10px;
   }
+  .actions-primary {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  @media (min-width: 720px) {
+    .actions-primary { grid-template-columns: repeat(3, 1fr); }
+  }
+  .action-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    text-align: left;
+    gap: 6px;
+    min-height: 72px;
+    height: auto;
+    padding: 14px 16px;
+    line-height: 1.35;
+  }
+  .action-tile svg { flex-shrink: 0; margin-bottom: 2px; }
+  .action-title { font-weight: 600; font-size: 14px; }
+  .action-desc {
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--muted);
+    line-height: 1.4;
+  }
+  .btn.action-tile:not(.ghost) .action-desc { color: rgba(255,255,255,0.75); }
+  .tools-panel {
+    margin-top: 16px;
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    background: rgba(0,0,0,0.15);
+  }
+  .tools-panel summary {
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--muted);
+    user-select: none;
+  }
+  .tools-panel .actions { margin-top: 12px; }
+  .dash-intro { margin: 0 0 16px; max-width: 52rem; }
   .toast {
     position: fixed;
     bottom: 20px;
@@ -1993,19 +2040,37 @@ HTML = r"""<!doctype html>
     <div class="grid stats" id="statCards"></div>
     <div class="gradient-sep"></div>
     <div class="card">
-      <h2>Actions</h2>
-      <div class="actions">
-        <button class="btn" onclick="action('full')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg> Full Sync</button>
-        <button class="btn ghost" onclick="action('scan')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg> Scan Playlists</button>
-        <button class="btn ghost" onclick="action('scan-artists')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="3"></circle></svg> Scan Albums</button>
-        <button class="btn ghost" onclick="action('artists-sync-new')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></svg> Sync New</button>
-        <button class="btn ghost" onclick="action('artists-sync')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg> Sync All</button>
-        <button class="btn ghost" onclick="action('download-pending')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download</button>
-        <button class="btn ghost" onclick="action('reconcile')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg> Reconcile</button>
-        <button class="btn ghost" onclick="action('migrate-structure')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Migrate Structure</button>
-        <button class="btn ghost" onclick="action('fix-metadata')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg> Fix Metadata</button>
-        <button class="btn ghost danger" onclick="if(confirm('This will deduplicate all artists, tracks, and 1-track albums in the database and filesystem. Proceed?')) action('deduplicate')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg> Deduplicate</button>
-        <button class="btn danger" onclick="stop()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"></polygon><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg> Stop</button>
+      <h2>Library</h2>
+      <p class="hint dash-intro">Set each artist&apos;s <strong>Limit</strong> on the Artists tab (e.g. 10). The app keeps only their <strong>top viewed</strong> tracks on YouTube Music and deletes the rest automatically when you use the buttons below.</p>
+      <div class="actions actions-primary">
+        <button type="button" class="btn action-tile" onclick="action('full')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+          <span class="action-title">Update everything</span>
+          <span class="action-desc">Scan playlists &amp; catalogs, trim to caps, download missing top tracks</span>
+        </button>
+        <button type="button" class="btn ghost action-tile" onclick="action('download-pending')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+          <span class="action-title">Download top tracks</span>
+          <span class="action-desc">Remove extras over limit, then download only top viewed (per artist cap)</span>
+        </button>
+        <button type="button" class="btn ghost action-tile" onclick="action('reconcile')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+          <span class="action-title">Refresh files</span>
+          <span class="action-desc">Match disk ↔ database, then delete tracks over limit (not top viewed)</span>
+        </button>
+      </div>
+      <details class="tools-panel">
+        <summary>More tools</summary>
+        <div class="actions">
+          <button type="button" class="btn ghost" onclick="action('fix-metadata')">Fix tags &amp; covers</button>
+          <button type="button" class="btn ghost" onclick="action('mark-romanian')">Mark Romanian artists</button>
+          <button type="button" class="btn ghost" onclick="action('migrate-structure')">Migrate folder layout</button>
+          <button type="button" class="btn ghost danger" onclick="if(confirm('Deduplicate all artists and tracks?'))action('deduplicate')">Deduplicate library</button>
+        </div>
+      </details>
+      <div class="gradient-sep"></div>
+      <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+        <button type="button" class="btn danger sm" onclick="stop()">Stop running job</button>
       </div>
       <div class="gradient-sep"></div>
       <div class="row">
