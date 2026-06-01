@@ -515,15 +515,24 @@ def _clean_artist_name_for_ytm(artist_name: str) -> str:
 
 
 def _song_youtube_video_id(row) -> Optional[str]:
-    sid = row["spotify_id"] if hasattr(row, "keys") else row.get("spotify_id", "")
+    if hasattr(row, "keys"):
+        keys = row.keys()
+        sid = row["spotify_id"] if "spotify_id" in keys else ""
+    else:
+        sid = row.get("spotify_id", "")
     if sid and len(sid) == 11 and ":" not in sid:
         return sid
-    url = row["youtube_url"] if hasattr(row, "keys") else row.get("youtube_url")
+    if hasattr(row, "keys"):
+        keys = row.keys()
+        url = row["youtube_url"] if "youtube_url" in keys else None
+    else:
+        url = row.get("youtube_url")
     if url:
         m = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', str(url))
         if m:
             return m.group(1)
     return None
+
 
 
 def _song_matches_top_entry(row, entry: dict) -> bool:
@@ -1670,7 +1679,7 @@ def _artist_effective_limit(artist_max_downloads, global_max: int) -> int:
 def _pending_songs_for_artist(db_conn, sid: str) -> list:
     return db_conn.execute(
         """
-        SELECT s.spotify_id, s.title
+        SELECT s.spotify_id, s.title, s.youtube_url
         FROM songs s
         JOIN albums al ON s.album_id = al.spotify_id
         WHERE s.artist_id = ? AND s.status != 'downloaded'
@@ -1916,7 +1925,7 @@ def prune_artist_to_cap(
     rows = db_conn.execute(
         """
         SELECT s.spotify_id, s.title, s.file_path, s.status,
-               al.release_year
+               s.youtube_url, al.release_year
         FROM songs s
         JOIN albums al ON s.album_id = al.spotify_id
         WHERE s.artist_id = ?
