@@ -1696,28 +1696,29 @@ def _apply_artist_download_cap(
     if len(pending_songs) <= remaining:
         return {ps["spotify_id"] for ps in pending_songs}, True
 
-    top_titles = _get_top_songs_for_artist(name, remaining)
-    if top_titles:
-        matched, unmatched = [], []
-        for ps in pending_songs:
-            if _normalize_song_title(ps["title"]) in top_titles:
+    top_ordered = _get_top_song_titles_ordered(name, remaining)
+    if top_ordered:
+        by_norm = {_normalize_song_title(ps["title"]): ps for ps in pending_songs}
+        matched = []
+        for norm in top_ordered:
+            if len(matched) >= remaining:
+                break
+            ps = by_norm.get(norm)
+            if ps:
                 matched.append(ps)
-            else:
-                unmatched.append(ps)
-        final_list = matched + unmatched
+        keep_ids = {ps["spotify_id"] for ps in matched}
+        skip_ids = [ps["spotify_id"] for ps in pending_songs if ps["spotify_id"] not in keep_ids]
         log.info(
-            "  -> %s: matched %d top-viewed tracks; keeping %d of %d pending (cap %d, %d already downloaded)",
-            name, len(matched), remaining, len(pending_songs), limit, downloaded,
+            "  -> %s: %d top-viewed match(es); will download %d (cap %d, %d already on disk, %d pending total)",
+            name, len(matched), len(keep_ids), limit, downloaded, len(pending_songs),
         )
     else:
-        final_list = pending_songs
-        log.info(
-            "  -> %s: no YT Music top list; keeping newest %d of %d pending (cap %d)",
-            name, remaining, len(pending_songs), limit,
+        keep_ids = set()
+        skip_ids = [ps["spotify_id"] for ps in pending_songs]
+        log.warning(
+            "  -> %s: no YT Music top list — skipping downloads (will not use release year)",
+            name,
         )
-
-    keep_ids = {ps["spotify_id"] for ps in final_list[:remaining]}
-    skip_ids = [ps["spotify_id"] for ps in final_list[remaining:]]
     if prune_skipped and skip_ids:
         db_conn.execute(
             f"DELETE FROM songs WHERE spotify_id IN ({','.join(['?'] * len(skip_ids))})",
@@ -1798,8 +1799,11 @@ def _get_top_songs_for_artist(artist_name: str, limit: int) -> set:
 
 
 def _rank_songs_for_cap(songs: list, top_ordered: list[str], limit: int) -> tuple[list, list]:
-    """Split song rows into keep (up to limit) and drop using top-viewed order."""
+    """Keep only tracks that match YT Music top-viewed list (in view order), up to limit."""
     if limit <= 0 or not songs:
+        return list(songs), []
+
+    if not top_ordered:
         return list(songs), []
 
     by_title: dict[str, list] = {}
@@ -1811,23 +1815,13 @@ def _rank_songs_for_cap(songs: list, top_ordered: list[str], limit: int) -> tupl
     used_ids: set[str] = set()
 
     for norm in top_ordered:
+        if len(keep) >= limit:
+            break
         for row in by_title.get(norm, []):
             if row["spotify_id"] not in used_ids:
                 keep.append(row)
                 used_ids.add(row["spotify_id"])
-            if len(keep) >= limit:
-                return keep, [s for s in songs if s["spotify_id"] not in used_ids]
-
-    rest = [s for s in songs if s["spotify_id"] not in used_ids]
-    rest.sort(
-        key=lambda r: (r["release_year"] or 0, r["title"] or ""),
-        reverse=True,
-    )
-    for row in rest:
-        if len(keep) >= limit:
-            break
-        keep.append(row)
-        used_ids.add(row["spotify_id"])
+                break
 
     drop = [s for s in songs if s["spotify_id"] not in used_ids]
     return keep, drop
@@ -1921,6 +1915,11 @@ def prune_artist_to_cap(
         return stats
 
     top_ordered = _get_top_song_titles_ordered(name, limit)
+    if not top_ordered:
+        log.warning("  %s: no YT Music top list — cap not applied (release year is never used)", name)
+        stats["kept"] = len(rows)
+        return stats
+
     keep, drop = _rank_songs_for_cap(list(rows), top_ordered, limit)
     drop_ids = {s["spotify_id"] for s in drop}
     if not drop_ids:
@@ -1930,16 +1929,10 @@ def prune_artist_to_cap(
     music_dir = Path(CFG["music_dir"])
     kept_rels: set[str] = set()
 
-    if top_ordered:
-        log.info(
-            "  %s: keeping %d / %d tracks (top %d by YT Music views)%s",
-            name, len(keep), len(rows), limit, " [dry-run]" if dry_run else "",
-        )
-    else:
-        log.info(
-            "  %s: keeping %d / %d tracks (newest fallback; YT top list unavailable)%s",
-            name, len(keep), len(rows), limit, " [dry-run]" if dry_run else "",
-        )
+    log.info(
+        "  %s: keeping %d / %d tracks (top %d by YT Music views only)%s",
+        name, len(keep), len(rows), limit, " [dry-run]" if dry_run else "",
+    )
 
     for s in keep:
         if s["file_path"]:
