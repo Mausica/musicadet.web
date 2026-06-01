@@ -1595,6 +1595,51 @@ def cmd_scan_artists(args):
     log.info("Artist catalog scan complete")
 
 
+def _verify_artist_ytmusic_reachable(sid: str, name: str, index: int, total: int) -> bool:
+    """Ensure the artist has a verified YT Music mapping before downloading."""
+    if CFG.get("artist_scanner", "ytmusic") != "ytmusic":
+        return True
+
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT ytmusic_status FROM artists WHERE spotify_id=?",
+            (sid,),
+        ).fetchone()
+    status = (row["ytmusic_status"] if row else None) or "unknown"
+    status = status.lower()
+    if status in ("found", "manually_mapped"):
+        return True
+    if status == "not_found":
+        log.warning("[%d/%d] %s — skipped because YT Music lookup previously failed", index, total, name)
+        return False
+
+    log.info("[%d/%d] %s — verifying YT Music reachability before download", index, total, name)
+    with db_connect() as db:
+        row = db.execute("SELECT * FROM artists WHERE spotify_id=?", (sid,)).fetchone()
+    if not row:
+        log.warning("[%d/%d] %s — artist record missing from DB", index, total, name)
+        return False
+
+    scan_artist_catalog(row)
+
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT ytmusic_status FROM artists WHERE spotify_id=?",
+            (sid,),
+        ).fetchone()
+    new_status = (row["ytmusic_status"] if row else None) or "unknown"
+    new_status = new_status.lower()
+    if new_status in ("found", "manually_mapped"):
+        log.info("[%d/%d] %s — YT Music verification succeeded", index, total, name)
+        return True
+
+    log.warning(
+        "[%d/%d] %s — YT Music still unreachable after verification (%s)",
+        index, total, name, new_status,
+    )
+    return False
+
+
 def _sync_artist_with_ytdlp(
     sid: str,
     name: str,
@@ -1646,6 +1691,9 @@ def _sync_artist_with_ytdlp(
                 (sid,),
             )
         return True
+
+    if not _verify_artist_ytmusic_reachable(sid, name, index, total):
+        return False
 
     if allowed_song_ids is not None and len(allowed_song_ids) == 0:
         log.info("[%d/%d] %s — at download cap, skipping", index, total, name)
