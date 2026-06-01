@@ -304,6 +304,27 @@ def enforce_primary_artist(
 # yt-dlp downloader
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_valid_netscape_cookies(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line_strip = line.strip()
+                if not line_strip:
+                    continue
+                # Netscape cookie file header comments
+                if line_strip.startswith("# Netscape HTTP Cookie File") or line_strip.startswith("# HTTP Cookie File"):
+                    return True
+                # Or standard tab-separated cookie line
+                if len(line_strip.split("\t")) >= 4:
+                    return True
+                break
+    except Exception:
+        pass
+    return False
+
+
 def _build_cookie_opts(
     cookies_file: Optional[str] = None,
     cookies_from_browser: Optional[str] = None,
@@ -313,7 +334,10 @@ def _build_cookie_opts(
     if cookies_file:
         path = Path(cookies_file).expanduser()
         if path.is_file():
-            opts["cookiefile"] = str(path)
+            if _is_valid_netscape_cookies(path):
+                opts["cookiefile"] = str(path)
+            else:
+                log.warning("youtube_cookies_file '%s' is not a valid Netscape format cookies file — skipping it to prevent download failure.", path)
         else:
             log.warning("youtube_cookies_file not found: %s", path)
     browser = (cookies_from_browser or "").strip()

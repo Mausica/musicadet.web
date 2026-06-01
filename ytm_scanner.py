@@ -200,41 +200,58 @@ def get_top_songs_ordered(artist_name: str, limit: int) -> List[Dict]:
         results = ytm.search(search_name, filter="artists", limit=5)
     except Exception as e:
         log.warning("YTMusic artist search failed for %s: %s", artist_name, e)
-        return []
-
-    if not results:
-        return []
+        results = []
 
     browse_id = None
-    for r in results:
-        candidate = r.get("artist", r.get("name", ""))
-        if _artist_matches(search_name, candidate) or _artist_matches(artist_name, candidate):
-            browse_id = r.get("browseId")
-            break
-    if not browse_id:
-        browse_id = results[0].get("browseId")
-    if not browse_id:
-        return []
+    if results:
+        for r in results:
+            candidate = r.get("artist", r.get("name", ""))
+            if _artist_matches(search_name, candidate) or _artist_matches(artist_name, candidate):
+                browse_id = r.get("browseId")
+                break
+        if not browse_id:
+            browse_id = results[0].get("browseId")
 
-    try:
-        artist_data = ytm.get_artist(browse_id)
-    except Exception as e:
-        log.warning("get_artist failed for %s: %s", artist_name, e)
-        return []
-
-    songs_section = artist_data.get("songs") or {}
-    playlist_id = songs_section.get("browseId")
-    raw_tracks: List[Dict] = []
-
-    if playlist_id:
+    artist_data = None
+    if browse_id:
         try:
-            playlist = ytm.get_playlist(playlist_id, limit=limit)
-            raw_tracks = playlist.get("tracks") or []
+            artist_data = ytm.get_artist(browse_id)
         except Exception as e:
-            log.warning("get_playlist top songs failed for %s: %s", artist_name, e)
+            log.warning("get_artist failed for %s (ID: %s): %s", artist_name, browse_id, e)
 
+    raw_tracks: List[Dict] = []
+    if artist_data:
+        songs_section = artist_data.get("songs") or {}
+        playlist_id = songs_section.get("browseId")
+
+        if playlist_id:
+            try:
+                playlist = ytm.get_playlist(playlist_id, limit=limit)
+                raw_tracks = playlist.get("tracks") or []
+            except Exception as e:
+                log.warning("get_playlist top songs failed for %s: %s", artist_name, e)
+
+        if not raw_tracks:
+            raw_tracks = songs_section.get("results") or []
+
+    # Fallback to direct song search if we couldn't get any top songs from the artist page
     if not raw_tracks:
-        raw_tracks = songs_section.get("results") or []
+        log.info("No artist page tracks found for %s. Trying direct song search fallback...", artist_name)
+        try:
+            search_songs = ytm.search(search_name, filter="songs", limit=max(limit * 2, 20))
+            # Filter search_songs to make sure we only include tracks matching the artist name
+            for s in search_songs:
+                artists = s.get("artists", [])
+                matched_art = False
+                for a in artists:
+                    a_name = a.get("name", "") if isinstance(a, dict) else str(a)
+                    if _artist_matches(search_name, a_name) or _artist_matches(artist_name, a_name):
+                        matched_art = True
+                        break
+                if matched_art:
+                    raw_tracks.append(s)
+        except Exception as e:
+            log.warning("YTMusic direct song search fallback failed for %s: %s", artist_name, e)
 
     ordered: List[Dict] = []
     seen_norm: set[str] = set()
@@ -264,3 +281,4 @@ def get_top_songs_ordered(artist_name: str, limit: int) -> List[Dict]:
             artist_name, len(ordered), limit,
         )
     return ordered
+

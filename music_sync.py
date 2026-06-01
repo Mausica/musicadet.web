@@ -1735,24 +1735,32 @@ def _apply_artist_download_cap(
     if len(pending_songs) <= remaining:
         return {ps["spotify_id"] for ps in pending_songs}, True
 
-    top_tracks = _get_top_tracks_ordered(name, remaining)
+    top_tracks = _get_top_tracks_ordered(name, limit)
     if top_tracks:
+        # Fetch all songs for this artist (downloaded + pending) to align ranking perfectly
+        all_songs = db_conn.execute(
+            """
+            SELECT s.spotify_id, s.title, s.status, s.youtube_url
+            FROM songs s
+            WHERE s.artist_id = ?
+            """,
+            (sid,),
+        ).fetchall()
+
+        keep, _ = _rank_songs_for_cap(list(all_songs), top_tracks, limit)
+
+        # Select pending songs from the ranked keep list up to the remaining quota
         matched = []
-        used = set()
-        for entry in top_tracks:
+        for s in keep:
             if len(matched) >= remaining:
                 break
-            for ps in pending_songs:
-                if ps["spotify_id"] in used:
-                    continue
-                if _song_matches_top_entry(ps, entry):
-                    matched.append(ps)
-                    used.add(ps["spotify_id"])
-                    break
-        keep_ids = {ps["spotify_id"] for ps in matched}
+            if s["status"] != "downloaded":
+                matched.append(s)
+
+        keep_ids = {s["spotify_id"] for s in matched}
         skip_ids = [ps["spotify_id"] for ps in pending_songs if ps["spotify_id"] not in keep_ids]
         log.info(
-            "  -> %s: %d/%d YT top songs matched pending; will download %d (cap %d, %d on disk)",
+            "  -> %s: %d/%d YT top songs matched; will download %d (cap %d, %d on disk)",
             name, len(matched), len(top_tracks), len(keep_ids), limit, downloaded,
         )
     else:
