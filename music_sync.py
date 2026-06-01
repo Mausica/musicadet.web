@@ -1319,8 +1319,8 @@ def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
         import ytm_scanner
         
         # Check if we have cached YouTube Music artist data
-        cached_ytmusic_name = artist_row.get("ytmusic_name")
-        cached_ytmusic_browse_id = artist_row.get("ytmusic_browse_id")
+        cached_ytmusic_name = artist_row["ytmusic_name"]
+        cached_ytmusic_browse_id = artist_row["ytmusic_browse_id"]
         
         if cached_ytmusic_browse_id:
             log.info("  → Using cached YT Music ID for %s", name)
@@ -1443,7 +1443,7 @@ def cmd_list(args):
     total = len(rows)
     synced = sum(1 for r in rows if r["sync_done"])
     disabled = sum(1 for r in rows if not r["active"])
-    manually_mapped = sum(1 for r in rows if r.get("ytmusic_status") == "manually_mapped")
+    manually_mapped = sum(1 for r in rows if r["ytmusic_status"] == "manually_mapped")
 
     print(f"\n{'Artist':<42} {'Source':<15} {'YTM Status':<18} {'Sync':>4}  Last synced")
     print("─" * 105)
@@ -1451,7 +1451,7 @@ def cmd_list(args):
         done = "✓" if r["sync_done"] else "·"
         last = (r["last_synced"] or "never")[:10]
         flag = " [off]" if not r["active"] else ""
-        status = r.get("ytmusic_status") or "—"
+        status = r["ytmusic_status"] or "—"
         status_icon = "🔧" if status == "manually_mapped" else ("⚠️" if status == "not_found" else " ")
         print(f"{status_icon} {r['name']:<40} {r['source']:<15} {status:<18} {done:>4}  {last}{flag}")
 
@@ -1638,7 +1638,7 @@ def _sync_artist_with_ytdlp(
             (sid,),
         ).fetchone()
     
-    if artist_row and artist_row.get("ytmusic_status") == "manually_mapped":
+    if artist_row and artist_row["ytmusic_status"] == "manually_mapped":
         log.info("[%d/%d] %s — marked as manually mapped, skipping download phase", index, total, name)
         with db_connect() as db:
             db.execute(
