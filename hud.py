@@ -331,20 +331,11 @@ def api_stats():
         p_active = conn.execute("SELECT COUNT(*) FROM playlists WHERE active=1").fetchone()[0]
         albums_total = conn.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
         albums_downloaded = conn.execute("SELECT COUNT(*) FROM albums WHERE downloaded_count >= track_count AND track_count > 0").fetchone()[0]
-        songs_downloaded = conn.execute("SELECT COUNT(*) FROM songs WHERE status='downloaded'").fetchone()[0]
-        
-        # Calculate capped songs pending based on per-artist and global limits
-        art_rows = conn.execute("SELECT max_downloads, (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id AND status='downloaded') as dl, (SELECT COUNT(*) FROM songs WHERE artist_id=a.spotify_id AND status!='downloaded') as pd FROM artists a WHERE a.active=1").fetchall()
-        global_max = int(load_cfg().get("max_downloads_per_artist", 0))
-        songs_pending = 0
-        for r in art_rows:
-            max_dl = r["max_downloads"] if r["max_downloads"] is not None else global_max
-            dl, pd = r["dl"], r["pd"]
-            if max_dl > 0:
-                allowed = max(0, max_dl - dl)
-                songs_pending += min(pd, allowed)
-            else:
-                songs_pending += pd
+        cap = _aggregate_capped_song_stats(conn, active_only=True)
+        songs_downloaded = cap["songs_downloaded"]
+        songs_pending = cap["songs_pending"]
+        songs_target = cap["songs_target"]
+        songs_catalog = cap["songs_catalog"]
         songs_failed = conn.execute("SELECT COUNT(*) FROM songs WHERE status='failed'").fetchone()[0]
         songs_missing_cover = conn.execute(
             "SELECT COUNT(*) FROM songs WHERE status='downloaded' AND has_cover=0"
@@ -357,7 +348,10 @@ def api_stats():
         "artists_pending": a_active - a_synced,
         "playlists_total": p_total, "playlists_active": p_active,
         "albums_total": albums_total, "albums_downloaded": albums_downloaded,
-        "songs_downloaded": songs_downloaded, "songs_pending": songs_pending,
+        "songs_downloaded": songs_downloaded,
+        "songs_pending": songs_pending,
+        "songs_target": songs_target,
+        "songs_catalog": songs_catalog,
         "songs_failed": songs_failed,
         "songs_missing_cover": songs_missing_cover,
         "songs_missing_lyrics": songs_missing_lyrics,
@@ -432,15 +426,60 @@ def _artist_filters(q: str, status: str) -> tuple[list[str], list]:
     return where, params
 
 
+def _effective_artist_limit(artist_max_downloads, global_max: int) -> int:
+    if artist_max_downloads is not None:
+        return int(artist_max_downloads or 0)
+    return int(global_max or 0)
+
+
+def _aggregate_capped_song_stats(conn, *, active_only: bool = True) -> dict:
+    """Totals for dashboard: target = sum of per-artist caps (or full catalog if unlimited)."""
+    global_max = int(load_cfg().get("max_downloads_per_artist", 0))
+    clause = "WHERE a.active=1" if active_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT a.max_downloads,
+               COALESCE(SUM(CASE WHEN s.status='downloaded' THEN 1 ELSE 0 END), 0) AS dl,
+               COALESCE(COUNT(s.spotify_id), 0) AS catalog
+        FROM artists a
+        LEFT JOIN songs s ON s.artist_id = a.spotify_id
+        {clause}
+        GROUP BY a.spotify_id, a.max_downloads
+        """
+    ).fetchall()
+
+    downloaded = pending = target = catalog = 0
+    for r in rows:
+        dl = int(r["dl"])
+        cat = int(r["catalog"])
+        cap = _effective_artist_limit(r["max_downloads"], global_max)
+        catalog += cat
+        if cap > 0:
+            target += cap
+            downloaded += min(dl, cap)
+            pending += min(max(0, cap - dl), max(0, cat - dl))
+        else:
+            target += cat
+            downloaded += dl
+            pending += max(0, cat - dl)
+
+    return {
+        "songs_downloaded": downloaded,
+        "songs_target": target,
+        "songs_pending": pending,
+        "songs_catalog": catalog,
+    }
+
+
 def _cap_artist_song_counts(rows: list[dict]) -> None:
+    """Per-artist SONGS column: downloaded / cap (not raw catalog size)."""
     global_max = int(load_cfg().get("max_downloads_per_artist", 0))
     for r in rows:
-        max_dl = r["max_downloads"] if r["max_downloads"] is not None else global_max
+        max_dl = _effective_artist_limit(r["max_downloads"], global_max)
         if max_dl > 0:
-            pd = r["songs_total"] - r["songs_dl"]
-            allowed_pending = max(0, max_dl - r["songs_dl"])
-            capped_pending = min(pd, allowed_pending)
-            r["songs_total"] = r["songs_dl"] + capped_pending
+            dl = min(int(r.get("songs_dl") or 0), max_dl)
+            r["songs_dl"] = dl
+            r["songs_total"] = max_dl
 
 
 @app.get("/api/artists/names")
@@ -573,6 +612,7 @@ def api_db_summary():
         incomplete = one(
             "SELECT COUNT(*) FROM albums WHERE track_count > 0 AND downloaded_count < track_count"
         )
+        cap = _aggregate_capped_song_stats(conn, active_only=True)
         return {
             "artists_total": one("SELECT COUNT(*) FROM artists WHERE active >= 0"),
             "artists_active": one("SELECT COUNT(*) FROM artists WHERE active = 1"),
@@ -583,8 +623,10 @@ def api_db_summary():
             "artists_romanian": one("SELECT COUNT(*) FROM artists WHERE is_romanian = 1"),
             "albums_total": one("SELECT COUNT(*) FROM albums"),
             "albums_incomplete": incomplete,
-            "songs_total": one("SELECT COUNT(*) FROM songs"),
-            "songs_pending": one("SELECT COUNT(*) FROM songs WHERE status = 'pending'"),
+            "songs_total": cap["songs_target"],
+            "songs_downloaded": cap["songs_downloaded"],
+            "songs_pending": cap["songs_pending"],
+            "songs_catalog": cap["songs_catalog"],
             "songs_failed": one("SELECT COUNT(*) FROM songs WHERE status = 'failed'"),
             "playlists_active": one("SELECT COUNT(*) FROM playlists WHERE active = 1"),
         }
@@ -2157,7 +2199,7 @@ HTML = r"""<!doctype html>
       <div class="table-scroll artist-table-wrap">
       <table class="table artists-table"><thead><tr>
         <th class="chk-col sel-col hide"><input type="checkbox" class="row-chk" id="artPickPage" title="Page" onchange="pickPage(this.checked)"/></th>
-        <th>Artist</th><th>Albums</th><th>Songs</th><th>Status</th><th>Actions</th></tr></thead>
+        <th>Artist</th><th>Albums</th><th title="Downloaded / limit (top viewed cap)">Songs</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody id="artistRows"></tbody></table>
       </div>
       <div class="pager">
@@ -2373,11 +2415,13 @@ document.querySelectorAll('header nav button').forEach(b=>b.onclick=()=>{
 async function loadStats(){
   let s;
   try{s=await api('/api/stats');}catch(e){toastErr('Dashboard: '+(e.message||e));return;}
-  const total_songs = s.songs_downloaded + s.songs_pending;
+  const target=s.songs_target??(s.songs_downloaded+s.songs_pending);
+  const songsSub=`${s.songs_downloaded} / ${target} downloaded`+
+    (s.songs_catalog&&s.songs_catalog>target?` · ${s.songs_pending} to fetch`:'');
   const cards = [
     { title: 'Artists', main: s.artists_total, sub: `${s.artists_synced} / ${s.artists_total} synced` },
     { title: 'Albums', main: s.albums_total, sub: `${s.albums_downloaded} / ${s.albums_total} fully downloaded` },
-    { title: 'Songs', main: total_songs, sub: `${s.songs_downloaded} / ${total_songs} downloaded` }
+    { title: 'Songs', main: target, sub: songsSub }
   ];
   $('#statCards').innerHTML=cards.map(c=>`
     <div class="card stat">
@@ -2522,7 +2566,9 @@ function artistsBaseUrl(){
 async function loadDbSummary(){
   try{
     const s=await api('/api/db/summary');
-    $('#dbSummary').innerHTML=`<b>${s.artists_active}</b> on · <b>${s.artists_pending_sync}</b> pending · <b>${s.artists_romanian}</b> ro · <b>${s.albums_incomplete}</b> albums left`;
+    const songs=`${s.songs_downloaded}/${s.songs_total} songs`+
+      (s.songs_catalog&&s.songs_catalog>s.songs_total?` (${s.songs_catalog} in catalog)`:'');
+    $('#dbSummary').innerHTML=`<b>${s.artists_active}</b> on · <b>${s.artists_pending_sync}</b> pending sync · ${songs} · <b>${s.artists_romanian}</b> ro · <b>${s.albums_incomplete}</b> albums incomplete`;
   }catch(e){$('#dbSummary').textContent='';toastErr('Summary: '+(e.message||e));}
 }
 function syncSelBar(){
@@ -2906,6 +2952,10 @@ function connectWS(){
     out.appendChild(d);
     while(out.childNodes.length>1200)out.removeChild(out.firstChild);
     if(autoscroll)out.scrollTop=out.scrollHeight;
+    if(/complete|done —|prune complete|download pending complete/i.test(text)){
+      loadStats();
+      if(!$('#artists').classList.contains('hide')){loadDbSummary();loadArtists();}
+    }
   };
 }
 $('#consoleOut').addEventListener('scroll',e=>{

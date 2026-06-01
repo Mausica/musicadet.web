@@ -166,3 +166,101 @@ def scan_artist(artist_name: str, ytmusic_instance=None) -> List[Dict]:
              len({s["album_id"] for s in songs}),
              artist_name)
     return songs
+
+
+def _strip_topic_suffix(name: str) -> str:
+    n = (name or "").strip()
+    for suffix in (" - Topic", " Topic", " - topic"):
+        if n.endswith(suffix):
+            n = n[: -len(suffix)].strip()
+    return n
+
+
+def _normalize_track_title(title: str) -> str:
+    s = (title or "").lower()
+    s = re.sub(r'\([^)]*\)', '', s)
+    s = re.sub(r'\[[^\]]*\]', '', s)
+    s = re.split(r'\b(feat|featuring|ft|with)\b', s)[0]
+    return re.sub(r'[^a-z0-9]', '', s).strip()
+
+
+def get_top_songs_ordered(artist_name: str, limit: int) -> List[Dict]:
+    """
+    Artist's top songs by views (full playlist, not the 5-song preview).
+
+    Returns [{"title", "videoId", "norm"}, ...] in popularity order.
+    """
+    if YTMusic is None or limit <= 0:
+        return []
+
+    search_name = _strip_topic_suffix(artist_name)
+    ytm = YTMusic()
+
+    try:
+        results = ytm.search(search_name, filter="artists", limit=5)
+    except Exception as e:
+        log.warning("YTMusic artist search failed for %s: %s", artist_name, e)
+        return []
+
+    if not results:
+        return []
+
+    browse_id = None
+    for r in results:
+        candidate = r.get("artist", r.get("name", ""))
+        if _artist_matches(search_name, candidate) or _artist_matches(artist_name, candidate):
+            browse_id = r.get("browseId")
+            break
+    if not browse_id:
+        browse_id = results[0].get("browseId")
+    if not browse_id:
+        return []
+
+    try:
+        artist_data = ytm.get_artist(browse_id)
+    except Exception as e:
+        log.warning("get_artist failed for %s: %s", artist_name, e)
+        return []
+
+    songs_section = artist_data.get("songs") or {}
+    playlist_id = songs_section.get("browseId")
+    raw_tracks: List[Dict] = []
+
+    if playlist_id:
+        try:
+            playlist = ytm.get_playlist(playlist_id, limit=limit)
+            raw_tracks = playlist.get("tracks") or []
+        except Exception as e:
+            log.warning("get_playlist top songs failed for %s: %s", artist_name, e)
+
+    if not raw_tracks:
+        raw_tracks = songs_section.get("results") or []
+
+    ordered: List[Dict] = []
+    seen_norm: set[str] = set()
+    seen_vid: set[str] = set()
+
+    for track in raw_tracks:
+        if len(ordered) >= limit:
+            break
+        title = track.get("title") or ""
+        vid = track.get("videoId") or track.get("id")
+        norm = _normalize_track_title(title)
+        if not norm and not vid:
+            continue
+        if vid and vid in seen_vid:
+            continue
+        if norm and norm in seen_norm:
+            continue
+        if vid:
+            seen_vid.add(vid)
+        if norm:
+            seen_norm.add(norm)
+        ordered.append({"title": title, "videoId": vid, "norm": norm})
+
+    if ordered:
+        log.debug(
+            "Top songs for %s: %d from YT Music (requested %d)",
+            artist_name, len(ordered), limit,
+        )
+    return ordered

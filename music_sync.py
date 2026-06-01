@@ -498,11 +498,41 @@ def _normalize_artist_name(name: str) -> str:
 
 def _normalize_song_title(title: str) -> str:
     s = title.lower()
-    # Remove featuring/feat/ft
-    s = re.split(r'\b(feat|featuring|ft)\b', s)[0]
-    # Remove extra punctuation/spaces
+    s = re.sub(r'\([^)]*\)', '', s)
+    s = re.sub(r'\[[^\]]*\]', '', s)
+    s = re.split(r'\b(feat|featuring|ft|with)\b', s)[0]
     s = re.sub(r'[^a-z0-9]', '', s)
     return s.strip()
+
+
+def _clean_artist_name_for_ytm(artist_name: str) -> str:
+    """Strip auto-channel suffixes so YT Music search finds the real artist."""
+    n = (artist_name or "").strip()
+    for suffix in (" - Topic", " Topic", " - topic"):
+        if n.endswith(suffix):
+            n = n[: -len(suffix)].strip()
+    return n or artist_name
+
+
+def _song_youtube_video_id(row) -> Optional[str]:
+    sid = row["spotify_id"] if hasattr(row, "keys") else row.get("spotify_id", "")
+    if sid and len(sid) == 11 and ":" not in sid:
+        return sid
+    url = row["youtube_url"] if hasattr(row, "keys") else row.get("youtube_url")
+    if url:
+        m = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', str(url))
+        if m:
+            return m.group(1)
+    return None
+
+
+def _song_matches_top_entry(row, entry: dict) -> bool:
+    vid = entry.get("videoId")
+    if vid and _song_youtube_video_id(row) == vid:
+        return True
+    norm_row = _normalize_song_title(row["title"])
+    norm_top = entry.get("norm") or _normalize_song_title(entry.get("title", ""))
+    return bool(norm_row and norm_top and norm_row == norm_top)
 
 
 def _merge_folders(src: Path, dst: Path):
@@ -1696,21 +1726,25 @@ def _apply_artist_download_cap(
     if len(pending_songs) <= remaining:
         return {ps["spotify_id"] for ps in pending_songs}, True
 
-    top_ordered = _get_top_song_titles_ordered(name, remaining)
-    if top_ordered:
-        by_norm = {_normalize_song_title(ps["title"]): ps for ps in pending_songs}
+    top_tracks = _get_top_tracks_ordered(name, remaining)
+    if top_tracks:
         matched = []
-        for norm in top_ordered:
+        used = set()
+        for entry in top_tracks:
             if len(matched) >= remaining:
                 break
-            ps = by_norm.get(norm)
-            if ps:
-                matched.append(ps)
+            for ps in pending_songs:
+                if ps["spotify_id"] in used:
+                    continue
+                if _song_matches_top_entry(ps, entry):
+                    matched.append(ps)
+                    used.add(ps["spotify_id"])
+                    break
         keep_ids = {ps["spotify_id"] for ps in matched}
         skip_ids = [ps["spotify_id"] for ps in pending_songs if ps["spotify_id"] not in keep_ids]
         log.info(
-            "  -> %s: %d top-viewed match(es); will download %d (cap %d, %d already on disk, %d pending total)",
-            name, len(matched), len(keep_ids), limit, downloaded, len(pending_songs),
+            "  -> %s: %d/%d YT top songs matched pending; will download %d (cap %d, %d on disk)",
+            name, len(matched), len(top_tracks), len(keep_ids), limit, downloaded,
         )
     else:
         keep_ids = set()
@@ -1763,62 +1797,45 @@ def _make_ytdlp_downloader(music_dir: Path, fmt: str) -> "custom_dl.YtDlpDownloa
     )
 
 
+def _get_top_tracks_ordered(artist_name: str, limit: int) -> list[dict]:
+    """
+    Full top-songs playlist from YT Music (not just the 5-song preview on get_artist).
+    Each entry: {title, videoId, norm}.
+    """
+    import ytm_scanner
+    return ytm_scanner.get_top_songs_ordered(artist_name, limit)
+
+
 def _get_top_song_titles_ordered(artist_name: str, limit: int) -> list[str]:
-    """YouTube Music artist page songs section, most-viewed first."""
-    try:
-        from ytmusicapi import YTMusic
-        import ytm_scanner
-        ytm = YTMusic()
-        results = ytm.search(artist_name, filter="artists", limit=3)
-        if not results:
-            return []
-
-        browse_id = None
-        for r in results:
-            if ytm_scanner._artist_matches(artist_name, r.get("artist", "")):
-                browse_id = r["browseId"]
-                break
-        if not browse_id:
-            browse_id = results[0]["browseId"]
-
-        artist_data = ytm.get_artist(browse_id)
-        ordered: list[str] = []
-        if "songs" in artist_data and "results" in artist_data["songs"]:
-            for song in artist_data["songs"]["results"][:limit]:
-                norm = _normalize_song_title(song.get("title", ""))
-                if norm and norm not in ordered:
-                    ordered.append(norm)
-        return ordered
-    except Exception as e:
-        log.warning("Failed to get top songs for %s: %s", artist_name, e)
-        return []
+    return [
+        t["norm"]
+        for t in _get_top_tracks_ordered(artist_name, limit)
+        if t.get("norm")
+    ]
 
 
 def _get_top_songs_for_artist(artist_name: str, limit: int) -> set:
     return set(_get_top_song_titles_ordered(artist_name, limit))
 
 
-def _rank_songs_for_cap(songs: list, top_ordered: list[str], limit: int) -> tuple[list, list]:
-    """Keep only tracks that match YT Music top-viewed list (in view order), up to limit."""
+def _rank_songs_for_cap(songs: list, top_tracks: list[dict], limit: int) -> tuple[list, list]:
+    """Keep library rows matching YT top-songs playlist order (videoId + title), up to limit."""
     if limit <= 0 or not songs:
         return list(songs), []
 
-    if not top_ordered:
+    if not top_tracks:
         return list(songs), []
-
-    by_title: dict[str, list] = {}
-    for s in songs:
-        key = _normalize_song_title(s["title"])
-        by_title.setdefault(key, []).append(s)
 
     keep: list = []
     used_ids: set[str] = set()
 
-    for norm in top_ordered:
+    for entry in top_tracks:
         if len(keep) >= limit:
             break
-        for row in by_title.get(norm, []):
-            if row["spotify_id"] not in used_ids:
+        for row in songs:
+            if row["spotify_id"] in used_ids:
+                continue
+            if _song_matches_top_entry(row, entry):
                 keep.append(row)
                 used_ids.add(row["spotify_id"])
                 break
@@ -1914,13 +1931,13 @@ def prune_artist_to_cap(
         stats["kept"] = len(downloaded)
         return stats
 
-    top_ordered = _get_top_song_titles_ordered(name, limit)
-    if not top_ordered:
-        log.warning("  %s: no YT Music top list — cap not applied (release year is never used)", name)
+    top_tracks = _get_top_tracks_ordered(name, limit)
+    if not top_tracks:
+        log.warning("  %s: no YT Music top list — cap not applied", name)
         stats["kept"] = len(rows)
         return stats
 
-    keep, drop = _rank_songs_for_cap(list(rows), top_ordered, limit)
+    keep, drop = _rank_songs_for_cap(list(rows), top_tracks, limit)
     drop_ids = {s["spotify_id"] for s in drop}
     if not drop_ids:
         stats["kept"] = len(keep)
@@ -1930,8 +1947,9 @@ def prune_artist_to_cap(
     kept_rels: set[str] = set()
 
     log.info(
-        "  %s: keeping %d / %d tracks (top %d by YT Music views only)%s",
-        name, len(keep), len(rows), limit, " [dry-run]" if dry_run else "",
+        "  %s: cap %d — %d YT top songs, %d matched in library (of %d total)%s",
+        name, limit, len(top_tracks), len(keep), len(rows),
+        " [dry-run]" if dry_run else "",
     )
 
     for s in keep:
