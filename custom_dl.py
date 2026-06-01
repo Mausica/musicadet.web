@@ -64,6 +64,19 @@ def check_rate_limit() -> Optional[int]:
     return None
 
 
+def _set_rate_limited_if_needed(err_msg: str) -> bool:
+    """Mark the session rate-limited if the yt-dlp error indicates YouTube throttling."""
+    if not err_msg:
+        return False
+    msg = str(err_msg).lower()
+    if "rate-limited" in msg or "session has been rate-limited" in msg:
+        global RATE_LIMITED_UNTIL
+        RATE_LIMITED_UNTIL = time.time() + 3600  # 1 hour
+        log.error("    ✗ yt-dlp rate limit encountered, pausing downloads for 1 hour")
+        return True
+    return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Filename sanitation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -443,6 +456,9 @@ class YtDlpDownloader:
                     entry = info["entries"][0]
                     return entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry['id']}"
         except Exception as e:
+            err_msg = str(e)
+            if _set_rate_limited_if_needed(err_msg):
+                return None
             log.debug("Search failed for '%s': %s", query, e)
         return None
 
@@ -577,6 +593,8 @@ class YtDlpDownloader:
                         # Fall back: use it as a single video
                         playlist_url = url
         except Exception as e:
+            err_msg = str(e)
+            _set_rate_limited_if_needed(err_msg)
             log.debug("Album search error: %s", e)
 
         if not playlist_url:

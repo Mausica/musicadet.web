@@ -429,6 +429,12 @@ def _artist_filters(q: str, status: str) -> tuple[list[str], list]:
         where.append("a.active=1 AND a.sync_done=0")
     elif status == "synced":
         where.append("a.sync_done=1")
+    elif status == "ytok":
+        where.append("a.ytmusic_status='found'")
+    elif status == "ytmissing":
+        where.append("a.ytmusic_status='not_found'")
+    elif status == "ytunknown":
+        where.append("(a.ytmusic_status IS NULL OR a.ytmusic_status='unknown')")
     if q2 := {"romanian": "a.is_romanian=1", "international": "a.is_romanian=0"}.get(status):
         where.append(q2)
     return where, params
@@ -2256,6 +2262,9 @@ HTML = r"""<!doctype html>
           <button type="button" class="chip active" data-value="all">All</button>
           <button type="button" class="chip chip-ro" data-value="romanian">Romanian</button>
           <button type="button" class="chip" data-value="international">International</button>
+          <button type="button" class="chip" data-value="ytok">YT OK</button>
+          <button type="button" class="chip" data-value="ytunknown">YT unknown</button>
+          <button type="button" class="chip" data-value="ytmissing">YT missing</button>
           <button type="button" class="chip" data-value="active">Active</button>
           <button type="button" class="chip" data-value="pending">Pending</button>
           <button type="button" class="chip" data-value="synced">Synced</button>
