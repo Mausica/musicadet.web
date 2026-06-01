@@ -483,7 +483,14 @@ class YtDlpDownloader:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([yt_url])
         except Exception as e:
-            log.error("    ✗ yt-dlp error for %s: %s", title, e)
+            # Detect YouTube rate limiting
+            err_msg = str(e).lower()
+            if "rate-limited" in err_msg or "video unavailable" in err_msg:
+                import time
+                custom_dl.RATE_LIMITED_UNTIL = time.time() + 3600  # 1 hour
+                log.error("    ✗ yt-dlp rate limit encountered, pausing downloads for 1 hour")
+            else:
+                log.error("    ✗ yt-dlp error for %s: %s", title, e)
             return None
 
         # yt-dlp might have written a slightly different extension; locate the file

@@ -241,15 +241,48 @@ def get_top_songs_ordered(artist_name: str, limit: int) -> List[Dict]:
             search_songs = ytm.search(search_name, filter="songs", limit=max(limit * 2, 20))
             # Filter search_songs to make sure we only include tracks matching the artist name
             for s in search_songs:
-                artists = s.get("artists", [])
+                names_to_check = []
+                
+                # Check "artists" (list of dicts, list of strings, or string)
+                artists_val = s.get("artists")
+                if isinstance(artists_val, list):
+                    for a in artists_val:
+                        if isinstance(a, dict):
+                            names_to_check.append(a.get("name", ""))
+                        elif isinstance(a, str):
+                            names_to_check.append(a)
+                elif isinstance(artists_val, str):
+                    names_to_check.append(artists_val)
+                elif isinstance(artists_val, dict):
+                    names_to_check.append(artists_val.get("name", ""))
+
+                # Check "artist" (string, dict, list of dicts, or list of strings)
+                artist_val = s.get("artist")
+                if isinstance(artist_val, list):
+                    for a in artist_val:
+                        if isinstance(a, dict):
+                            names_to_check.append(a.get("name", ""))
+                        elif isinstance(a, str):
+                            names_to_check.append(a)
+                elif isinstance(artist_val, str):
+                    names_to_check.append(artist_val)
+                elif isinstance(artist_val, dict):
+                    names_to_check.append(artist_val.get("name", ""))
+
                 matched_art = False
-                for a in artists:
-                    a_name = a.get("name", "") if isinstance(a, dict) else str(a)
+                for a_name in names_to_check:
+                    if not a_name:
+                        continue
                     if _artist_matches(search_name, a_name) or _artist_matches(artist_name, a_name):
                         matched_art = True
                         break
                 if matched_art:
                     raw_tracks.append(s)
+
+            # Absolute fallback: if filtering yielded 0 tracks, accept the top search results directly!
+            if not raw_tracks and search_songs:
+                log.info("Direct song search filtering yielded 0 tracks for %s. Falling back to accepting top search results directly.", artist_name)
+                raw_tracks = search_songs[:limit]
         except Exception as e:
             log.warning("YTMusic direct song search fallback failed for %s: %s", artist_name, e)
 
