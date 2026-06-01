@@ -1826,6 +1826,7 @@ HTML = r"""<!doctype html>
   .pill.off { color: var(--muted); }
   .pill.done { color: var(--txt); }
   .pill.pend { color: var(--warning); border-color: #422006; }
+  .pill.warn { color: var(--warning); border-color: #eab308; }
   .meta-ok { color: var(--success); }
   .meta-no { color: var(--muted); opacity: 0.5; }
   h2 {
@@ -2485,6 +2486,21 @@ async function api(path,opts={},signal){
 }
 function esc(s){return (s==null?'':s).toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function artistById(id){return curArt.find(a=>a.spotify_id===id);}
+function artistYtMusicStatusHtml(r){
+  const status = (r.ytmusic_status||'unknown').toLowerCase();
+  const name = r.ytmusic_name || r.name || '';
+  const notes = r.ytmusic_notes ? ` — ${r.ytmusic_notes}` : '';
+  if(status==='found'){
+    return `<span class="pill done" title="YT Music matched: ${esc(name)}${esc(notes)}">YT OK</span>`;
+  }
+  if(status==='manually_mapped'){
+    return `<span class="pill on" title="Manually mapped to ${esc(name)}${esc(notes)}">YT fixed</span>`;
+  }
+  if(status==='not_found'){
+    return `<span class="pill warn" title="YT Music not found${esc(notes)}">YT missing</span>`;
+  }
+  return `<span class="pill pend" title="YT Music unknown${esc(notes)}">YT unknown</span>`;
+}
 function flashArtistRow(id){
   const sel=`[data-aid="${CSS.escape(id)}"]`;
   document.querySelectorAll(`tr${sel}, .artist-card${sel}`).forEach(el=>{
@@ -2753,8 +2769,9 @@ function artistRowHtml(r){
   const rowCls=r.is_romanian?'row-ro':'';
   const picked=selectedArtists.has(r.spotify_id);
   const chk=selectMode?`<td class="chk-col sel-col"><input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/></td>`:'';
-  return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td><button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync}</td>
+  return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td><button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync} ${artistYtMusicStatusHtml(r)}</td>
     <td class="td-actions"><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${artistLimitSelectHtml(r)}
+      <button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping">YT</button>
       <button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
       <button type="button" class="btn danger sm" data-del title="Remove from database. Shift+click: delete files.">×</button></div></td></tr>`;
 }
@@ -2769,9 +2786,9 @@ function artistCardHtml(r){
   const chk=selectMode?`<input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/>`:'';
   return `<div class="artist-card ${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">
     <div class="artist-card-head">${chk}<button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button><span>${esc(r.name)}</span></div>
-    <div class="artist-card-meta"><span>${r.album_count||0} albums</span><span>${prog} songs</span>${act}${sync}</div>
+    <div class="artist-card-meta"><span>${r.album_count||0} albums</span><span>${prog} songs</span>${act}${sync} ${artistYtMusicStatusHtml(r)}</div>
     <div class="artist-card-actions">${artistLimitSelectHtml(r)}
-      <div class="btn-row"><button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
+      <div class="btn-row"><button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping">YT</button><button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
       <button type="button" class="btn danger sm" data-del title="Remove. Shift+click: delete files.">Remove</button></div></div></div>`;
 }
 function renderArtists(){
@@ -2796,6 +2813,7 @@ function onArtistListClick(e){
   if(!root)return;
   const id=root.dataset.aid;
   if(e.target.closest('button[data-ro]')){setRomanian(id,parseInt(e.target.closest('button[data-ro]').dataset.val,10));return;}
+  if(e.target.closest('button[data-fix]')){fixArtistYtMusic(id);return;}
   if(e.target.closest('button[data-toggle]')){toggleArtist(id);return;}
   if(e.target.closest('button[data-del]')){delArtist(id,e);return;}
 }
@@ -2856,6 +2874,32 @@ async function setArtistLimit(id, limit){
     patchArtistLimit(id,r.max_downloads);
     renderArtists();
   }catch(e){patchArtistLimit(id,prev);renderArtists();toastErr(e.message||'Limit save failed');}
+}
+async function fixArtistYtMusic(id){
+  const a=artistById(id);if(!a)return;
+  const currentStatus=a.ytmusic_status||'unknown';
+  const currentName=a.ytmusic_name||a.name||'';
+  const name=prompt(`Enter YouTube Music artist name for "${a.name}" (leave blank to mark not found):`, currentName);
+  if(name===null) return;
+  const trimmed=name.trim();
+  let status='manually_mapped';
+  if(!trimmed){
+    if(!confirm(`Mark "${a.name}" as not found on YouTube Music?`)) return;
+    status='not_found';
+  }
+  const body={status};
+  if(trimmed) body.ytmusic_name = trimmed;
+  try{
+    const r=await api(artistUrl(id,'ytmusic'),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body),
+    });
+    a.ytmusic_status = r.status;
+    if(r.ytmusic_name) a.ytmusic_name = r.ytmusic_name;
+    renderArtists(); flashArtistRow(id);
+    toast(`YT mapping updated: ${r.status}`);
+  }catch(e){toastErr(e.message||'YT mapping update failed');}
 }
 async function delArtist(id,ev){
   const a=artistById(id);

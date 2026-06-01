@@ -1361,7 +1361,10 @@ def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
     with db_connect() as db:
         new_albums, new_songs = _upsert_artist_catalog(db, sid, songs)
         db.execute(
-            "UPDATE artists SET albums_scanned_at=datetime('now') WHERE spotify_id=?",
+            "UPDATE artists SET albums_scanned_at=datetime('now'), "
+            "ytmusic_status=CASE WHEN ytmusic_status!='manually_mapped' THEN 'found' ELSE ytmusic_status END, "
+            "ytmusic_notes=CASE WHEN ytmusic_status!='manually_mapped' THEN NULL ELSE ytmusic_notes END "
+            "WHERE spotify_id=?",
             (sid,),
         )
 
@@ -1922,6 +1925,11 @@ def _apply_artist_download_cap(
             "  -> %s: no YT Music top list — skipping downloads (will not use release year)",
             name,
         )
+        db_conn.execute(
+            "UPDATE artists SET ytmusic_status='not_found', ytmusic_notes='No YT Music top list available for manual review' "
+            "WHERE spotify_id=? AND ytmusic_status!='manually_mapped'",
+            (sid,),
+        )
     if prune_skipped and skip_ids:
         db_conn.execute(
             f"DELETE FROM songs WHERE spotify_id IN ({','.join(['?'] * len(skip_ids))})",
@@ -2103,6 +2111,11 @@ def prune_artist_to_cap(
     top_tracks = _get_top_tracks_ordered(name, limit)
     if not top_tracks:
         log.warning("  %s: no YT Music top list — cap not applied", name)
+        db_conn.execute(
+            "UPDATE artists SET ytmusic_status='not_found', ytmusic_notes='No YT Music top list available for manual review' "
+            "WHERE spotify_id=? AND ytmusic_status!='manually_mapped'",
+            (sid,),
+        )
         stats["kept"] = len(rows)
         return stats
 
