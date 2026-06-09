@@ -141,7 +141,88 @@ def scan_artist_with_metadata(
     try:
         artist_data = ytm.get_artist(browse_id)
     except Exception as e:
-        log.warning("Failed to get artist data for %s: %s", artist_name, e)
+        log.warning("Failed to get artist data for %s: %s — attempting direct song-search fallback", artist_name, e)
+        # Fallback: try a broad direct song search and synthesize a catalog from matching tracks
+        try:
+            search_name = _strip_topic_suffix(artist_name)
+            search_songs = ytm.search(search_name, filter="songs", limit=200)
+        except Exception as e2:
+            log.warning("Direct song search fallback also failed for %s: %s", artist_name, e2)
+            return [], None, None
+
+        if not search_songs:
+            log.warning("Direct song search returned no results for %s", artist_name)
+            return [], None, None
+
+        # Build a minimal songs list from search results, matching by artist name
+        songs = []
+        albums_map: dict = {}
+        for s in search_songs:
+            # Extract artist names to verify match
+            names_to_check = []
+            artists_val = s.get("artists")
+            if isinstance(artists_val, list):
+                for a in artists_val:
+                    if isinstance(a, dict):
+                        names_to_check.append(a.get("name", ""))
+                    elif isinstance(a, str):
+                        names_to_check.append(a)
+            elif isinstance(artists_val, str):
+                names_to_check.append(artists_val)
+            elif isinstance(artists_val, dict):
+                names_to_check.append(artists_val.get("name", ""))
+
+            artist_val = s.get("artist")
+            if isinstance(artist_val, list):
+                for a in artist_val:
+                    if isinstance(a, dict):
+                        names_to_check.append(a.get("name", ""))
+                    elif isinstance(a, str):
+                        names_to_check.append(a)
+            elif isinstance(artist_val, str):
+                names_to_check.append(artist_val)
+            elif isinstance(artist_val, dict):
+                names_to_check.append(artist_val.get("name", ""))
+
+            matched = False
+            for n in names_to_check:
+                if n and _artist_matches(search_name, n) or _artist_matches(artist_name, n):
+                    matched = True
+                    break
+            if not matched:
+                continue
+
+            vid = s.get("videoId") or s.get("id") or s.get("resultId")
+            title = s.get("title") or s.get("name") or "Unknown"
+            album_info = s.get("album") or {}
+            album_name = album_info.get("name") if isinstance(album_info, dict) else (album_info or "Singles")
+            if not album_name:
+                album_name = "Singles"
+
+            # Create a synthetic album id per artist+album
+            key = f"search:{search_name}:{album_name}"
+            album_id = albums_map.get(key)
+            if not album_id:
+                album_id = f"search:{abs(hash(key))}"
+                albums_map[key] = album_id
+
+            song_dict = {
+                "id": vid or title,
+                "name": title,
+                "artist": artist_name,
+                "album_id": album_id,
+                "album_name": album_name,
+                "track_number": 0,
+                "year": None,
+                "url": f"https://music.youtube.com/watch?v={vid}" if vid else None,
+                "download_url": f"https://music.youtube.com/watch?v={vid}" if vid else None,
+            }
+            songs.append(song_dict)
+
+        if songs:
+            log.info("Direct-search fallback found %d tracks for %s", len(songs), artist_name)
+            # matched_name remains None (we didn't resolve a browse_id)
+            return songs, None, None
         return [], None, None
 
     songs: List[Dict] = []
