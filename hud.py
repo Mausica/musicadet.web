@@ -35,7 +35,7 @@ DEFAULTS = {
     "format": "opus",
     "bitrate": "320k",
     "threads": 4,
-    "output_template": "{artist}/{album}/{track-number} - {title}.{output-ext}",
+    "output_template": "{artist}/{album}/{title}.{output-ext}",
     "download_format": "original",
     "artist_scanner": "ytmusic",
     "playlist_save_timeout": 600,
@@ -727,6 +727,20 @@ def api_toggle_artist(spotify_id: str):
         new = 0 if row["active"] else 1
         conn.execute("UPDATE artists SET active=? WHERE spotify_id=?", (new, spotify_id))
     return {"ok": True, "active": new}
+
+
+@app.post("/api/artists/{spotify_id:path}/download")
+async def api_download_artist(spotify_id: str):
+    _db_ready()
+    spotify_id = _decode_artist_id(spotify_id)
+    with db() as conn:
+        row = conn.execute("SELECT name FROM artists WHERE spotify_id=?", (spotify_id,)).fetchone()
+        if not row:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        artist_name = row["name"]
+    label = f"Descărcare artist: {artist_name}"
+    asyncio.create_task(bus.run([sys.executable, str(PY_SCRIPT), "artists-sync", "--artist", spotify_id], label))
+    return {"ok": True, "label": label}
 
 
 @app.post("/api/artists/limit")
@@ -2159,6 +2173,173 @@ HTML = r"""<!doctype html>
       padding: 0;
     }
   }
+
+  /* Visual Pipeline Flow Styles */
+  .pipeline-container {
+    background: linear-gradient(135deg, rgba(13, 13, 18, 0.45) 0%, rgba(20, 20, 29, 0.45) 100%);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+  }
+  .pipeline-flow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    padding: 4px 2px;
+  }
+  .pipeline-flow::-webkit-scrollbar { display: none; }
+  .pipeline-step {
+    flex: 1;
+    min-width: 130px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    border-radius: 10px;
+    padding: 14px 12px;
+    text-align: center;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    position: relative;
+  }
+  .pipeline-step.active-path {
+    background: rgba(99, 102, 241, 0.04);
+    border-color: rgba(99, 102, 241, 0.35);
+    box-shadow: 0 0 15px rgba(99, 102, 241, 0.1);
+  }
+  .pipeline-step.running {
+    background: rgba(16, 185, 129, 0.06);
+    border-color: var(--success);
+    box-shadow: 0 0 20px rgba(16, 185, 129, 0.2);
+    animation: stepPulse 1.8s infinite alternate;
+  }
+  @keyframes stepPulse {
+    0% { transform: translateY(0) scale(0.99); opacity: 0.95; }
+    100% { transform: translateY(-2px) scale(1.01); opacity: 1; }
+  }
+  .pipeline-arrow {
+    color: rgba(255, 255, 255, 0.15);
+    font-size: 20px;
+    user-select: none;
+    flex-shrink: 0;
+    font-weight: 300;
+  }
+  .step-icon {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 10px;
+    font-size: 11px;
+    font-weight: 700;
+    transition: all 0.3s ease;
+  }
+  .pipeline-step.active-path .step-icon {
+    background: rgba(99, 102, 241, 0.2);
+    color: #818cf8;
+    box-shadow: 0 0 8px rgba(99, 102, 241, 0.25);
+  }
+  .pipeline-step.running .step-icon {
+    background: var(--success);
+    color: #000;
+    box-shadow: 0 0 10px rgba(16, 185, 129, 0.4);
+  }
+  .step-label {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--txt);
+    margin-bottom: 4px;
+    letter-spacing: -0.01em;
+  }
+  .step-desc {
+    font-size: 10px;
+    color: var(--muted);
+    line-height: 1.4;
+  }
+  
+  /* Modern styling overrides */
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
+  :root {
+    --bg: #06060a;
+    --surface: #0e0e15;
+    --surface-hover: #161622;
+    --bg-card: #0e0e15;
+    --border: rgba(255, 255, 255, 0.06);
+    --border-card: rgba(255, 255, 255, 0.06);
+    --primary: #6366f1;
+    --primary-fg: #ffffff;
+    --txt: #f3f4f6;
+    --muted: #9ca3af;
+  }
+  body {
+    font-family: 'Outfit', 'Inter', system-ui, -apple-system, sans-serif;
+  }
+  body::before {
+    content: "";
+    position: fixed;
+    top: -20%;
+    left: 10%;
+    width: 60%;
+    height: 60%;
+    background: radial-gradient(circle, rgba(99, 102, 241, 0.05) 0%, rgba(0, 0, 0, 0) 70%);
+    pointer-events: none;
+    z-index: -1;
+  }
+  .card {
+    background: linear-gradient(135deg, rgba(14, 14, 21, 0.7) 0%, rgba(22, 22, 34, 0.7) 100%);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  }
+  .btn {
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(99, 102, 241, 0.25);
+    font-family: 'Outfit', sans-serif;
+  }
+  .btn:hover {
+    background: #4f46e5;
+    border-color: #4f46e5;
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4);
+  }
+  .btn.ghost {
+    box-shadow: none;
+  }
+  .btn.ghost:hover {
+    background: var(--surface-hover);
+    border-color: rgba(99, 102, 241, 0.4);
+    box-shadow: 0 2px 8px rgba(99, 102, 241, 0.1);
+  }
+  .btn-select-mode.active, header nav button.active {
+    border-color: rgba(99, 102, 241, 0.6) !important;
+    background: rgba(99, 102, 241, 0.1) !important;
+    color: #a5b4fc !important;
+  }
+  header {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  @media (max-width: 720px) {
+    .pipeline-flow {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 12px;
+    }
+    .pipeline-arrow {
+      transform: rotate(90deg);
+      margin: 2px auto;
+    }
+    .pipeline-step {
+      min-height: auto;
+    }
+  }
 </style>
 </head>
 <body>
@@ -2180,21 +2361,64 @@ HTML = r"""<!doctype html>
   <section id="dashboard">
     <div class="grid stats" id="statCards"></div>
     <div class="gradient-sep"></div>
+    
+    <!-- Visual Pipeline Flow -->
+    <div class="pipeline-container">
+      <h3 style="margin-top:0; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted); margin-bottom:16px;">Pipeline Execuție</h3>
+      <div class="pipeline-flow">
+        <div class="pipeline-step" id="step-scan">
+          <div class="step-icon">1</div>
+          <div class="step-label">Scanare Playlist</div>
+          <div class="step-desc">Scanare playlist-uri Spotify</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" id="step-catalog">
+          <div class="step-icon">2</div>
+          <div class="step-label">Scanare Catalog</div>
+          <div class="step-desc">Descoperire albume și piese</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" id="step-match">
+          <div class="step-icon">3</div>
+          <div class="step-label">Potrivire Fișiere</div>
+          <div class="step-desc">Reconciliere fișiere disc ↔ DB</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" id="step-trim">
+          <div class="step-icon">4</div>
+          <div class="step-label">Limitare &amp; Curățare</div>
+          <div class="step-desc">Eliminare piese peste limită</div>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step" id="step-download">
+          <div class="step-icon">5</div>
+          <div class="step-label">Descărcare</div>
+          <div class="step-desc">Descărcare piese lipsă</div>
+        </div>
+      </div>
+    </div>
+
     <div class="card">
       <h2>Library</h2>
       <p class="hint dash-intro">Set each artist&apos;s <strong>Limit</strong> on the Artists tab (e.g. 10). The app keeps only their <strong>top viewed</strong> tracks on YouTube Music and deletes the rest automatically when you use the buttons below.</p>
       <div class="actions actions-primary">
-        <button type="button" class="btn action-tile" onclick="action('full')">
+        <button type="button" class="btn action-tile" onclick="action('full')"
+                onmouseover="highlightPipeline(['scan', 'catalog', 'match', 'trim', 'download'])"
+                onmouseout="clearPipelineHighlight()">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
           <span class="action-title">Update everything</span>
           <span class="action-desc">Scan playlists &amp; catalogs, trim to caps, download missing top tracks</span>
         </button>
-        <button type="button" class="btn ghost action-tile" onclick="action('download-pending')">
+        <button type="button" class="btn ghost action-tile" onclick="action('download-pending')"
+                onmouseover="highlightPipeline(['trim', 'download'])"
+                onmouseout="clearPipelineHighlight()">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
           <span class="action-title">Download top tracks</span>
           <span class="action-desc">Remove extras over limit, then download only top viewed (per artist cap)</span>
         </button>
-        <button type="button" class="btn ghost action-tile" onclick="action('reconcile')">
+        <button type="button" class="btn ghost action-tile" onclick="action('reconcile')"
+                onmouseover="highlightPipeline(['match', 'trim'])"
+                onmouseout="clearPipelineHighlight()">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
           <span class="action-title">Refresh files</span>
           <span class="action-desc">Match disk ↔ database, then delete tracks over limit (not top viewed)</span>
@@ -2203,9 +2427,13 @@ HTML = r"""<!doctype html>
       <details class="tools-panel">
         <summary>More tools</summary>
         <div class="actions">
-          <button type="button" class="btn ghost" onclick="action('fix-metadata')">Fix tags &amp; covers</button>
+          <button type="button" class="btn ghost" onclick="action('fix-metadata')"
+                  onmouseover="highlightPipeline(['match'])"
+                  onmouseout="clearPipelineHighlight()">Fix tags &amp; covers</button>
           <button type="button" class="btn ghost" onclick="action('mark-romanian')">Mark Romanian artists</button>
-          <button type="button" class="btn ghost" onclick="action('migrate-structure')">Migrate folder layout</button>
+          <button type="button" class="btn ghost" onclick="action('migrate-structure')"
+                  onmouseover="highlightPipeline(['match'])"
+                  onmouseout="clearPipelineHighlight()">Migrate folder layout</button>
           <button type="button" class="btn ghost danger" onclick="if(confirm('Deduplicate all artists and tracks?'))action('deduplicate')">Deduplicate library</button>
         </div>
       </details>
@@ -2372,7 +2600,7 @@ HTML = r"""<!doctype html>
           <option value="ytmusic">YouTube Music (Fast but includes remixes/EPs)</option>
         </select>
       </div>
-      <div class="field"><label>Output template</label><input id="cfgTemplate" placeholder="{artist}/{album}/{track_number} - {title}.{output-ext}"/></div>
+      <div class="field"><label>Output template</label><input id="cfgTemplate" placeholder="{artist}/{album}/{title}.{output-ext}"/></div>
       <div class="field"><label>Lyrics providers (comma-separated)</label><input id="cfgLyrics" placeholder="genius,musixmatch,azlyrics"/></div>
       <div class="row">
         <div class="field" style="flex:1"><label>Playlist timeout (s)</label><input id="cfgPlTimeout" type="number"/></div>
@@ -2563,7 +2791,7 @@ async function loadSettings(){
   $('#cfgDlFormat').value=c.download_format||'original';
   $('#cfgScanner').value=c.artist_scanner||'spotify';
   $('#cfgBitrate').value=c.bitrate||'320k';
-  $('#cfgTemplate').value=c.output_template||'{artist}/{album}/{track-number} - {title}.{output-ext}';
+  $('#cfgTemplate').value=c.output_template||'{artist}/{album}/{title}.{output-ext}';
   $('#cfgLyrics').value=(c.lyrics_providers||[]).join(',');
   $('#cfgPlTimeout').value=c.playlist_save_timeout||600;
   $('#cfgPlRetries').value=c.playlist_save_retries||3;
@@ -2784,9 +3012,11 @@ function artistRowHtml(r){
   const picked=selectedArtists.has(r.spotify_id);
   const chk=selectMode?`<td class="chk-col sel-col"><input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/></td>`:'';
   const fixButton = artistNeedsYtFix(r) ? `<button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping">YT</button>` : '';
+  const dlBtn = `<button type="button" class="btn ghost sm" data-download title="Descărcare piese manual">DL</button>`;
   return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td><button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync} ${artistYtMusicStatusHtml(r)}</td>
     <td class="td-actions"><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${artistLimitSelectHtml(r)}
       ${fixButton}
+      ${dlBtn}
       <button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
       <button type="button" class="btn danger sm" data-del title="Remove from database. Shift+click: delete files.">×</button></div></td></tr>`;
 }
@@ -2800,11 +3030,12 @@ function artistCardHtml(r){
   const picked=selectedArtists.has(r.spotify_id);
   const chk=selectMode?`<input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/>`:'';
   const fixButton = artistNeedsYtFix(r) ? `<button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping">YT</button>` : '';
+  const dlBtn = `<button type="button" class="btn ghost sm" data-download title="Descărcare piese manual">DL</button>`;
   return `<div class="artist-card ${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">
     <div class="artist-card-head">${chk}<button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button><span>${esc(r.name)}</span></div>
     <div class="artist-card-meta"><span>${r.album_count||0} albums</span><span>${prog} songs</span>${act}${sync} ${artistYtMusicStatusHtml(r)}</div>
     <div class="artist-card-actions">${artistLimitSelectHtml(r)}
-      <div class="btn-row">${fixButton}<button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
+      <div class="btn-row">${fixButton}${dlBtn}<button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
       <button type="button" class="btn danger sm" data-del title="Remove. Shift+click: delete files.">Remove</button></div></div></div>`;
 }
 function renderArtists(){
@@ -2830,6 +3061,7 @@ function onArtistListClick(e){
   const id=root.dataset.aid;
   if(e.target.closest('button[data-ro]')){setRomanian(id,parseInt(e.target.closest('button[data-ro]').dataset.val,10));return;}
   if(e.target.closest('button[data-fix]')){fixArtistYtMusic(id);return;}
+  if(e.target.closest('button[data-download]')){downloadArtist(id);return;}
   if(e.target.closest('button[data-toggle]')){toggleArtist(id);return;}
   if(e.target.closest('button[data-del]')){delArtist(id,e);return;}
 }
@@ -2890,6 +3122,14 @@ async function setArtistLimit(id, limit){
     patchArtistLimit(id,r.max_downloads);
     renderArtists();
   }catch(e){patchArtistLimit(id,prev);renderArtists();toastErr(e.message||'Limit save failed');}
+}
+async function downloadArtist(id){
+  const a=artistById(id);if(!a)return;
+  toast('Descărcare manuală pornită pentru: '+a.name);
+  try{
+    const r=await api(artistUrl(id,'download'),{method:'POST'});
+    toast('Pornit: '+(r.label||a.name));showConsole();
+  }catch(e){toastErr(e.message||'Descărcare eșuată');}
 }
 async function fixArtistYtMusic(id){
   const a=artistById(id);if(!a)return;
@@ -3085,6 +3325,34 @@ async function stop(){
 }
 function showConsole(){document.querySelector('header nav button[data-tab="console"]')?.click();}
 function clearConsole(){$('#consoleOut').innerHTML='';}
+function highlightPipeline(steps) {
+  document.querySelectorAll('.pipeline-step').forEach(el => {
+    if (!el.classList.contains('running')) {
+      el.classList.remove('active-path');
+    }
+  });
+  steps.forEach(s => document.getElementById('step-' + s)?.classList.add('active-path'));
+}
+function clearPipelineHighlight() {
+  document.querySelectorAll('.pipeline-step').forEach(el => {
+    if (!el.classList.contains('running')) {
+      el.classList.remove('active-path');
+    }
+  });
+}
+function setStepRunning(stepId) {
+  document.querySelectorAll('.pipeline-step').forEach(el => {
+    el.classList.remove('running');
+    if (!stepId) el.classList.remove('active-path');
+  });
+  if (stepId) {
+    const stepEl = document.getElementById('step-' + stepId);
+    if (stepEl) {
+      stepEl.classList.add('running');
+      stepEl.classList.add('active-path');
+    }
+  }
+}
 function connectWS(){
   const proto=location.protocol==='https:'?'wss':'ws';
   const ws=new WebSocket(`${proto}://${location.host}/ws/logs`);
@@ -3095,6 +3363,22 @@ function connectWS(){
     const d=document.createElement('div');
     const text=e.data;
     d.textContent=text;
+    
+    // Set step running in pipeline
+    if (text.includes("Step 1") || text.includes("Scanning playlists")) {
+      setStepRunning('scan');
+    } else if (text.includes("Step 2") || text.includes("Scanning artist albums") || text.includes("Scanning catalog")) {
+      setStepRunning('catalog');
+    } else if (text.includes("Reconciling") || text.includes("potrivire") || text.includes("Reconcile") || text.includes("reconcile") || text.includes("potrivesc")) {
+      setStepRunning('match');
+    } else if (text.includes("Step 3") || text.includes("Enforcing caps") || text.includes("caps") || text.includes("trim library") || text.includes("trimming")) {
+      setStepRunning('trim');
+    } else if (text.includes("Step 4") || text.includes("Downloading top tracks") || text.includes("Downloading:") || text.includes("tracks to download") || text.includes("Downloading")) {
+      setStepRunning('download');
+    } else if (text.includes("complete") || text.includes("done —") || text.includes("exit 0") || text.includes("exit")) {
+      setStepRunning(null);
+    }
+    
     if(/ERROR|✗|failed|error/i.test(text)) d.style.color='#f87171';
     else if(/WARN|WARNING/i.test(text)) d.style.color='#fbbf24';
     else if(/===/.test(text)) d.style.color='#ffffff';

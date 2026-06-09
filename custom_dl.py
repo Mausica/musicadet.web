@@ -69,11 +69,11 @@ def _set_rate_limited_if_needed(err_msg: str) -> bool:
     if not err_msg:
         return False
     msg = str(err_msg).lower()
-    if "rate-limited" in msg or "session has been rate-limited" in msg:
+    if "rate-limited" in msg or "session has been rate-limited" in msg or "429" in msg or "too many requests" in msg:
         global RATE_LIMITED_UNTIL
         RATE_LIMITED_UNTIL = time.time() + 3600  # 1 hour
-        log.error("    ✗ yt-dlp rate limit encountered, pausing downloads for 1 hour")
-        return True
+        log.error("    ✗ yt-dlp rate limit encountered, stopping execution")
+        raise RuntimeError("YouTube rate-limited. Stopping execution.")
     return False
 
 
@@ -484,8 +484,7 @@ class YtDlpDownloader:
         # Check if we're rate-limited
         rate_wait = check_rate_limit()
         if rate_wait is not None:
-            log.error("    ✗ YouTube rate-limited. Wait %d seconds before retrying.", rate_wait)
-            return None
+            raise RuntimeError(f"YouTube rate-limited. Stopping execution. Please wait {rate_wait} seconds.")
 
         # Build the output path
         resolved_album = detect_singles(album, title)
@@ -495,11 +494,7 @@ class YtDlpDownloader:
         album_folder.mkdir(parents=True, exist_ok=True)
 
         safe_title = _clean_filename(title)
-        if track_number and safe_album != "Singles":
-            trk = str(track_number).zfill(2)
-            out_path = album_folder / f"{trk} - {safe_title}.{self.fmt}"
-        else:
-            out_path = album_folder / f"{safe_title}.{self.fmt}"
+        out_path = album_folder / f"{safe_title}.{self.fmt}"
 
         if out_path.exists():
             log.info("    ↳ Already exists: %s", out_path.name)
@@ -527,10 +522,11 @@ class YtDlpDownloader:
         except Exception as e:
             # Detect YouTube rate limiting
             err_msg = str(e).lower()
-            if "rate-limited" in err_msg or "video unavailable" in err_msg:
+            if "rate-limited" in err_msg or "video unavailable" in err_msg or "429" in err_msg or "too many requests" in err_msg:
                 global RATE_LIMITED_UNTIL
                 RATE_LIMITED_UNTIL = time.time() + 3600  # 1 hour
-                log.error("    ✗ yt-dlp rate limit encountered, pausing downloads for 1 hour")
+                log.error("    ✗ yt-dlp rate limit encountered, stopping execution")
+                raise RuntimeError("YouTube rate-limited. Stopping execution.")
             else:
                 log.error("    ✗ yt-dlp error for %s: %s", title, e)
             return None
@@ -568,8 +564,7 @@ class YtDlpDownloader:
         # Check if we're rate-limited
         rate_wait = check_rate_limit()
         if rate_wait is not None:
-            log.error("  ✗ YouTube rate-limited. Wait %d seconds before retrying.", rate_wait)
-            return 0
+            raise RuntimeError(f"YouTube rate-limited. Stopping execution. Please wait {rate_wait} seconds.")
 
         query = f"ytsearch1:{artist} {album} full album"
         log.info("  ↳ Album search: %s — %s", artist, album)
@@ -606,7 +601,7 @@ class YtDlpDownloader:
         album_folder = artist_folder / _clean_filename(album)
         album_folder.mkdir(parents=True, exist_ok=True)
 
-        out_tpl = str(album_folder / "%(playlist_index)02d - %(title)s.%(ext)s")
+        out_tpl = str(album_folder / "%(title)s.%(ext)s")
         opts = self._ydl_opts(out_tpl, quiet=False)
 
         downloaded = 0
@@ -616,6 +611,11 @@ class YtDlpDownloader:
                 if result == 0:
                     downloaded = len(list(album_folder.glob(f"*.{self.fmt}")))
         except Exception as e:
+            err_msg = str(e).lower()
+            if "rate-limited" in err_msg or "video unavailable" in err_msg or "429" in err_msg or "too many requests" in err_msg:
+                global RATE_LIMITED_UNTIL
+                RATE_LIMITED_UNTIL = time.time() + 3600
+                raise RuntimeError("YouTube rate-limited. Stopping execution.")
             log.error("  ✗ Album download error (%s — %s): %s", artist, album, e)
 
         log.info("  ✓ Album downloaded %d tracks: %s — %s", downloaded, artist, album)

@@ -66,8 +66,8 @@ DEFAULTS: dict = {
     "threads": 4,
     # Legacy flat template kept for reference; new downloads use album structure
     "output_template": "{artist}/{title}.{output-ext}",
-    # New: album-structured output  →  artist/album/NN - title.ext
-    "album_output_template": "{artist}/{album}/{track-number:02d} - {title}.{output-ext}",
+    # New: album-structured output  →  artist/album/title.ext
+    "album_output_template": "{artist}/{album}/{title}.{output-ext}",
     "download_concurrency": 1,          # sequential — no rate-limit issues
     "playlist_save_timeout": 600,
     "playlist_save_retries": 3,
@@ -1164,6 +1164,39 @@ def _upsert_artist_catalog(db: sqlite3.Connection, artist_id: str, songs: list) 
     return new_albums, new_songs
 
 
+def remove_track_number_prefixes(music_dir: Path):
+    """Scan the music directory and rename any files like '04 - Title.ext' to 'Title.ext'."""
+    if not music_dir.exists():
+        return
+    log.info("Scanning for files with track number prefixes to strip...")
+    renamed_count = 0
+    for root, _dirs, files in os.walk(music_dir):
+        for fname in files:
+            if Path(fname).suffix.lower() not in AUDIO_EXTS:
+                continue
+            m = re.match(r"^\d+\s*-\s*(.+)$", fname)
+            if m:
+                new_fname = m.group(1).strip()
+                old_path = Path(root) / fname
+                new_path = Path(root) / new_fname
+                if old_path != new_path:
+                    try:
+                        if new_path.exists():
+                            if old_path.stat().st_size >= new_path.stat().st_size:
+                                new_path.unlink()
+                                old_path.rename(new_path)
+                            else:
+                                old_path.unlink()
+                        else:
+                            old_path.rename(new_path)
+                        renamed_count += 1
+                        log.debug("Renamed: %s -> %s", fname, new_fname)
+                    except Exception as e:
+                        log.warning("Failed to rename prefix for %s: %s", fname, e)
+    if renamed_count > 0:
+        log.info("Renamed %d files to remove track number prefixes.", renamed_count)
+
+
 def _build_file_index(music_dir: Path) -> tuple[dict, dict]:
     """Index by (artist, album, title) and (album, title) keys."""
     by_full: dict[tuple[str, str, str], Path] = {}
@@ -1756,11 +1789,7 @@ def _sync_artist_with_ytdlp(
         resolved_album = custom_dl.detect_singles(album_name, s["title"])
         safe_album = custom_dl._clean_filename(resolved_album)
         safe_title = custom_dl._clean_filename(s["title"])
-        if track_num and safe_album != "Singles":
-            trk = str(track_num).zfill(2)
-            expected = music_dir / safe_artist / safe_album / f"{trk} - {safe_title}.{fmt}"
-        else:
-            expected = music_dir / safe_artist / safe_album / f"{safe_title}.{fmt}"
+        expected = music_dir / safe_artist / safe_album / f"{safe_title}.{fmt}"
 
         if expected.exists():
             with db_connect() as db:
@@ -1829,11 +1858,18 @@ def _sync_artist_with_ytdlp(
 def cmd_artists_sync(args):
     """Sequential artist sync: SpotDL fetch → yt-dlp download → album completeness."""
     new_only = getattr(args, "new_only", False)
+    artist_filter = getattr(args, "artist", None)
+    remove_track_number_prefixes(Path(CFG["music_dir"]))
     with db_connect() as db:
-        query = "SELECT * FROM artists WHERE active=1"
-        if new_only:
-            query += " AND sync_done=0"
-        artists = db.execute(query + " ORDER BY name COLLATE NOCASE").fetchall()
+        if artist_filter:
+            # If a specific artist is requested, allow active >= 0
+            query = "SELECT * FROM artists WHERE active >= 0 AND (name LIKE ? OR spotify_id=?)"
+            artists = db.execute(query + " ORDER BY name COLLATE NOCASE", (f"%{artist_filter}%", artist_filter)).fetchall()
+        else:
+            query = "SELECT * FROM artists WHERE active=1"
+            if new_only:
+                query += " AND sync_done=0"
+            artists = db.execute(query + " ORDER BY name COLLATE NOCASE").fetchall()
 
     tag = " (new only)" if new_only else ""
     log.info("Artists to sync%s: %d (sequential)", tag, len(artists))
@@ -2641,6 +2677,7 @@ def cmd_download_direct(args):
 
 
 def cmd_migrate_structure(args):
+    remove_track_number_prefixes(Path(CFG["music_dir"]))
     log.info("Migrating existing flat files to album structure...")
     
     if custom_dl:
@@ -2714,6 +2751,7 @@ def cmd_migrate_structure(args):
 
 
 def cmd_reconcile(args):
+    remove_track_number_prefixes(Path(CFG["music_dir"]))
     artist_filter = getattr(args, "artist", None)
     with db_connect() as db:
         if artist_filter:
@@ -2842,6 +2880,7 @@ def cmd_full_sync(args):
     log.info("━" * 60)
     log.info("  FULL SYNC  —  %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
     log.info("━" * 60)
+    remove_track_number_prefixes(Path(CFG["music_dir"]))
 
     log.info("\n▶ Step 1 / 3 — Scanning playlists")
     cmd_scan(argparse.Namespace())
@@ -2910,6 +2949,7 @@ Examples:
 
     as_ = subparsers.add_parser("artists-sync", help="Sync artist discographies (sequential yt-dlp)")
     as_.add_argument("--new-only", action="store_true", help="Only sync artists not yet downloaded")
+    as_.add_argument("--artist", help="Sync only this artist (name substring or spotify id)")
 
     subparsers.add_parser("download-pending", help="Directly download all pending tracks without SpotDL fetches")
 
