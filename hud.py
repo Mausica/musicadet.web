@@ -1264,40 +1264,52 @@ HTML = r"""<!doctype html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
   :root {
-    --bg: #000000;
-    --surface: #0a0a0a;
-    --surface-hover: #111111;
-    --bg-card: #0a0a0a;
-    --border: #262626;
-    --border-card: #262626;
-    --primary: #ededed;
-    --primary-fg: #0a0a0a;
-    --success: #22c55e;
-    --warning: #eab308;
+    --bg: #061428; /* deep navy */
+    --surface: #0b1b2b;
+    --surface-hover: #0f2436;
+    --bg-card: #0b1b2b;
+    --border: rgba(255,255,255,0.04);
+    --border-card: rgba(255,255,255,0.04);
+    --primary: #4f46e5; /* indigo accent */
+    --primary-fg: #ffffff;
+    --success: #16a34a;
+    --warning: #f59e0b;
     --error: #ef4444;
-    --txt: #ededed;
-    --muted: #888888;
-    --radius: 6px;
-    --radius-lg: 8px;
+    --txt: #e6eef8;
+    --muted: #9aa6b2;
+    --radius: 8px;
+    --radius-lg: 12px;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html { color-scheme: dark; }
-  body {
-    margin: 0;
-    font: 14px/1.5 'Inter', system-ui, -apple-system, sans-serif;
-    color: var(--txt);
-    background: var(--bg);
-    min-height: 100vh;
-    min-height: 100dvh;
+  /* Layout: left sidebar + content */
+  body { display: flex; }
+  aside.sidebar {
+    position: fixed;
+    left: 0; top: 0; bottom: 0;
+    width: 260px;
+    background: linear-gradient(180deg,#071226 0%, #081428 100%);
+    border-right: 1px solid var(--border);
+    padding: 20px 12px;
+    box-shadow: 0 8px 30px rgba(2,6,23,0.6);
+    z-index: 30;
+    overflow: auto;
   }
-  a {
-    color: var(--txt);
-    text-decoration: none;
-    transition: color 0.2s ease;
+  main { margin-left: 280px; flex:1; }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    backdrop-filter: blur(6px);
+    background: transparent;
+    border-bottom: 1px solid transparent;
+    padding: 12px 16px;
+    padding-top: max(12px, env(safe-area-inset-top));
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: nowrap;
   }
-  a:hover {
-    color: #ffffff;
-    text-decoration: underline;
   }
   header {
     position: sticky;
@@ -1326,12 +1338,12 @@ HTML = r"""<!doctype html>
     background: var(--border-card);
   }
   .logo {
-    font-weight: 600;
+    font-weight: 700;
     font-size: 18px;
-    letter-spacing: -0.03em;
+    letter-spacing: -0.02em;
     color: var(--txt);
     flex-shrink: 0;
-    font-family: 'Inter', system-ui, sans-serif;
+    font-family: 'Outfit', system-ui, sans-serif;
   }
   .dot {
     width: 8px;
@@ -1361,38 +1373,26 @@ HTML = r"""<!doctype html>
     border: 1px solid var(--border);
     flex-shrink: 0;
   }
-  header nav {
-    display: flex;
-    gap: 4px;
-    margin-left: auto;
-    flex: 0 0 auto;
-    white-space: nowrap;
-  }
-  header nav button {
+  aside.sidebar nav { display:flex; flex-direction:column; gap:6px; }
+  aside.sidebar nav button {
+    text-align: left;
     background: transparent;
-    border: 1px solid transparent;
+    border: none;
     color: var(--muted);
-    padding: 6px 12px;
-    border-radius: var(--radius);
+    padding: 10px 14px;
+    border-radius: 8px;
     cursor: pointer;
-    font: 500 13px 'Inter', sans-serif;
-    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-    flex: 0 0 auto;
-    touch-action: manipulation;
+    font: 600 14px 'Outfit', sans-serif;
+    transition: background 0.12s ease, color 0.12s ease;
+    display: flex; align-items: center; gap:10px;
   }
-  header nav button.active {
-    color: var(--txt);
-    background: var(--surface);
-    border-color: var(--border);
-  }
-  header nav button:hover {
-    color: var(--txt);
-    background: var(--surface-hover);
-  }
+  aside.sidebar nav button.active { color: var(--primary); background: rgba(79,70,229,0.08); }
+  aside.sidebar nav button:hover { color: #ffffff; background: rgba(255,255,255,0.03); }
+  aside.sidebar .side-title { color: var(--muted); font-size:12px; margin:8px 10px; text-transform:uppercase; letter-spacing:0.06em }
   main {
     max-width: 1200px;
     margin: 0 auto;
-    padding: 20px 16px;
+    padding: 20px 24px;
     padding-bottom: max(20px, env(safe-area-inset-bottom));
   }
   .table-scroll {
@@ -1427,8 +1427,8 @@ HTML = r"""<!doctype html>
     grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   }
   .card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
+    background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.02));
+    border: 1px solid var(--border-card);
     border-radius: var(--radius-lg);
     padding: 20px;
   }
@@ -1612,24 +1612,20 @@ HTML = r"""<!doctype html>
     color: var(--muted);
   }
   .btn {
-    border: 1px solid var(--primary);
-    border-radius: var(--radius);
-    padding: 8px 14px;
-    font: 500 13px 'Inter', sans-serif;
+    border-radius: 10px;
+    padding: 10px 16px;
+    font: 600 13px 'Outfit', sans-serif;
     cursor: pointer;
     color: var(--primary-fg);
     background: var(--primary);
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 6px;
-    transition: background 0.15s ease, border-color 0.15s ease;
-    touch-action: manipulation;
+    gap: 8px;
+    transition: transform 0.12s ease, box-shadow 0.12s ease;
+    box-shadow: 0 6px 18px rgba(79,70,229,0.08);
   }
-  .btn:hover {
-    background: #d4d4d4;
-    border-color: #d4d4d4;
-  }
+  .btn:hover { transform: translateY(-1px); }
   .btn.ghost,
   .sel-btn,
   .btn-ro {
@@ -2409,9 +2405,7 @@ HTML = r"""<!doctype html>
     background: rgba(99, 102, 241, 0.1) !important;
     color: #a5b4fc !important;
   }
-  header {
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  }
+  header { border-bottom: 1px solid rgba(255,255,255,0.02); }
   @media (max-width: 720px) {
     .pipeline-flow {
       flex-direction: column;
@@ -2429,21 +2423,32 @@ HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
-<header>
-  <div class="header-gradient"></div>
-  <div class="logo">MusicaDet</div>
-  <div class="status"><span id="dot" class="dot"></span><span id="statusText">idle</span></div>
-  <nav aria-label="Sections">
-    <button type="button" data-tab="dashboard" class="active">Dashboard</button>
-    <button type="button" data-tab="library">Library</button>
-    <button type="button" data-tab="artists">Artists</button>
-    <button type="button" data-tab="playlists">Playlists</button>
-    <button type="button" data-tab="tracks">Files</button>
-    <button type="button" data-tab="settings">Settings</button>
-    <button type="button" data-tab="console">Console</button>
-  </nav>
-</header>
-<main>
+  <aside class="sidebar">
+    <div class="logo">AudioMuse-AI</div>
+    <div style="height:14px"></div>
+    <nav aria-label="Sections">
+      <button type="button" data-tab="dashboard" class="active">Dashboard</button>
+      <button type="button" data-tab="library">Analysis and Clustering</button>
+      <button type="button" data-tab="artists">Instant Playlist</button>
+      <button type="button" data-tab="playlists">Playlist from Similar Song</button>
+      <button type="button" data-tab="tracks">Artist Similarity</button>
+      <button type="button" data-tab="settings">Song Path</button>
+      <button type="button" data-tab="console">Song Alchemy</button>
+    </nav>
+    <div class="side-title" style="margin-top:18px">Administration</div>
+    <nav aria-label="Admin" style="margin-top:6px">
+      <button type="button" data-tab="settings">Setup Wizard</button>
+      <button type="button" data-tab="library">Users</button>
+    </nav>
+  </aside>
+
+  <main>
+  <header>
+    <div class="header-gradient"></div>
+    <div class="logo">MusicaDet</div>
+    <div style="flex:1"></div>
+    <div class="status"><span id="dot" class="dot"></span><span id="statusText">idle</span></div>
+  </header>
   <section id="dashboard">
     <div class="grid stats" id="statCards"></div>
     <div class="gradient-sep"></div>
@@ -2836,8 +2841,9 @@ function flashArtistRow(id){
     el.classList.remove('row-flash');void el.offsetWidth;el.classList.add('row-flash');
   });
 }
-document.querySelectorAll('header nav button').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('header nav button').forEach(x=>x.classList.remove('active'));
+document.querySelectorAll('.sidebar nav button').forEach(b=>b.onclick=()=>{
+  // mark active in sidebar
+  document.querySelectorAll('.sidebar nav button').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');
   b.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});
   ['dashboard','library','artists','playlists','tracks','settings','console'].forEach(id=>$('#'+id).classList.add('hide'));
