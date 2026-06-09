@@ -75,6 +75,40 @@ def public_cfg() -> dict:
     return {k: load_cfg().get(k, DEFAULTS.get(k)) for k in CONFIG_KEYS}
 
 
+def _parse_ytmusic_url(url: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Parse a YouTube Music artist URL or handle.
+    Returns (browse_id, canonical_url).
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return None, None
+    if raw.startswith("@"):
+        handle = raw[1:].split("/")[0].split("?")[0]
+        return None, f"https://music.youtube.com/@{handle}"
+    if not raw.startswith("http"):
+        if "/" not in raw:
+            return None, f"https://music.youtube.com/@{raw.lstrip('@')}"
+        raw = f"https://music.youtube.com/{raw.lstrip('/')}"
+
+    canonical = raw.split("?")[0].rstrip("/")
+    browse_id = None
+    if "/channel/" in canonical:
+        browse_id = canonical.split("/channel/")[1].split("/")[0]
+    elif "/@" in canonical:
+        handle = canonical.split("/@")[1].split("/")[0]
+        canonical = f"https://music.youtube.com/@{handle}"
+    return browse_id, canonical
+
+
+def _artist_ytmusic_display_url(row: sqlite3.Row) -> Optional[str]:
+    if row["ytmusic_url"]:
+        return row["ytmusic_url"]
+    if row["ytmusic_browse_id"]:
+        return f"https://music.youtube.com/channel/{row['ytmusic_browse_id']}"
+    return None
+
+
 def db() -> sqlite3.Connection:
     cfg = load_cfg()
     conn = sqlite3.connect(cfg["db_path"], timeout=60, check_same_thread=False)
@@ -189,6 +223,10 @@ def _run_ensure_db_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE artists ADD COLUMN ytmusic_status TEXT DEFAULT 'unknown'")
     if "ytmusic_notes" not in cols:
         conn.execute("ALTER TABLE artists ADD COLUMN ytmusic_notes TEXT")
+    if "ytmusic_url" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN ytmusic_url TEXT")
+    if "ytmusic_searched_at" not in cols:
+        conn.execute("ALTER TABLE artists ADD COLUMN ytmusic_searched_at TEXT")
     conn.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
@@ -543,7 +581,12 @@ def api_artists(
         SELECT a.spotify_id, a.name, a.source, a.active, a.sync_done, a.last_synced, a.added_at,
                a.albums_scanned_at, a.max_downloads, a.is_romanian, a.ytmusic_status, a.ytmusic_name, a.ytmusic_notes,
                a.ytmusic_browse_id,
-               CASE WHEN a.ytmusic_browse_id IS NOT NULL THEN 'https://music.youtube.com/channel/' || a.ytmusic_browse_id ELSE NULL END AS ytmusic_url,
+               COALESCE(
+                 a.ytmusic_url,
+                 CASE WHEN a.ytmusic_browse_id IS NOT NULL
+                   THEN 'https://music.youtube.com/channel/' || a.ytmusic_browse_id
+                   ELSE NULL END
+               ) AS ytmusic_url,
                COALESCE(ac.album_count, 0) AS album_count,
                COALESCE(sc.songs_dl, 0) AS songs_dl,
                COALESCE(sc.songs_total, 0) AS songs_total
@@ -808,11 +851,19 @@ async def api_mark_artist_ytmusic(spotify_id: str, request: Request):
         body = {}
     
     status = body.get("status")  # 'found', 'not_found', 'manually_mapped'
-    ytmusic_name = body.get("ytmusic_name")  # New name if manually mapped
+    ytmusic_name = body.get("ytmusic_name")
+    ytmusic_url = body.get("ytmusic_url", "")
+    ytmusic_browse_id = body.get("ytmusic_browse_id")
     notes = body.get("notes", "")
     
     if status not in ("found", "not_found", "manually_mapped"):
         return JSONResponse({"error": "invalid status"}, status_code=400)
+    
+    parsed_browse_id, parsed_url = _parse_ytmusic_url(ytmusic_url)
+    if parsed_browse_id and not ytmusic_browse_id:
+        ytmusic_browse_id = parsed_browse_id
+    if parsed_url:
+        ytmusic_url = parsed_url
     
     with db_tx() as conn:
         _ensure_artist_schema(conn)
@@ -823,13 +874,25 @@ async def api_mark_artist_ytmusic(spotify_id: str, request: Request):
         updates = {"ytmusic_status": status}
         if ytmusic_name:
             updates["ytmusic_name"] = ytmusic_name
+        if ytmusic_url:
+            updates["ytmusic_url"] = ytmusic_url
+        if ytmusic_browse_id:
+            updates["ytmusic_browse_id"] = ytmusic_browse_id
         if notes:
             updates["ytmusic_notes"] = notes
+        if status in ("found", "manually_mapped"):
+            updates["ytmusic_searched_at"] = datetime.now().isoformat(timespec="seconds")
         
         update_sql = "UPDATE artists SET " + ", ".join(f"{k}=?" for k in updates.keys()) + " WHERE spotify_id=?"
         conn.execute(update_sql, list(updates.values()) + [spotify_id])
     
-    return {"ok": True, "status": status, "ytmusic_name": ytmusic_name or row["name"]}
+    return {
+        "ok": True,
+        "status": status,
+        "ytmusic_name": ytmusic_name or row["name"],
+        "ytmusic_url": ytmusic_url or None,
+        "ytmusic_browse_id": ytmusic_browse_id or None,
+    }
 
 
 @app.post("/api/artists/{spotify_id:path}/edit")
@@ -1297,6 +1360,7 @@ HTML = r"""<!doctype html>
     --radius: 8px;
     --radius-lg: 12px;
     --sidebar-width: 260px;
+    --sidebar-collapsed: 64px;
     scrollbar-gutter: stable;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -1310,23 +1374,77 @@ HTML = r"""<!doctype html>
     color: var(--txt);
     line-height: 1.5;
   }
+  .nav-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.55);
+    z-index: 28;
+    backdrop-filter: blur(2px);
+  }
+  .nav-overlay.show { display: block; }
+  .nav-toggle {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 5px;
+    width: 40px;
+    height: 40px;
+    padding: 8px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    flex-shrink: 0;
+    color: var(--txt);
+  }
+  .nav-toggle span {
+    display: block;
+    height: 2px;
+    background: currentColor;
+    border-radius: 1px;
+    transition: transform 0.2s ease, opacity 0.2s ease;
+  }
+  body.sidebar-collapsed .nav-toggle span:nth-child(1) { transform: translateY(7px) rotate(45deg); }
+  body.sidebar-collapsed .nav-toggle span:nth-child(2) { opacity: 0; }
+  body.sidebar-collapsed .nav-toggle span:nth-child(3) { transform: translateY(-7px) rotate(-45deg); }
   aside.sidebar {
     position: fixed;
     left: 0; top: 0; bottom: 0;
     width: var(--sidebar-width);
     background: var(--bg-sidebar);
     border-right: 1px solid var(--border);
-    padding: 20px 12px;
+    padding: 16px 10px;
     z-index: 30;
     overflow-y: auto;
     overflow-x: hidden;
     display: flex;
     flex-direction: column;
+    transition: width 0.22s ease, transform 0.22s ease;
+  }
+  .sidebar-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 6px 16px;
+    margin-bottom: 4px;
   }
   aside.sidebar .logo {
-    padding: 4px 12px 16px;
-    font-size: 18px;
+    padding: 0;
+    font-size: 17px;
+    font-weight: 700;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    min-width: 0;
   }
+  body.sidebar-collapsed aside.sidebar { width: var(--sidebar-collapsed); }
+  body.sidebar-collapsed aside.sidebar .logo,
+  body.sidebar-collapsed aside.sidebar .side-title,
+  body.sidebar-collapsed aside.sidebar .side-footer,
+  body.sidebar-collapsed aside.sidebar nav button .nav-label { display: none; }
+  body.sidebar-collapsed aside.sidebar nav button { justify-content: center; padding: 10px; }
   aside.sidebar .side-footer {
     margin-top: auto;
     padding: 16px 12px 4px;
@@ -1334,6 +1452,7 @@ HTML = r"""<!doctype html>
     font-size: 11px;
     color: var(--muted);
   }
+  .mobile-topbar { display: none; }
   main {
     margin-left: var(--sidebar-width);
     flex: 1;
@@ -1341,7 +1460,9 @@ HTML = r"""<!doctype html>
     max-width: 1100px;
     padding: 24px 28px;
     padding-bottom: max(24px, env(safe-area-inset-bottom));
+    transition: margin-left 0.22s ease;
   }
+  body.sidebar-collapsed main { margin-left: var(--sidebar-collapsed); }
   header {
     position: sticky;
     top: 0;
@@ -1420,7 +1541,16 @@ HTML = r"""<!doctype html>
     display: flex;
     align-items: center;
     gap: 10px;
+    width: 100%;
   }
+  aside.sidebar nav button .nav-icon {
+    width: 18px;
+    text-align: center;
+    flex-shrink: 0;
+    font-size: 15px;
+    opacity: 0.85;
+  }
+  aside.sidebar nav button.active .nav-icon { opacity: 1; }
   aside.sidebar nav button.active {
     color: #ffffff;
     background: var(--color-primary);
@@ -2204,6 +2334,113 @@ HTML = r"""<!doctype html>
     color: var(--primary-fg);
   }
   .dash-intro { margin: 0 0 16px; max-width: 52rem; }
+  .sync-hub { padding: 0; overflow: hidden; }
+  .sync-hub-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 20px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sync-hub-head h2 { margin: 0; font-size: 15px; border: none; padding: 0; }
+  .sync-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    background: var(--border);
+  }
+  .sync-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 20px 12px;
+    min-height: 88px;
+    background: var(--bg-card);
+    border: none;
+    color: var(--txt);
+    cursor: pointer;
+    font: inherit;
+    transition: background 0.15s ease;
+  }
+  .sync-btn:hover { background: var(--surface-hover); }
+  .sync-btn-primary { background: var(--color-primary); color: #fff; }
+  .sync-btn-primary:hover { background: #1d4ed8; }
+  .sync-btn-icon { font-size: 22px; line-height: 1; }
+  .sync-btn-label { font-size: 13px; font-weight: 600; text-align: center; }
+  .sync-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    border-top: 1px solid var(--border);
+    background: rgba(0,0,0,0.15);
+  }
+  .sync-more {
+    border-top: 1px solid var(--border);
+    padding: 0 16px;
+  }
+  .sync-more summary {
+    cursor: pointer;
+    padding: 12px 0;
+    font-size: 13px;
+    color: var(--muted);
+    list-style: none;
+  }
+  .sync-more summary::-webkit-details-marker { display: none; }
+  .sync-more .actions { padding-bottom: 14px; }
+  .lib-artist-group { margin-bottom: 4px; }
+  .lib-artist-head {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 12px 14px 6px;
+    background: rgba(255,255,255,0.02);
+    border-bottom: 1px solid var(--border);
+  }
+  .lib-artist-head:first-child { padding-top: 6px; }
+  tr.lib-artist-head-row td.lib-artist-head {
+    font-size: 11px;
+    padding: 10px 14px 4px;
+    background: transparent;
+    border-bottom: none;
+  }
+  .btn-yt {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: rgba(255,255,255,0.04);
+    color: #f87171;
+    cursor: pointer;
+  }
+  .btn-yt:hover { background: rgba(248,113,113,0.15); border-color: rgba(248,113,113,0.4); }
+  .btn-yt.ok { color: #34d399; border-color: rgba(52,211,153,0.3); }
+  .btn-yt.ok:hover { background: rgba(52,211,153,0.12); }
+  .yt-modal-url {
+    display: block;
+    word-break: break-all;
+    padding: 10px 12px;
+    background: var(--bg-body);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 13px;
+    color: var(--color-primary);
+    text-decoration: none;
+    margin-bottom: 12px;
+  }
+  .yt-modal-url:hover { text-decoration: underline; }
+  .yt-modal-field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .yt-modal-field input { width: 100%; }
+  .yt-modal-actions { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
   .toast {
     position: fixed;
     bottom: 20px;
@@ -2269,43 +2506,41 @@ HTML = r"""<!doctype html>
   }
   .modal-close:hover { color: var(--txt); }
   .val { font-weight: 500; font-size: 14px; margin-bottom: 8px; color: var(--txt); }
+  @media (max-width: 900px) {
+    .sync-grid { grid-template-columns: 1fr; }
+  }
   @media (max-width: 768px) {
     aside.sidebar {
+      transform: translateX(-100%);
+      width: min(280px, 88vw);
+      box-shadow: 4px 0 24px rgba(0,0,0,0.4);
+    }
+    body.mobile-nav-open aside.sidebar { transform: translateX(0); }
+    body.mobile-nav-open .nav-overlay { display: block; }
+    body.sidebar-collapsed aside.sidebar { width: min(280px, 88vw); }
+    body.sidebar-collapsed aside.sidebar .logo,
+    body.sidebar-collapsed aside.sidebar .side-title,
+    body.sidebar-collapsed aside.sidebar .side-footer,
+    body.sidebar-collapsed aside.sidebar nav button .nav-label { display: inline; }
+    .mobile-topbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
       position: sticky;
       top: 0;
-      width: 100%;
-      height: auto;
-      flex-direction: row;
-      flex-wrap: wrap;
-      align-items: center;
-      padding: 10px 12px;
-      gap: 4px;
-      border-right: none;
+      z-index: 25;
+      background: var(--bg-body);
+      padding: 10px 0 12px;
+      margin: -4px 0 8px;
       border-bottom: 1px solid var(--border);
     }
-    aside.sidebar .logo {
-      padding: 0 8px 0 4px;
-      margin-right: 4px;
-    }
-    aside.sidebar nav {
-      flex-direction: row;
-      flex-wrap: nowrap;
-      overflow-x: auto;
-      gap: 4px;
-    }
-    aside.sidebar .side-title,
-    aside.sidebar .side-footer { display: none; }
-    aside.sidebar nav button {
-      white-space: nowrap;
-      padding: 8px 12px;
-      font-size: 13px;
-    }
-    body { flex-direction: column; }
+    .mobile-topbar .logo { font-size: 16px; font-weight: 700; }
     main {
       margin-left: 0;
       max-width: none;
-      padding: 16px 12px;
+      padding: 12px 14px;
       padding-bottom: max(16px, env(safe-area-inset-bottom));
+      width: 100%;
     }
     header {
       padding: 8px 0;
@@ -2478,22 +2713,32 @@ HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
-  <aside class="sidebar">
-    <div class="logo">MusicaDet</div>
+  <div id="navOverlay" class="nav-overlay" onclick="closeMobileNav()"></div>
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <button type="button" class="nav-toggle" id="navToggle" aria-label="Toggle menu" onclick="toggleSidebar()">
+        <span></span><span></span><span></span>
+      </button>
+      <div class="logo">MusicaDet</div>
+    </div>
     <nav aria-label="Sections">
-      <button type="button" data-tab="dashboard" class="active">Dashboard</button>
-      <button type="button" data-tab="library">Library</button>
-      <button type="button" data-tab="artists">Artists</button>
+      <button type="button" data-tab="dashboard" class="active"><span class="nav-icon">◫</span><span class="nav-label">Dashboard</span></button>
+      <button type="button" data-tab="library"><span class="nav-icon">♫</span><span class="nav-label">Library</span></button>
+      <button type="button" data-tab="artists"><span class="nav-icon">◎</span><span class="nav-label">Artists</span></button>
     </nav>
     <div class="side-title">Administration</div>
     <nav aria-label="Admin">
-      <button type="button" data-tab="settings">Setup</button>
-      <button type="button" data-tab="console">Logs</button>
+      <button type="button" data-tab="settings"><span class="nav-icon">⚙</span><span class="nav-label">Setup</span></button>
+      <button type="button" data-tab="console"><span class="nav-icon">▤</span><span class="nav-label">Logs</span></button>
     </nav>
-    <div class="side-footer">MusicaDet HUD</div>
+    <div class="side-footer">MusicaDet v0.0.1</div>
   </aside>
 
   <main>
+  <div class="mobile-topbar" id="mobileTopbar">
+    <button type="button" class="nav-toggle" aria-label="Open menu" onclick="openMobileNav()"><span></span><span></span><span></span></button>
+    <div class="logo">MusicaDet</div>
+  </div>
   <header>
     <div style="flex:1"></div>
     <div class="status" id="statusBadge"><span id="dot" class="dot"></span><span id="statusText">idle</span></div>
@@ -2544,55 +2789,51 @@ HTML = r"""<!doctype html>
       </div>
     </div>
 
-    <div class="card">
-      <h2>Library</h2>
-      <p class="hint dash-intro">Set each artist&apos;s <strong>Limit</strong> on the Artists tab (e.g. 10). The app keeps only their <strong>top viewed</strong> tracks on YouTube Music and deletes the rest automatically when you use the buttons below.</p>
-      <div class="actions actions-primary">
-        <button type="button" class="btn action-tile" onclick="action('full')"
-                onmouseover="highlightPipeline(['scan', 'catalog', 'match', 'trim', 'download'])"
+    <div class="card sync-hub">
+      <div class="sync-hub-head">
+        <h2>Sync</h2>
+        <span class="muted" style="font-size:12px" title="Per-artist limits on Artists tab — keeps top viewed YT tracks">Limits on Artists →</span>
+      </div>
+      <div class="sync-grid">
+        <button type="button" class="sync-btn sync-btn-primary" onclick="action('full')"
+                title="Scan playlists, catalogs, trim caps, download missing"
+                onmouseover="highlightPipeline(['scan','catalog','match','trim','download'])"
                 onmouseout="clearPipelineHighlight()">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
-          <span class="action-title">Update everything</span>
-          <span class="action-desc">Scan playlists &amp; catalogs, trim to caps, download missing top tracks</span>
+          <span class="sync-btn-icon">⚡</span>
+          <span class="sync-btn-label">Full update</span>
         </button>
-        <button type="button" class="btn ghost action-tile" onclick="action('download-pending')"
-                onmouseover="highlightPipeline(['trim', 'download'])"
+        <button type="button" class="sync-btn" onclick="action('download-pending')"
+                title="Trim over limit, download top viewed only"
+                onmouseover="highlightPipeline(['trim','download'])"
                 onmouseout="clearPipelineHighlight()">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-          <span class="action-title">Download top tracks</span>
-          <span class="action-desc">Remove extras over limit, then download only top viewed (per artist cap)</span>
+          <span class="sync-btn-icon">↓</span>
+          <span class="sync-btn-label">Download tops</span>
         </button>
-        <button type="button" class="btn ghost action-tile" onclick="action('reconcile')"
-                onmouseover="highlightPipeline(['match', 'trim'])"
+        <button type="button" class="sync-btn" onclick="action('reconcile')"
+                title="Match disk ↔ DB, enforce caps"
+                onmouseover="highlightPipeline(['match','trim'])"
                 onmouseout="clearPipelineHighlight()">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
-          <span class="action-title">Refresh files</span>
-          <span class="action-desc">Match disk ↔ database, then delete tracks over limit (not top viewed)</span>
+          <span class="sync-btn-icon">↻</span>
+          <span class="sync-btn-label">Refresh files</span>
         </button>
       </div>
-      <details class="tools-panel">
-        <summary>More tools</summary>
-        <div class="actions">
-          <button type="button" class="btn ghost" onclick="action('fix-metadata')"
-                  onmouseover="highlightPipeline(['match'])"
-                  onmouseout="clearPipelineHighlight()">Fix tags &amp; covers</button>
-          <button type="button" class="btn ghost" onclick="action('mark-romanian')">Mark Romanian artists</button>
-          <button type="button" class="btn ghost" onclick="action('migrate-structure')"
-                  onmouseover="highlightPipeline(['match'])"
-                  onmouseout="clearPipelineHighlight()">Migrate folder layout</button>
-          <button type="button" class="btn ghost danger" onclick="if(confirm('Deduplicate all artists and tracks?'))action('deduplicate')">Deduplicate library</button>
+      <div class="sync-footer">
+        <button type="button" class="btn danger-outline sm" onclick="stop()">Stop job</button>
+        <div class="direct-download-group" style="flex:1;min-width:200px">
+          <input id="directDownloadUrl" placeholder="Paste Spotify / YouTube URL…"/>
+          <button type="button" onclick="downloadDirect()" title="Direct download">↓</button>
         </div>
+      </div>
+      <details class="sync-more">
+        <summary>Advanced tools</summary>
+        <div class="actions">
+          <button type="button" class="btn ghost sm" onclick="action('fix-metadata')">Fix tags</button>
+          <button type="button" class="btn ghost sm" onclick="action('mark-romanian')">Mark RO</button>
+          <button type="button" class="btn ghost sm" onclick="action('migrate-structure')">Migrate folders</button>
+          <button type="button" class="btn ghost sm danger" onclick="if(confirm('Deduplicate library?'))action('deduplicate')">Deduplicate</button>
+        </div>
+        <div class="hint" style="padding-bottom:12px">Folder: <span id="musicDirHint" class="muted">—</span></div>
       </details>
-      <div class="gradient-sep"></div>
-      <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
-        <button type="button" class="btn danger-outline sm" onclick="stop()">Stop running job</button>
-      </div>
-      <div class="gradient-sep"></div>
-      <div class="direct-download-group">
-        <input id="directDownloadUrl" placeholder="Direct Download (Spotify or YouTube URL) - bypasses DB checks"/>
-        <button onclick="downloadDirect()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download</button>
-      </div>
-      <div class="hint" style="margin-top:12px">Music folder: <span id="musicDirHint" class="muted">—</span></div>
     </div>
   </section>
 
@@ -2777,6 +3018,28 @@ HTML = r"""<!doctype html>
   </section>
 </main>
 
+<div id="ytMusicModal" class="modal hide" onclick="if(event.target===this) closeYtMusicModal()">
+  <div class="modal-content" style="max-width:480px" onclick="event.stopPropagation()">
+    <button type="button" class="modal-close" onclick="closeYtMusicModal()">×</button>
+    <h2 id="ytModalTitle" style="margin-top:0;font-size:18px">YouTube Music</h2>
+    <p id="ytModalStatus" class="muted" style="font-size:13px;margin:0 0 12px"></p>
+    <a id="ytModalLink" class="yt-modal-url hide" href="#" target="_blank" rel="noreferrer noopener"></a>
+    <div class="yt-modal-field">
+      <label for="ytModalUrlInput">Artist page URL or @handle</label>
+      <input id="ytModalUrlInput" placeholder="https://music.youtube.com/@ArtistName"/>
+    </div>
+    <div class="yt-modal-field" style="margin-top:10px">
+      <label for="ytModalNameInput">YT Music name (optional)</label>
+      <input id="ytModalNameInput" placeholder="Display name on YouTube Music"/>
+    </div>
+    <div class="yt-modal-actions">
+      <button type="button" class="btn sm" onclick="saveYtMusicModal()">Save</button>
+      <button type="button" class="btn ghost sm" onclick="markYtNotFound()">Mark missing</button>
+      <button type="button" class="btn ghost sm" onclick="closeYtMusicModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <div id="songModal" class="modal hide" onclick="if(event.target===this) closeSongModal()">
   <div class="modal-content song-modal-content" onclick="event.stopPropagation()">
     <button type="button" class="modal-close" onclick="closeSongModal()">×</button>
@@ -2843,8 +3106,75 @@ function syncMobileLists(){
   document.querySelector('.lib-table-wrap')?.classList.toggle('hide',m);
 }
 mobileMq.addEventListener('change',()=>{syncMobileLists();renderArtists();renderLibrary();});
+const navMq=window.matchMedia('(max-width:768px)');
+function onNavMqChange(){
+  if(!navMq.matches){document.body.classList.remove('mobile-nav-open');$('#navOverlay')?.classList.remove('show');}
+}
+navMq.addEventListener('change',onNavMqChange);
+function openMobileNav(){document.body.classList.add('mobile-nav-open');$('#navOverlay')?.classList.add('show');}
+function closeMobileNav(){document.body.classList.remove('mobile-nav-open');$('#navOverlay')?.classList.remove('show');}
+function toggleSidebar(){
+  if(navMq.matches){document.body.classList.toggle('mobile-nav-open');$('#navOverlay')?.classList.toggle('show');return;}
+  document.body.classList.toggle('sidebar-collapsed');
+}
 syncMobileLists();
 function closeSongModal(){$('#songModal')?.classList.add('hide');}
+let ytModalArtistId=null;
+function closeYtMusicModal(){$('#ytMusicModal')?.classList.add('hide');ytModalArtistId=null;}
+function ytStatusLabel(s){
+  s=(s||'unknown').toLowerCase();
+  if(s==='found')return 'YT OK';
+  if(s==='manually_mapped')return 'YT fixed';
+  if(s==='not_found')return 'YT missing';
+  return 'YT unknown';
+}
+function openYtMusicModal(id){
+  const a=artistById(id);if(!a)return;
+  ytModalArtistId=id;
+  $('#ytModalTitle').textContent=a.name;
+  $('#ytModalStatus').textContent=ytStatusLabel(a.ytmusic_status);
+  const url=a.ytmusic_url||'';
+  const link=$('#ytModalLink');
+  if(url){link.href=url;link.textContent=url;link.classList.remove('hide');}
+  else{link.classList.add('hide');}
+  $('#ytModalUrlInput').value=url;
+  $('#ytModalNameInput').value=a.ytmusic_name||a.name||'';
+  $('#ytMusicModal').classList.remove('hide');
+}
+async function saveYtMusicModal(){
+  if(!ytModalArtistId)return;
+  const url=$('#ytModalUrlInput').value.trim();
+  const name=$('#ytModalNameInput').value.trim();
+  const body={status:url||name?'manually_mapped':'not_found'};
+  if(url)body.ytmusic_url=url;
+  if(name)body.ytmusic_name=name;
+  try{
+    const r=await api(artistUrl(ytModalArtistId,'ytmusic'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const a=artistById(ytModalArtistId);
+    if(a){a.ytmusic_status=r.status;a.ytmusic_name=r.ytmusic_name;a.ytmusic_url=r.ytmusic_url;}
+    renderArtists();flashArtistRow(ytModalArtistId);
+    toast('YouTube Music updated');
+    closeYtMusicModal();
+  }catch(e){toastErr(e.message||'Save failed');}
+}
+async function markYtNotFound(){
+  if(!ytModalArtistId||!confirm('Mark as not found on YouTube Music?'))return;
+  try{
+    const r=await api(artistUrl(ytModalArtistId,'ytmusic'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'not_found'})});
+    const a=artistById(ytModalArtistId);
+    if(a)a.ytmusic_status=r.status;
+    renderArtists();flashArtistRow(ytModalArtistId);
+    toast('Marked YT missing');
+    closeYtMusicModal();
+  }catch(e){toastErr(e.message||'Update failed');}
+}
+function artistYtButtonHtml(r){
+  const status=(r.ytmusic_status||'unknown').toLowerCase();
+  const ok=status==='found'||status==='manually_mapped';
+  const cls='btn-yt'+(ok?' ok':'');
+  const title=ok?'YouTube Music — click to view/edit':`YouTube Music — ${ytStatusLabel(status)} (click to fix)`;
+  return `<button type="button" class="${cls}" data-yt title="${esc(title)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2 31 31 0 0 0 0 12a31 31 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 24 12a31 31 0 0 0-.5-5.8zM9.75 15.02V8.98L15.5 12l-5.75 3.02z"/></svg></button>`;
+}
 function skeletonRows(cols,n=10){return Array.from({length:n},()=>'<tr class="skeleton-row">'+Array.from({length:cols},()=>'<td><span class="skel"></span></td>').join('')+'</tr>').join('');}
 async function api(path,opts={},signal){
   const r=await fetch(path,{...opts,signal});
@@ -2897,10 +3227,9 @@ function flashArtistRow(id){
   });
 }
 document.querySelectorAll('.sidebar nav button').forEach(b=>b.onclick=()=>{
-  // mark active in sidebar
   document.querySelectorAll('.sidebar nav button').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');
-  b.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});
+  closeMobileNav();
   ['dashboard','library','artists','playlists','tracks','settings','console'].forEach(id=>$('#'+id).classList.add('hide'));
   $('#'+b.dataset.tab).classList.remove('hide');
   if(b.dataset.tab==='artists'){loadDbSummary();loadArtists();}
@@ -3010,28 +3339,41 @@ async function loadLibrary(reset=true){
 }
 function libPrev(){if(libPage>0){libPage--;loadLibrary(false);}}
 function libNext(){if((libPage+1)*LIB_PAGE<libTotal){libPage++;loadLibrary(false);}}
+function libRowData(r){
+  const pct=r.track_count?Math.round(100*r.downloaded_count/r.track_count):0;
+  const bar=`<div style="height:4px;background:rgba(255,255,255,.08);border-radius:99px;overflow:hidden;flex:1;max-width:120px"><div style="height:100%;width:${pct}%;background:#ededed;border-radius:99px"></div></div>`;
+  const pill=r.downloaded_count>=r.track_count&&r.track_count>0?'<span class="pill done">done</span>':'<span class="pill pend">'+pct+'%</span>';
+  const prog=`${r.downloaded_count}/${r.track_count}`;
+  return {r,bar,pill,prog};
+}
 function renderLibrary(){
   const pages=Math.max(1,Math.ceil(libTotal/LIB_PAGE));
   $('#libPageInfo').textContent=`${libPage+1} / ${pages} · ${libTotal} albums`;
-  const empty='<tr><td colspan=4 class="muted">No albums yet — run Scan Albums.</td></tr>';
-  const emptyCards='<div class="muted" style="padding:12px">No albums yet — run Scan Albums.</div>';
-  const rows=curLib.map(r=>{
-    const pct=r.track_count?Math.round(100*r.downloaded_count/r.track_count):0;
-    const bar=`<div style="height:4px;background:rgba(255,255,255,.08);border-radius:99px;overflow:hidden;flex:1;max-width:120px"><div style="height:100%;width:${pct}%;background:#ededed;border-radius:99px"></div></div>`;
-    const pill=r.downloaded_count>=r.track_count&&r.track_count>0?'<span class="pill done">done</span>':'<span class="pill pend">'+pct+'%</span>';
-    const prog=`${r.downloaded_count}/${r.track_count}`;
-  return {r,pct,bar,pill,prog};
+  const empty='<tr><td colspan=4 class="muted">No albums yet — run Full update.</td></tr>';
+  const emptyCards='<div class="muted" style="padding:12px">No albums yet.</div>';
+  const rows=curLib.map(libRowData);
+  const grouped=new Map();
+  rows.forEach(row=>{const k=row.r.artist_name||'?';if(!grouped.has(k))grouped.set(k,[]);grouped.get(k).push(row);});
+  let tableHtml='';
+  grouped.forEach((items,artist)=>{
+    tableHtml+=`<tr class="lib-artist-head-row"><td colspan="4" class="lib-artist-head">${esc(artist)}</td></tr>`;
+    items.forEach(({r,bar,pill,prog})=>{
+      tableHtml+=`<tr><td class="muted" style="width:24px">·</td><td>${esc(r.name)}</td><td class="progress">${prog} ${bar} ${pill}</td>
+        <td><button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button></td></tr>`;
+    });
   });
-  $('#libRows').innerHTML=rows.length?rows.map(({r,bar,pill,prog})=>`<tr><td>${esc(r.artist_name)}</td><td>${esc(r.name)}</td><td class="progress">${prog} ${bar} ${pill}</td>
-      <td><button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button></td></tr>`).join(''):empty;
-  $('#libCards').innerHTML=rows.length?rows.map(({r,pill,prog})=>`<div class="lib-card">
-      <div class="lib-card-artist">${esc(r.artist_name)}</div>
-      <div class="lib-card-title">${esc(r.name)}</div>
-      <div class="lib-card-foot">
-        <span class="lib-card-progress">${prog} ${pill}</span>
-        <button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button>
-      </div>
-    </div>`).join(''):emptyCards;
+  $('#libRows').innerHTML=rows.length?tableHtml:empty;
+  let cardsHtml='';
+  grouped.forEach((items,artist)=>{
+    cardsHtml+=`<div class="lib-artist-group"><div class="lib-artist-head">${esc(artist)}</div>`;
+    items.forEach(({r,pill,prog})=>{
+      cardsHtml+=`<div class="lib-card"><div class="lib-card-title">${esc(r.name)}</div>
+        <div class="lib-card-foot"><span class="lib-card-progress">${prog} ${pill}</span>
+        <button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button></div></div>`;
+    });
+    cardsHtml+='</div>';
+  });
+  $('#libCards').innerHTML=rows.length?cardsHtml:emptyCards;
   syncMobileLists();
 }
 async function showSongs(albumId,albumName){
@@ -3163,11 +3505,10 @@ function artistRowHtml(r){
   const rowCls=r.is_romanian?'row-ro':'';
   const picked=selectedArtists.has(r.spotify_id);
   const chk=selectMode?`<td class="chk-col sel-col"><input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/></td>`:'';
-  const fixButton = artistNeedsYtFix(r) ? `<button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"></path><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"></polygon></svg></button>` : '';
   const dlBtn = `<button type="button" class="btn ghost sm" data-download title="Descărcare piese manual"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>`;
   return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td><button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync} ${artistYtMusicStatusHtml(r)}</td>
     <td class="td-actions"><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${artistLimitSelectHtml(r)}
-      ${fixButton}
+      ${artistYtButtonHtml(r)}
       ${dlBtn}
       <button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
       <button type="button" class="btn danger sm" data-del title="Remove from database. Shift+click: delete files.">×</button></div></td></tr>`;
@@ -3181,13 +3522,12 @@ function artistCardHtml(r){
   const rowCls=r.is_romanian?'row-ro':'';
   const picked=selectedArtists.has(r.spotify_id);
   const chk=selectMode?`<input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/>`:'';
-  const fixButton = artistNeedsYtFix(r) ? `<button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"></path><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"></polygon></svg></button>` : '';
   const dlBtn = `<button type="button" class="btn ghost sm" data-download title="Descărcare piese manual"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>`;
   return `<div class="artist-card ${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">
     <div class="artist-card-head">${chk}<button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button><span>${esc(r.name)}</span></div>
     <div class="artist-card-meta"><span>${r.album_count||0} albums</span><span>${prog} songs</span>${act}${sync} ${artistYtMusicStatusHtml(r)}</div>
     <div class="artist-card-actions">${artistLimitSelectHtml(r)}
-      <div class="btn-row">${fixButton}${dlBtn}<button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
+      <div class="btn-row">${artistYtButtonHtml(r)}${dlBtn}<button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
       <button type="button" class="btn danger sm" data-del title="Remove. Shift+click: delete files.">Remove</button></div></div></div>`;
 }
 function renderArtists(){
@@ -3212,7 +3552,7 @@ function onArtistListClick(e){
   if(!root)return;
   const id=root.dataset.aid;
   if(e.target.closest('button[data-ro]')){setRomanian(id,parseInt(e.target.closest('button[data-ro]').dataset.val,10));return;}
-  if(e.target.closest('button[data-fix]')){fixArtistYtMusic(id);return;}
+  if(e.target.closest('button[data-yt]')){openYtMusicModal(id);return;}
   if(e.target.closest('button[data-download]')){downloadArtist(id);return;}
   if(e.target.closest('button[data-toggle]')){toggleArtist(id);return;}
   if(e.target.closest('button[data-del]')){delArtist(id,e);return;}

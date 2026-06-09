@@ -158,6 +158,8 @@ def _migrate_columns(db: sqlite3.Connection) -> None:
         # Status values: 'found', 'not_found', 'manually_mapped', 'duplicate', 'unknown'
     if "ytmusic_notes" not in artist_cols:
         db.execute("ALTER TABLE artists ADD COLUMN ytmusic_notes TEXT")
+    if "ytmusic_url" not in artist_cols:
+        db.execute("ALTER TABLE artists ADD COLUMN ytmusic_url TEXT")
 
     song_cols = {r[1] for r in db.execute("PRAGMA table_info(songs)")}
     if "youtube_url" not in song_cols:
@@ -1357,6 +1359,85 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
     return stats
 
 
+MIN_ALBUM_TRACKS = 5
+
+
+def consolidate_small_albums(db: sqlite3.Connection, artist_id: Optional[str] = None) -> int:
+    """
+    Move tracks from albums with fewer than MIN_ALBUM_TRACKS into a virtual 'Singles' album.
+    Returns number of albums merged.
+    """
+    clause = (
+        "WHERE LOWER(TRIM(al.name)) != 'singles' "
+        "AND (SELECT COUNT(*) FROM songs s WHERE s.album_id = al.spotify_id) > 0 "
+        "AND (SELECT COUNT(*) FROM songs s WHERE s.album_id = al.spotify_id) < ?"
+    )
+    params: list = [MIN_ALBUM_TRACKS]
+    if artist_id:
+        clause += " AND al.artist_id = ?"
+        params.append(artist_id)
+
+    small = db.execute(
+        f"""
+        SELECT al.spotify_id, al.artist_id, al.name, al.track_count
+        FROM albums al
+        {clause}
+        ORDER BY al.artist_id, al.name COLLATE NOCASE
+        """,
+        params,
+    ).fetchall()
+    if not small:
+        return 0
+
+    merged = 0
+    for alb in small:
+        aid = alb["artist_id"]
+        singles = db.execute(
+            "SELECT spotify_id FROM albums WHERE artist_id=? AND LOWER(TRIM(name))='singles'",
+            (aid,),
+        ).fetchone()
+        if singles:
+            singles_id = singles["spotify_id"]
+        else:
+            singles_id = f"singles:{aid}"
+            db.execute(
+                "INSERT OR IGNORE INTO albums (spotify_id, artist_id, name, track_count, downloaded_count) VALUES (?,?,?,0,0)",
+                (singles_id, aid, "Singles"),
+            )
+
+        next_num = db.execute(
+            "SELECT COALESCE(MAX(track_number), 0) FROM songs WHERE album_id=?",
+            (singles_id,),
+        ).fetchone()[0]
+
+        songs = db.execute(
+            "SELECT spotify_id FROM songs WHERE album_id=? ORDER BY track_number, title",
+            (alb["spotify_id"],),
+        ).fetchall()
+        for i, song in enumerate(songs, start=next_num + 1):
+            db.execute(
+                "UPDATE songs SET album_id=?, track_number=? WHERE spotify_id=?",
+                (singles_id, i, song["spotify_id"]),
+            )
+
+        db.execute("DELETE FROM albums WHERE spotify_id=?", (alb["spotify_id"],))
+        row = db.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN status='downloaded' THEN 1 ELSE 0 END) AS done
+            FROM songs WHERE album_id=?
+            """,
+            (singles_id,),
+        ).fetchone()
+        db.execute(
+            "UPDATE albums SET track_count=?, downloaded_count=? WHERE spotify_id=?",
+            (row["total"], row["done"] or 0, singles_id),
+        )
+        merged += 1
+
+    return merged
+
+
 def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
     """Scan one artist's discography into albums/songs tables."""
     sid = artist_row["spotify_id"]
@@ -1417,6 +1498,9 @@ def scan_artist_catalog(artist_row: sqlite3.Row) -> tuple[int, int]:
 
     with db_connect() as db:
         new_albums, new_songs = _upsert_artist_catalog(db, sid, songs)
+        merged = consolidate_small_albums(db, sid)
+        if merged:
+            log.info("  → Merged %d small album(s) into Singles", merged)
         db.execute(
             "UPDATE artists SET albums_scanned_at=datetime('now'), "
             "ytmusic_status=CASE WHEN ytmusic_status!='manually_mapped' THEN 'found' ELSE ytmusic_status END, "
@@ -1667,8 +1751,13 @@ def _verify_artist_ytmusic_reachable(sid: str, name: str, index: int, total: int
     if status in ("found", "manually_mapped"):
         return True
     if status == "not_found":
-        log.warning("[%d/%d] %s — skipped because YT Music lookup previously failed", index, total, name)
-        return False
+        log.info("[%d/%d] %s — retrying YT Music lookup (was not_found)", index, total, name)
+        with db_connect() as db:
+            db.execute(
+                "UPDATE artists SET ytmusic_status='unknown', ytmusic_notes='Auto-retry after previous failure' WHERE spotify_id=?",
+                (sid,),
+            )
+        status = "unknown"
 
     log.info("[%d/%d] %s — verifying YT Music reachability before download", index, total, name)
     with db_connect() as db:
@@ -1944,7 +2033,7 @@ def get_resolved_album_name(db_conn, album_id: str, album_name: str, song_title:
     row = db_conn.execute(
         "SELECT track_count FROM albums WHERE spotify_id=?", (album_id,)
     ).fetchone()
-    if row and row["track_count"] is not None and row["track_count"] <= 5:
+    if row and row["track_count"] is not None and row["track_count"] < 5:
         return "Singles"
 
     if custom_dl:
@@ -1993,9 +2082,10 @@ def _apply_artist_download_cap(
         return None, False
 
     artist_row = db_conn.execute(
-        "SELECT ytmusic_status FROM artists WHERE spotify_id=?", (sid,)
+        "SELECT ytmusic_status, ytmusic_browse_id FROM artists WHERE spotify_id=?", (sid,)
     ).fetchone()
     ytmusic_status = (artist_row["ytmusic_status"] if artist_row else None) or "unknown"
+    ytm_browse_id = artist_row["ytmusic_browse_id"] if artist_row else None
 
     downloaded = db_conn.execute(
         "SELECT COUNT(*) FROM songs WHERE artist_id=? AND status='downloaded'",
@@ -2035,7 +2125,7 @@ def _apply_artist_download_cap(
             log.info("  -> Deleted %d skipped pending songs for %s", len(skip_ids), name)
         return keep_ids, True
 
-    top_tracks = _get_top_tracks_ordered(name, limit)
+    top_tracks = _get_top_tracks_ordered(name, limit, browse_id=ytm_browse_id)
     if top_tracks:
         # Fetch all songs for this artist (downloaded + pending) to align ranking perfectly
         all_songs = db_conn.execute(
@@ -2067,14 +2157,15 @@ def _apply_artist_download_cap(
         keep_ids = set()
         skip_ids = [ps["spotify_id"] for ps in pending_songs]
         log.warning(
-            "  -> %s: no YT Music top list — skipping downloads (will not use release year)",
+            "  -> %s: no YT Music top list — skipping downloads (set artist URL on Artists tab to fix)",
             name,
         )
-        db_conn.execute(
-            "UPDATE artists SET ytmusic_status='not_found', ytmusic_notes='No YT Music top list available for manual review' "
-            "WHERE spotify_id=? AND ytmusic_status!='manually_mapped'",
-            (sid,),
-        )
+        if ytmusic_status not in ("found", "manually_mapped"):
+            db_conn.execute(
+                "UPDATE artists SET ytmusic_status='not_found', ytmusic_notes='No YT Music top list — add artist URL manually' "
+                "WHERE spotify_id=? AND ytmusic_status NOT IN ('manually_mapped', 'found')",
+                (sid,),
+            )
     if prune_skipped and skip_ids:
         db_conn.execute(
             f"DELETE FROM songs WHERE spotify_id IN ({','.join(['?'] * len(skip_ids))})",
@@ -2119,13 +2210,21 @@ def _make_ytdlp_downloader(music_dir: Path, fmt: str) -> "custom_dl.YtDlpDownloa
     )
 
 
-def _get_top_tracks_ordered(artist_name: str, limit: int) -> list[dict]:
+def _get_top_tracks_ordered(artist_name: str, limit: int, browse_id: Optional[str] = None) -> list[dict]:
     """
     Full top-songs playlist from YT Music (not just the 5-song preview on get_artist).
     Each entry: {title, videoId, norm}.
     """
     import ytm_scanner
-    return ytm_scanner.get_top_songs_ordered(artist_name, limit)
+    if browse_id is None:
+        with db_connect() as db:
+            row = db.execute(
+                "SELECT ytmusic_browse_id FROM artists WHERE name=? COLLATE NOCASE LIMIT 1",
+                (artist_name,),
+            ).fetchone()
+            if row and row["ytmusic_browse_id"]:
+                browse_id = row["ytmusic_browse_id"]
+    return ytm_scanner.get_top_songs_ordered(artist_name, limit, cached_browse_id=browse_id)
 
 
 def _get_top_song_titles_ordered(artist_name: str, limit: int) -> list[str]:
@@ -2249,27 +2348,19 @@ def prune_artist_to_cap(
         return stats
 
     artist_row = db_conn.execute(
-        "SELECT ytmusic_status FROM artists WHERE spotify_id=?", (sid,)
+        "SELECT ytmusic_status, ytmusic_browse_id FROM artists WHERE spotify_id=?", (sid,)
     ).fetchone()
     ytmusic_status = (artist_row["ytmusic_status"] if artist_row else None) or "unknown"
-    if ytmusic_status == "not_found":
-        log.info("  %s: ytmusic_status is 'not_found', skipping cap pruning", name)
-        stats["kept"] = len(rows)
-        return stats
+    ytm_browse_id = artist_row["ytmusic_browse_id"] if artist_row else None
 
     downloaded = [r for r in rows if r["status"] == "downloaded"]
     if len(downloaded) <= limit and len(rows) == len(downloaded):
         stats["kept"] = len(downloaded)
         return stats
 
-    top_tracks = _get_top_tracks_ordered(name, limit)
+    top_tracks = _get_top_tracks_ordered(name, limit, browse_id=ytm_browse_id)
     if not top_tracks:
-        log.warning("  %s: no YT Music top list — cap not applied", name)
-        db_conn.execute(
-            "UPDATE artists SET ytmusic_status='not_found', ytmusic_notes='No YT Music top list available for manual review' "
-            "WHERE spotify_id=? AND ytmusic_status!='manually_mapped'",
-            (sid,),
-        )
+        log.warning("  %s: no YT Music top list — cap not applied (add artist URL on Artists tab)", name)
         stats["kept"] = len(rows)
         return stats
 
@@ -2855,6 +2946,14 @@ def cmd_reconcile(args):
         removed = db.execute("DELETE FROM albums WHERE track_count=0").rowcount
         if removed:
             log.info("  → Removed %d empty album(s)", removed)
+        merged = consolidate_small_albums(db)
+        if merged:
+            log.info("  → Merged %d small album(s) into Singles", merged)
+        db.execute("""
+            UPDATE albums SET
+                track_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id),
+                downloaded_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id AND status='downloaded')
+        """)
     log.info("▶ Enforcing caps after reconcile (delete non–top-viewed over limit)")
     enforce_all_download_caps(artist_filter, quiet_if_none=True)
 
