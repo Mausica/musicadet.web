@@ -491,9 +491,10 @@ def _cap_artist_song_counts(rows: list[dict]) -> None:
     for r in rows:
         max_dl = _effective_artist_limit(r["max_downloads"], global_max)
         if max_dl > 0:
-            dl = min(int(r.get("songs_dl") or 0), max_dl)
+            catalog_total = int(r.get("songs_total") or 0)
+            r["songs_total"] = min(max_dl, catalog_total)
+            dl = min(int(r.get("songs_dl") or 0), r["songs_total"])
             r["songs_dl"] = dl
-            r["songs_total"] = max_dl
 
 
 @app.get("/api/artists/names")
@@ -2020,8 +2021,91 @@ HTML = r"""<!doctype html>
     font-weight: 500;
     color: var(--muted);
     user-select: none;
+    list-style: none; /* Hide default arrow */
+    outline: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .tools-panel summary::-webkit-details-marker {
+    display: none; /* Hide standard arrow in WebKit */
+  }
+  .tools-panel summary::before {
+    content: '▶';
+    font-size: 9px;
+    transition: transform 0.2s ease;
+    display: inline-block;
+    color: var(--muted);
+  }
+  .tools-panel[open] summary::before {
+    transform: rotate(90deg);
   }
   .tools-panel .actions { margin-top: 12px; }
+  .btn.danger-outline {
+    background: transparent;
+    color: var(--error);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    font-weight: 500;
+    font-size: 13px;
+    padding: 8px 14px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn.danger-outline:hover {
+    background: var(--error);
+    color: #ffffff;
+    border-color: var(--error);
+    box-shadow: 0 0 12px rgba(239, 68, 68, 0.25);
+  }
+  .direct-download-group {
+    display: flex;
+    align-items: stretch;
+    width: 100%;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .direct-download-group:focus-within {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+  }
+  .direct-download-group input {
+    flex: 1;
+    background: transparent;
+    border: none !important;
+    border-radius: 0 !important;
+    padding: 10px 14px;
+    font-size: 13px;
+    color: var(--txt);
+    outline: none;
+    box-shadow: none !important;
+  }
+  .direct-download-group button {
+    border: none !important;
+    border-left: 1px solid var(--border) !important;
+    border-radius: 0 !important;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 0 16px;
+    font-size: 13px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    color: var(--txt);
+    transition: background 0.2s, color 0.2s;
+    box-shadow: none !important;
+  }
+  .direct-download-group button:hover {
+    background: var(--primary);
+    color: var(--primary-fg);
+  }
   .dash-intro { margin: 0 0 16px; max-width: 52rem; }
   .toast {
     position: fixed;
@@ -2439,12 +2523,12 @@ HTML = r"""<!doctype html>
       </details>
       <div class="gradient-sep"></div>
       <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
-        <button type="button" class="btn danger sm" onclick="stop()">Stop running job</button>
+        <button type="button" class="btn danger-outline sm" onclick="stop()">Stop running job</button>
       </div>
       <div class="gradient-sep"></div>
-      <div class="row">
-        <input id="directDownloadUrl" placeholder="Direct Download (Spotify/YT URL) - no DB checks" style="flex:1"/>
-        <button class="btn ghost" onclick="downloadDirect()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download directly</button>
+      <div class="direct-download-group">
+        <input id="directDownloadUrl" placeholder="Direct Download (Spotify or YouTube URL) - bypasses DB checks"/>
+        <button onclick="downloadDirect()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download</button>
       </div>
       <div class="hint" style="margin-top:12px">Music folder: <span id="musicDirHint" class="muted">—</span></div>
     </div>
@@ -3011,8 +3095,8 @@ function artistRowHtml(r){
   const rowCls=r.is_romanian?'row-ro':'';
   const picked=selectedArtists.has(r.spotify_id);
   const chk=selectMode?`<td class="chk-col sel-col"><input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/></td>`:'';
-  const fixButton = artistNeedsYtFix(r) ? `<button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping">YT</button>` : '';
-  const dlBtn = `<button type="button" class="btn ghost sm" data-download title="Descărcare piese manual">DL</button>`;
+  const fixButton = artistNeedsYtFix(r) ? `<button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"></path><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"></polygon></svg></button>` : '';
+  const dlBtn = `<button type="button" class="btn ghost sm" data-download title="Descărcare piese manual"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>`;
   return `<tr class="${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">${chk}<td><button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button>${esc(r.name)}</td><td class="muted">${r.album_count||0}</td><td class="muted">${prog}</td><td>${act} ${sync} ${artistYtMusicStatusHtml(r)}</td>
     <td class="td-actions"><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${artistLimitSelectHtml(r)}
       ${fixButton}
@@ -3029,8 +3113,8 @@ function artistCardHtml(r){
   const rowCls=r.is_romanian?'row-ro':'';
   const picked=selectedArtists.has(r.spotify_id);
   const chk=selectMode?`<input type="checkbox" class="row-chk" data-aid="${esc(r.spotify_id)}" ${picked?'checked':''}/>`:'';
-  const fixButton = artistNeedsYtFix(r) ? `<button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping">YT</button>` : '';
-  const dlBtn = `<button type="button" class="btn ghost sm" data-download title="Descărcare piese manual">DL</button>`;
+  const fixButton = artistNeedsYtFix(r) ? `<button type="button" class="btn ghost sm" data-fix title="Fix YouTube Music mapping"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"></path><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"></polygon></svg></button>` : '';
+  const dlBtn = `<button type="button" class="btn ghost sm" data-download title="Descărcare piese manual"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>`;
   return `<div class="artist-card ${rowCls}${picked?' row-picked':''}" data-aid="${esc(r.spotify_id)}">
     <div class="artist-card-head">${chk}<button type="button" class="ro-toggle ${roCls}" data-ro data-val="${r.is_romanian?0:1}" title="${roTitle}">RO</button><span>${esc(r.name)}</span></div>
     <div class="artist-card-meta"><span>${r.album_count||0} albums</span><span>${prog} songs</span>${act}${sync} ${artistYtMusicStatusHtml(r)}</div>

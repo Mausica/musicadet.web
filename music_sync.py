@@ -1247,7 +1247,8 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
             
             resolved_album_key = ""
             if custom_dl:
-                resolved_album_key = custom_dl._clean_filename(custom_dl.detect_singles(album_name, song["title"])).lower()
+                resolved_album_name = get_resolved_album_name(db, song["album_id"], album_name, song["title"])
+                resolved_album_key = custom_dl._clean_filename(resolved_album_name).lower()
 
             found: Optional[Path] = None
             if song["file_path"]:
@@ -1278,25 +1279,48 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
             now = datetime.now().isoformat(timespec="seconds")
             if found:
                 rel = str(found.relative_to(music_dir))
-                current_artist_folder = Path(rel).parts[0] if len(Path(rel).parts) > 0 else ""
                 expected_artist = display_name if custom_dl is None else custom_dl._clean_filename(display_name)
                 
-                # Auto-rename / move if it's in the wrong artist folder (e.g. B A B A S H A -> Babasha)
-                if current_artist_folder and current_artist_folder.lower() != expected_artist.lower():
-                    if custom_dl:
-                        expected_album = custom_dl._clean_filename(album_name)
-                        safe_title = custom_dl._clean_filename(song["title"])
-                        if expected_album.lower() == safe_title.lower() or expected_album in ("Unknown Album", ""):
-                            expected_album = "Singles"
-                        new_folder = music_dir / expected_artist / expected_album
-                        new_folder.mkdir(parents=True, exist_ok=True)
-                        new_path = new_folder / found.name
-                        if found != new_path:
+                # Auto-rename / move if it's in the wrong folder structure
+                if custom_dl:
+                    resolved_album = get_resolved_album_name(db, song["album_id"], album_name, song["title"])
+                    safe_album = custom_dl._clean_filename(resolved_album)
+                    expected_folder = music_dir / expected_artist / safe_album
+                    old_parent = found.parent
+                    
+                    if old_parent.resolve() != expected_folder.resolve():
+                        expected_folder.mkdir(parents=True, exist_ok=True)
+                        new_path = expected_folder / found.name
+                        if found.resolve() != new_path.resolve():
                             import shutil
                             try:
-                                shutil.move(str(found), str(new_path))
-                                log.info("  [Auto-Merge] Moved %s from %s to %s", found.name, current_artist_folder, expected_artist)
-                                found = new_path
+                                if new_path.exists() and new_path.resolve() != found.resolve():
+                                    if found.stat().st_size <= new_path.stat().st_size:
+                                        found.unlink()
+                                        log.info("  [Auto-Clean] Duplicate found at destination: unlinked smaller %s", found.name)
+                                        found = new_path
+                                    else:
+                                        new_path.unlink()
+                                        shutil.move(str(found), str(new_path))
+                                        log.info("  [Auto-Move] Overwrote %s with %s", new_path.name, found.name)
+                                        found = new_path
+                                else:
+                                    shutil.move(str(found), str(new_path))
+                                    log.info("  [Auto-Move] Moved %s from %s to %s", found.name, old_parent.name, expected_folder.name)
+                                    found = new_path
+                                
+                                # Clean up old parent
+                                try:
+                                    if old_parent.exists() and not any(old_parent.iterdir()):
+                                        old_parent.rmdir()
+                                        log.info("  [Auto-Clean] Removed empty directory: %s", old_parent.name)
+                                        grandparent = old_parent.parent
+                                        if grandparent.exists() and grandparent.resolve() != music_dir.resolve() and not any(grandparent.iterdir()):
+                                            grandparent.rmdir()
+                                            log.info("  [Auto-Clean] Removed empty artist directory: %s", grandparent.name)
+                                except Exception as e:
+                                    log.debug("Failed to remove empty folder %s: %s", old_parent, e)
+
                                 rel = str(found.relative_to(music_dir))
                             except Exception as e:
                                 log.warning("Could not auto-move %s: %s", found, e)
@@ -1750,7 +1774,7 @@ def _sync_artist_with_ytdlp(
     with db_connect() as db:
         pending_rows = db.execute(
             """
-            SELECT s.spotify_id, s.title, s.track_number, s.status, s.file_path, s.youtube_url,
+            SELECT s.spotify_id, s.album_id, s.title, s.track_number, s.status, s.file_path, s.youtube_url,
                    al.name AS album_name
             FROM songs s
             JOIN albums al ON s.album_id = al.spotify_id
@@ -1786,7 +1810,8 @@ def _sync_artist_with_ytdlp(
 
         # Check if file already exists on disk
         safe_artist = custom_dl._clean_filename(name)
-        resolved_album = custom_dl.detect_singles(album_name, s["title"])
+        with db_connect() as db:
+            resolved_album = get_resolved_album_name(db, s["album_id"], album_name, s["title"])
         safe_album = custom_dl._clean_filename(resolved_album)
         safe_title = custom_dl._clean_filename(s["title"])
         expected = music_dir / safe_artist / safe_album / f"{safe_title}.{fmt}"
@@ -1805,7 +1830,7 @@ def _sync_artist_with_ytdlp(
         result = downloader.download_track(
             artist=name,
             title=s["title"],
-            album=album_name,
+            album=resolved_album,
             track_number=track_num,
             yt_url=yt_url,
         )
@@ -1814,7 +1839,7 @@ def _sync_artist_with_ytdlp(
             if result and result.exists():
                 # Embed metadata
                 custom_dl.enforce_primary_artist(
-                    result, name, s["title"], album_name, track_num
+                    result, name, s["title"], resolved_album, track_num
                 )
                 rel = str(result.relative_to(music_dir))
                 db.execute(
@@ -1877,7 +1902,7 @@ def cmd_artists_sync(args):
 
     max_dl = int(CFG.get("max_downloads_per_artist", 0))
     log.info("▶ Enforcing caps before artist sync")
-    enforce_all_download_caps(quiet_if_none=True)
+    enforce_all_download_caps(artist_filter, quiet_if_none=True)
     ok = failed = 0
     for i, a in enumerate(artists, 1):
         # Check if we're rate-limited before syncing this artist
@@ -1905,7 +1930,26 @@ def cmd_artists_sync(args):
 
     log.info("Artists sync done — ✓ %d  ✗ %d", ok, failed)
     log.info("▶ Final cap enforcement")
-    enforce_all_download_caps(quiet_if_none=True)
+    enforce_all_download_caps(artist_filter, quiet_if_none=True)
+
+
+def get_resolved_album_name(db_conn, album_id: str, album_name: str, song_title: str) -> str:
+    """
+    Resolve album name. If the album has <= 5 songs in the database, return 'Singles'.
+    Otherwise, fall back to detect_singles.
+    """
+    if not album_name or album_name == "Unknown Album":
+        return "Singles"
+
+    row = db_conn.execute(
+        "SELECT track_count FROM albums WHERE spotify_id=?", (album_id,)
+    ).fetchone()
+    if row and row["track_count"] is not None and row["track_count"] <= 5:
+        return "Singles"
+
+    if custom_dl:
+        return custom_dl.detect_singles(album_name, song_title)
+    return album_name
 
 
 def _artist_effective_limit(artist_max_downloads, global_max: int) -> int:
@@ -1948,6 +1992,11 @@ def _apply_artist_download_cap(
     if limit <= 0:
         return None, False
 
+    artist_row = db_conn.execute(
+        "SELECT ytmusic_status FROM artists WHERE spotify_id=?", (sid,)
+    ).fetchone()
+    ytmusic_status = (artist_row["ytmusic_status"] if artist_row else None) or "unknown"
+
     downloaded = db_conn.execute(
         "SELECT COUNT(*) FROM songs WHERE artist_id=? AND status='downloaded'",
         (sid,),
@@ -1973,6 +2022,18 @@ def _apply_artist_download_cap(
 
     if len(pending_songs) <= remaining:
         return {ps["spotify_id"] for ps in pending_songs}, True
+
+    if ytmusic_status == "not_found":
+        log.warning("  -> %s: ytmusic_status is 'not_found' — skipping downloads.", name)
+        keep_ids = set()
+        skip_ids = [ps["spotify_id"] for ps in pending_songs]
+        if prune_skipped and skip_ids:
+            db_conn.execute(
+                f"DELETE FROM songs WHERE spotify_id IN ({','.join(['?'] * len(skip_ids))})",
+                skip_ids,
+            )
+            log.info("  -> Deleted %d skipped pending songs for %s", len(skip_ids), name)
+        return keep_ids, True
 
     top_tracks = _get_top_tracks_ordered(name, limit)
     if top_tracks:
@@ -2185,6 +2246,15 @@ def prune_artist_to_cap(
         (sid,),
     ).fetchall()
     if not rows:
+        return stats
+
+    artist_row = db_conn.execute(
+        "SELECT ytmusic_status FROM artists WHERE spotify_id=?", (sid,)
+    ).fetchone()
+    ytmusic_status = (artist_row["ytmusic_status"] if artist_row else None) or "unknown"
+    if ytmusic_status == "not_found":
+        log.info("  %s: ytmusic_status is 'not_found', skipping cap pruning", name)
+        stats["kept"] = len(rows)
         return stats
 
     downloaded = [r for r in rows if r["status"] == "downloaded"]
@@ -2509,7 +2579,14 @@ def cmd_sync_playlist(args):
             log.info("[%d/%d] %s — %s", idx, len(songs), primary_artist, title)
 
             # Detect Singles
-            album = custom_dl.detect_singles(album, title)
+            if song_id:
+                song_row = db.execute("SELECT album_id FROM songs WHERE spotify_id=?", (song_id,)).fetchone()
+                if song_row:
+                    album = get_resolved_album_name(db, song_row["album_id"], album, title)
+                else:
+                    album = custom_dl.detect_singles(album, title)
+            else:
+                album = custom_dl.detect_singles(album, title)
 
             # Check if already downloaded
             if song_id:
