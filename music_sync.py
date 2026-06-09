@@ -2849,6 +2849,42 @@ def cmd_reconcile(args):
     enforce_all_download_caps(artist_filter, quiet_if_none=True)
 
 
+def cmd_repair_albums(args):
+    """Recompute `track_count` and `downloaded_count` for all albums.
+    Optionally delete albums that have `track_count == 0`.
+    """
+    remove_empty = getattr(args, "remove_empty", False)
+    dry_run = getattr(args, "dry_run", False)
+    with db_connect() as db:
+        log.info("Recomputing album track/downloaded counts...")
+        db.execute("""
+            UPDATE albums SET 
+            track_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id),
+            downloaded_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id AND status='downloaded')
+        """)
+        db.commit()
+
+        empties = db.execute("SELECT spotify_id, artist_id, name, track_count, downloaded_count FROM albums WHERE track_count=0 ORDER BY name COLLATE NOCASE").fetchall()
+        if not empties:
+            log.info("No empty albums found — nothing to do.")
+            return
+
+        log.info("Found %d albums with track_count=0", len(empties))
+        for r in empties[:200]:
+            art = db.execute("SELECT name FROM artists WHERE spotify_id=?", (r["artist_id"],)).fetchone()
+            artname = art["name"] if art else r["artist_id"]
+            print(f"{r['spotify_id']} — {artname} — {r['name']} (downloaded={r['downloaded_count']})")
+
+        if remove_empty:
+            if dry_run:
+                log.info("Dry-run: would delete %d empty albums (no changes applied)", len(empties))
+                return
+            ids = [e["spotify_id"] for e in empties]
+            db.execute(f"DELETE FROM albums WHERE spotify_id IN ({','.join(['?']*len(ids))})", ids)
+            db.commit()
+            log.info("Deleted %d empty albums", len(ids))
+
+
 def cmd_fix_metadata(args):
     artist_filter = getattr(args, "artist", None)
     with db_connect() as db:
@@ -3038,6 +3074,13 @@ Examples:
     )
     pr.add_argument("--artist", help="Only this artist (name substring or spotify id)")
     pr.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
+
+    ra = subparsers.add_parser(
+        "repair-albums",
+        help="Recompute album track/downloaded counts and optionally remove empty albums",
+    )
+    ra.add_argument("--remove-empty", action="store_true", help="Delete albums with track_count == 0")
+    ra.add_argument("--dry-run", action="store_true", help="Show what would be removed without deleting")
 
     # New: playlist-first sync command
     sp = subparsers.add_parser(
