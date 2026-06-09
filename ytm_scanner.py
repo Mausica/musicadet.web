@@ -70,6 +70,23 @@ def _try_alternative_searches(artist_name: str, ytm) -> Optional[tuple[str, str]
     return None
 
 
+def _search_artists_safe(artist_name: str, ytm) -> list[dict]:
+    """Try artist search with fallback filters and return any results."""
+    for args in [
+        {"filter": "artists", "limit": 5},
+        {"limit": 5},
+        {"filter": "songs", "limit": 25},
+    ]:
+        try:
+            results = ytm.search(artist_name, **args) if "filter" in args else ytm.search(artist_name, limit=args["limit"])
+            if results:
+                return results
+        except Exception as e:
+            log.info("YTMusic search fallback failed for %s (%s): %s", artist_name, args, e)
+            continue
+    return []
+
+
 def scan_artist(artist_name: str, ytmusic_instance=None) -> List[Dict]:
     """Fetch full catalog for *artist_name* from YouTube Music."""
     songs, _, _ = scan_artist_with_metadata(artist_name, ytmusic_instance)
@@ -103,12 +120,7 @@ def scan_artist_with_metadata(
     else:
         log.info("Searching YTMusic for artist: %s", artist_name)
 
-        try:
-            results = ytm.search(artist_name, filter="artists", limit=3)
-        except Exception as e:
-            log.warning("YTMusic search failed for %s: %s", artist_name, e)
-            return [], None, None
-
+        results = _search_artists_safe(artist_name, ytm)
         if not results:
             log.warning("No YTMusic results for %s", artist_name)
             return [], None, None
@@ -130,6 +142,15 @@ def scan_artist_with_metadata(
             if alt_result:
                 browse_id, matched_name = alt_result
                 log.info("Found via alternative search: %s → %s", artist_name, matched_name)
+            else:
+                # Try searching by stripped Topic suffix if available
+                stripped_name = _strip_topic_suffix(artist_name)
+                if stripped_name != artist_name:
+                    log.info("Trying stripped artist name: %s", stripped_name)
+                    alt_result = _try_alternative_searches(stripped_name, ytm)
+                    if alt_result:
+                        browse_id, matched_name = alt_result
+                        log.info("Found via stripped alternative search: %s → %s", artist_name, matched_name)
 
         if not browse_id:
             log.warning("No matching YTMusic artist for '%s' (got: %s)",
@@ -343,10 +364,9 @@ def get_top_songs_ordered(artist_name: str, limit: int) -> List[Dict]:
     search_name = _strip_topic_suffix(artist_name)
     ytm = YTMusic()
 
-    try:
-        results = ytm.search(search_name, filter="artists", limit=5)
-    except Exception as e:
-        log.warning("YTMusic artist search failed for %s: %s", artist_name, e)
+    results = _search_artists_safe(search_name, ytm)
+    if not results:
+        log.warning("YTMusic artist search failed for %s", artist_name)
         results = []
 
     browse_id = None

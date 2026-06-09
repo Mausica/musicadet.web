@@ -542,6 +542,8 @@ def api_artists(
     sql = f"""
         SELECT a.spotify_id, a.name, a.source, a.active, a.sync_done, a.last_synced, a.added_at,
                a.albums_scanned_at, a.max_downloads, a.is_romanian, a.ytmusic_status, a.ytmusic_name, a.ytmusic_notes,
+               a.ytmusic_browse_id,
+               CASE WHEN a.ytmusic_browse_id IS NOT NULL THEN 'https://music.youtube.com/channel/' || a.ytmusic_browse_id ELSE NULL END AS ytmusic_url,
                COALESCE(ac.album_count, 0) AS album_count,
                COALESCE(sc.songs_dl, 0) AS songs_dl,
                COALESCE(sc.songs_total, 0) AS songs_total
@@ -2812,11 +2814,12 @@ function artistYtMusicStatusHtml(r){
   const status = (r.ytmusic_status||'unknown').toLowerCase();
   const name = r.ytmusic_name || r.name || '';
   const notes = r.ytmusic_notes ? ` — ${r.ytmusic_notes}` : '';
+  const href = r.ytmusic_url ? ` href="${esc(r.ytmusic_url)}" target="_blank" rel="noreferrer noopener"` : '';
   if(status==='found'){
-    return `<span class="pill done" title="YT Music matched: ${esc(name)}${esc(notes)}">YT OK</span>`;
+    return `<a class="pill done"${href} title="YT Music matched: ${esc(name)}${esc(notes)}">YT OK</a>`;
   }
   if(status==='manually_mapped'){
-    return `<span class="pill on" title="Manually mapped to ${esc(name)}${esc(notes)}">YT fixed</span>`;
+    return `<a class="pill on"${href} title="Manually mapped to ${esc(name)}${esc(notes)}">YT fixed</a>`;
   }
   if(status==='not_found'){
     return `<span class="pill warn" title="YT Music not found${esc(notes)}">YT missing</span>`;

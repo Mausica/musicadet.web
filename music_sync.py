@@ -2845,6 +2845,16 @@ def cmd_reconcile(args):
         stats = reconcile_artist_downloads(a["spotify_id"], a["name"], file_index=file_index)
         log.info("  → %d downloaded, %d pending", stats["downloaded"], stats["pending"])
 
+    log.info("▶ Final album cleanup after reconcile")
+    with db_connect() as db:
+        db.execute("""
+            UPDATE albums SET 
+                track_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id),
+                downloaded_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id AND status='downloaded')
+        """)
+        removed = db.execute("DELETE FROM albums WHERE track_count=0").rowcount
+        if removed:
+            log.info("  → Removed %d empty album(s)", removed)
     log.info("▶ Enforcing caps after reconcile (delete non–top-viewed over limit)")
     enforce_all_download_caps(artist_filter, quiet_if_none=True)
 
