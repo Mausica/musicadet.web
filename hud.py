@@ -560,7 +560,7 @@ def _aggregate_capped_song_stats(conn, *, active_only: bool = True) -> dict:
     for r in rows:
         dl = int(r["dl"])
         cat = int(r["catalog"])
-        sync_done = int(r.get("sync_done", 0))
+        sync_done = int(r["sync_done"] or 0)
         cap = _effective_artist_limit(r["max_downloads"], global_max)
         catalog += cat
         if cap > 0:
@@ -748,6 +748,60 @@ def api_db_summary():
             "songs_failed": one("SELECT COUNT(*) FROM songs WHERE status = 'failed'"),
             "playlists_active": one("SELECT COUNT(*) FROM playlists WHERE active = 1"),
         }
+
+
+@app.get("/api/system/storage")
+def api_system_storage():
+    import shutil
+    cfg = load_cfg()
+    music_dir = cfg.get("music_dir", "")
+    result = {"music_dir": music_dir, "available": False}
+    if music_dir and Path(music_dir).exists():
+        try:
+            usage = shutil.disk_usage(music_dir)
+            result.update({
+                "available": True,
+                "total": usage.total,
+                "used": usage.used,
+                "free": usage.free,
+                "percent_used": round(usage.used / usage.total * 100, 1) if usage.total else 0,
+            })
+        except Exception as e:
+            result["error"] = str(e)
+    return result
+
+
+@app.get("/api/issues")
+def api_issues(kind: str = "failed", offset: int = 0, limit: int = 100):
+    """Return songs with a specific issue: failed, missing_cover, missing_lyrics, missing_tags."""
+    sql = """
+        SELECT s.spotify_id, s.title, s.status, s.file_path,
+               s.has_cover, s.has_lyrics, s.has_core_tags,
+               al.name AS album_name, ar.name AS artist_name, ar.spotify_id AS artist_id
+        FROM songs s
+        JOIN albums al ON al.spotify_id = s.album_id
+        JOIN artists ar ON ar.spotify_id = s.artist_id
+        WHERE ar.active = 1
+    """
+    if kind == "failed":
+        sql += " AND s.status = 'failed'"
+    elif kind == "missing_cover":
+        sql += " AND s.status = 'downloaded' AND s.has_cover = 0"
+    elif kind == "missing_lyrics":
+        sql += " AND s.status = 'downloaded' AND s.has_lyrics = 0"
+    elif kind == "missing_tags":
+        sql += " AND s.status = 'downloaded' AND s.has_core_tags = 0"
+    else:
+        return JSONResponse({"error": "unknown kind"}, status_code=400)
+    count_sql = sql.replace(
+        "SELECT s.spotify_id, s.title, s.status, s.file_path,\n               s.has_cover, s.has_lyrics, s.has_core_tags,\n               al.name AS album_name, ar.name AS artist_name, ar.spotify_id AS artist_id",
+        "SELECT COUNT(*)"
+    )
+    sql += " ORDER BY ar.name, al.name, s.title LIMIT ? OFFSET ?"
+    with db() as conn:
+        total = conn.execute(count_sql).fetchone()[0]
+        rows = [dict(r) for r in conn.execute(sql, (limit, offset)).fetchall()]
+    return {"items": rows, "total": total, "kind": kind}
 
 
 @app.post("/api/artists/bulk")
@@ -2218,13 +2272,23 @@ HTML = r"""<!doctype html>
     color: var(--muted);
     margin-left: 8px;
   }
-  .db-summary {
-    font-size: 11px;
-    color: var(--muted);
-    margin-bottom: 12px;
-    letter-spacing: 0.02em;
-  }
+  .db-summary { font-size: 11px; color: var(--muted); margin-bottom: 12px; letter-spacing: 0.02em; }
   .db-summary b { color: var(--txt); font-weight: 600; }
+  /* ── Health tab ──────────────────────────────────────── */
+  .storage-widget { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-top: 8px; }
+  .storage-stat { background: var(--surface); border-radius: var(--radius); padding: 16px 18px; text-align: center; }
+  .storage-stat .s-val { font-size: 26px; font-weight: 700; color: var(--accent); letter-spacing: -0.5px; }
+  .storage-stat .s-lbl { font-size: 11px; color: var(--muted); margin-top: 4px; text-transform: uppercase; letter-spacing: .06em; }
+  .storage-bar-wrap { margin-top: 20px; }
+  .storage-bar-track { height: 10px; background: var(--surface); border-radius: 99px; overflow: hidden; }
+  .storage-bar-fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--accent), #7c3aed); transition: width .6s ease; }
+  .storage-bar-fill.warn { background: linear-gradient(90deg, #f59e0b, #ef4444); }
+  .storage-bar-label { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .issue-badge { display: inline-block; padding: 2px 7px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+  .issue-badge.failed { background: rgba(239,68,68,.15); color: #f87171; }
+  .issue-badge.cover { background: rgba(245,158,11,.15); color: #fbbf24; }
+  .issue-badge.lyrics { background: rgba(99,102,241,.15); color: #818cf8; }
+  .issue-badge.tags { background: rgba(16,185,129,.15); color: #34d399; }
   .sel-bar {
     display: flex;
     align-items: center;
@@ -2910,6 +2974,7 @@ HTML = r"""<!doctype html>
       <button type="button" data-tab="dashboard" class="active"><span class="nav-icon">◫</span><span class="nav-label">Dashboard</span></button>
       <button type="button" data-tab="library"><span class="nav-icon">♫</span><span class="nav-label">Library</span></button>
       <button type="button" data-tab="artists"><span class="nav-icon">◎</span><span class="nav-label">Artists</span></button>
+      <button type="button" data-tab="health"><span class="nav-icon">♥</span><span class="nav-label">Health</span></button>
       <button type="button" data-tab="tracks"><span class="nav-icon">▦</span><span class="nav-label">Files</span></button>
     </nav>
     <div class="side-title">Administration</div>
@@ -3125,6 +3190,36 @@ HTML = r"""<!doctype html>
       <div class="table-scroll">
       <table class="table"><thead><tr><th>Playlist</th><th>Status</th><th>Last scan</th><th>Actions</th></tr></thead>
       <tbody id="playlistRows"></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <section id="health" class="hide">
+    <div class="card">
+      <h2>💾 Storage Health</h2>
+      <div id="storageWidget" class="storage-widget">
+        <div class="storage-loading muted">Loading storage info…</div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>⚠️ Issues Panel</h2>
+      <div class="filter-chips" id="issueFilterChips" role="group" aria-label="Issue type">
+        <button type="button" class="chip active" data-issue="failed" onclick="loadIssues('failed')">❌ Failed Downloads</button>
+        <button type="button" class="chip" data-issue="missing_cover" onclick="loadIssues('missing_cover')">🖼 Missing Cover</button>
+        <button type="button" class="chip" data-issue="missing_lyrics" onclick="loadIssues('missing_lyrics')">🎵 Missing Lyrics</button>
+        <button type="button" class="chip" data-issue="missing_tags" onclick="loadIssues('missing_tags')">🏷 Missing Tags</button>
+      </div>
+      <div style="margin-top:12px;color:var(--muted);font-size:13px" id="issueCount"></div>
+      <div class="table-scroll" style="margin-top:10px">
+        <table class="table">
+          <thead><tr><th>Artist</th><th>Album</th><th>Title</th><th>Issue</th><th>Actions</th></tr></thead>
+          <tbody id="issueRows"><tr><td colspan="5" class="muted" style="text-align:center">Click a filter above to load issues</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button type="button" class="btn ghost sm" onclick="issuePrev()">← Prev</button>
+        <span id="issuePageInfo" class="muted">Page 1</span>
+        <button type="button" class="btn ghost sm" onclick="issueNext()">Next →</button>
       </div>
     </div>
   </section>
@@ -3438,13 +3533,14 @@ document.querySelectorAll('.sidebar nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.sidebar nav button').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');
   closeMobileNav();
-  ['dashboard','library','artists','playlists','tracks','settings','console'].forEach(id=>$('#'+id).classList.add('hide'));
+  ['dashboard','library','artists','playlists','tracks','settings','console','health'].forEach(id=>$('#'+id).classList.add('hide'));
   $('#'+b.dataset.tab).classList.remove('hide');
   if(b.dataset.tab==='artists'){loadDbSummary();loadArtists();}
   if(b.dataset.tab==='playlists')loadPlaylists();
   if(b.dataset.tab==='tracks')loadTracks();
   if(b.dataset.tab==='library'){loadLibArtists();loadLibrary();}
   if(b.dataset.tab==='settings')loadSettings();
+  if(b.dataset.tab==='health'){loadStorageHealth();loadIssues('failed');}
 });
 async function loadStats(){
   let s;
@@ -4076,6 +4172,92 @@ async function stop(){
 }
 function showConsole(){document.querySelector('aside.sidebar nav button[data-tab="console"]')?.click();}
 function clearConsole(){$('#consoleOut').innerHTML='';}
+/* ── Health tab ───────────────────────────────────────── */
+function fmtBytes(b){
+  if(b==null)return'—';
+  const units=['B','KB','MB','GB','TB'];
+  let i=0;while(b>=1024&&i<units.length-1){b/=1024;i++;}
+  return b.toFixed(i>0?1:0)+' '+units[i];
+}
+async function loadStorageHealth(){
+  const el=$('#storageWidget');
+  try{
+    const s=await api('/api/system/storage');
+    if(!s.available){
+      el.innerHTML=`<p class="muted">Storage info unavailable${s.error?' — '+s.error:''}.</p>`;
+      return;
+    }
+    const pct=s.percent_used;
+    const warn=pct>85;
+    el.innerHTML=`
+      <div class="storage-widget">
+        <div class="storage-stat"><div class="s-val">${fmtBytes(s.total)}</div><div class="s-lbl">Total Disk</div></div>
+        <div class="storage-stat"><div class="s-val">${fmtBytes(s.used)}</div><div class="s-lbl">Used</div></div>
+        <div class="storage-stat"><div class="s-val" style="${warn?'color:#f87171':''}">${fmtBytes(s.free)}</div><div class="s-lbl">Free</div></div>
+        <div class="storage-stat"><div class="s-val" style="${warn?'color:#f87171':''}">${pct}%</div><div class="s-lbl">Disk Usage</div></div>
+      </div>
+      <div class="storage-bar-wrap">
+        <div class="storage-bar-track">
+          <div class="storage-bar-fill${warn?' warn':''}" style="width:${Math.min(pct,100)}%"></div>
+        </div>
+        <div class="storage-bar-label">
+          <span>Music folder: <b>${s.music_dir}</b></span>
+          <span>${pct}% used</span>
+        </div>
+      </div>`;
+  }catch(e){el.innerHTML=`<p class="muted">Failed to load storage info.</p>`;}
+}
+let _issueKind='failed',_issuePage=0,_issueTotal=0;
+const _issueLimit=100;
+async function loadIssues(kind){
+  if(kind){
+    _issueKind=kind;_issuePage=0;
+    document.querySelectorAll('#issueFilterChips .chip').forEach(c=>c.classList.toggle('active',c.dataset.issue===kind));
+  }
+  const offset=_issuePage*_issueLimit;
+  const rows=$('#issueRows');
+  rows.innerHTML='<tr><td colspan="5" class="muted" style="text-align:center">Loading…</td></tr>';
+  try{
+    const data=await api(`/api/issues?kind=${_issueKind}&offset=${offset}&limit=${_issueLimit}`);
+    _issueTotal=data.total;
+    const totalPages=Math.max(1,Math.ceil(_issueTotal/_issueLimit));
+    $('#issuePageInfo').textContent=`Page ${_issuePage+1} / ${totalPages}`;
+    $('#issueCount').textContent=`${_issueTotal} issue${_issueTotal===1?'':'s'} found`;
+    if(!data.items.length){
+      rows.innerHTML='<tr><td colspan="5" style="text-align:center;padding:24px;color:var(--accent)">✅ No issues found!</td></tr>';
+      return;
+    }
+    const badgeClass={failed:'failed',missing_cover:'cover',missing_lyrics:'lyrics',missing_tags:'tags'}[_issueKind]||'';
+    const badgeLabel={failed:'Failed',missing_cover:'No Cover',missing_lyrics:'No Lyrics',missing_tags:'No Tags'}[_issueKind]||'';
+    rows.innerHTML=data.items.map(r=>{
+      const actions=_issueKind==='failed'
+        ?`<button class="btn ghost sm" onclick="retryDownload('${r.spotify_id}','${escHtml(r.artist_name)}')">Retry</button>`
+        :`<button class="btn ghost sm" onclick="fixMetadata('${r.artist_id}')">Fix metadata</button>`;
+      return `<tr>
+        <td>${escHtml(r.artist_name)}</td>
+        <td>${escHtml(r.album_name)}</td>
+        <td>${escHtml(r.title)}</td>
+        <td><span class="issue-badge ${badgeClass}">${badgeLabel}</span></td>
+        <td>${actions}</td>
+      </tr>`;
+    }).join('');
+  }catch(e){rows.innerHTML=`<tr><td colspan="5" class="muted" style="text-align:center">Error: ${e.message||e}</td></tr>`;}
+}
+function issuePrev(){if(_issuePage>0){_issuePage--;loadIssues();}}
+function issueNext(){if((_issuePage+1)*_issueLimit<_issueTotal){_issuePage++;loadIssues();}}
+function escHtml(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+async function retryDownload(songId,artistName){
+  try{
+    await api(`/api/run`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'download-pending',artist:artistName})});
+    toast('Retry queued for '+artistName);
+  }catch(e){toastErr('Retry failed: '+(e.message||e));}
+}
+async function fixMetadata(artistId){
+  try{
+    await api(`/api/run`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'fix-metadata'})});
+    toast('Metadata fix queued');
+  }catch(e){toastErr('Fix failed: '+(e.message||e));}
+}
 function highlightPipeline(steps) {
   document.querySelectorAll('.pipeline-step').forEach(el => {
     if (!el.classList.contains('running')) {
