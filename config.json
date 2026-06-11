@@ -13,6 +13,14 @@
   "lyrics_providers": ["genius", "musixmatch", "azlyrics"],
   "generate_lrc": false,
   "hud_port": 8800,
+  "audiomuse": {
+    "enabled": true,
+    "postgres_container": "audiomuse-postgres",
+    "postgres_user": "audiomuse",
+    "postgres_db": "audiomusedb",
+    "music_dir": "/mnt/storage_jellyfin/media/music",
+    "prune_unlisted_scores": false
+  },
   "playlists": [
     { "name": "Today's Top Hits", "url": "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M" },
     { "name": "Top 50 Romania", "url": "https://open.spotify.com/playlist/37i9dQZEVXbNZbJ6TZelCq" },

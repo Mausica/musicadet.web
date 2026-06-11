@@ -45,6 +45,14 @@ DEFAULTS = {
     "generate_lrc": False,
     "hud_port": 8800,
     "playlists": [],
+    "audiomuse": {
+        "enabled": False,
+        "postgres_container": "audiomuse-postgres",
+        "postgres_user": "audiomuse",
+        "postgres_db": "audiomusedb",
+        "music_dir": "",
+        "prune_unlisted_scores": False,
+    },
 }
 
 CONFIG_KEYS = [
@@ -72,7 +80,10 @@ def save_cfg(cfg: dict) -> None:
 
 
 def public_cfg() -> dict:
-    return {k: load_cfg().get(k, DEFAULTS.get(k)) for k in CONFIG_KEYS}
+    cfg = load_cfg()
+    out = {k: cfg.get(k, DEFAULTS.get(k)) for k in CONFIG_KEYS}
+    out["audiomuse"] = cfg.get("audiomuse") or DEFAULTS.get("audiomuse", {})
+    return out
 
 
 def _parse_ytmusic_url(url: str) -> tuple[Optional[str], Optional[str]]:
@@ -330,6 +341,15 @@ class PlaylistIn(BaseModel):
     url: str
 
 
+class AudioMuseConfigIn(BaseModel):
+    enabled: Optional[bool] = None
+    postgres_container: Optional[str] = None
+    postgres_user: Optional[str] = None
+    postgres_db: Optional[str] = None
+    music_dir: Optional[str] = None
+    prune_unlisted_scores: Optional[bool] = None
+
+
 class ConfigIn(BaseModel):
     music_dir: Optional[str] = None
     sync_dir: Optional[str] = None
@@ -345,6 +365,7 @@ class ConfigIn(BaseModel):
     generate_lrc: Optional[bool] = None
     hud_port: Optional[int] = None
     max_downloads_per_artist: Optional[int] = None
+    audiomuse: Optional[AudioMuseConfigIn] = None
 
 
 @app.get("/api/config")
@@ -358,9 +379,14 @@ def api_put_config(body: ConfigIn):
     data = body.model_dump(exclude_none=True)
     if "music_dir" in data and not Path(data["music_dir"]).is_absolute():
         return JSONResponse({"error": "music_dir must be absolute"}, status_code=400)
+    am_patch = data.pop("audiomuse", None)
     for k, v in data.items():
         if k in CONFIG_KEYS:
             cfg[k] = v
+    if am_patch is not None:
+        am = dict(cfg.get("audiomuse") or DEFAULTS.get("audiomuse") or {})
+        am.update(am_patch)
+        cfg["audiomuse"] = am
     if cfg.get("music_dir"):
         Path(cfg["music_dir"]).mkdir(parents=True, exist_ok=True)
     save_cfg(cfg)
@@ -369,16 +395,16 @@ def api_put_config(body: ConfigIn):
 
 @app.get("/api/stats")
 def api_stats():
+    music_dir = Path(load_cfg()["music_dir"])
     with db() as conn:
-        a_total = conn.execute("SELECT COUNT(*) FROM artists").fetchone()[0]
+        a_total = conn.execute("SELECT COUNT(*) FROM artists WHERE active >= 0").fetchone()[0]
         a_active = conn.execute("SELECT COUNT(*) FROM artists WHERE active=1").fetchone()[0]
-        a_synced = conn.execute("SELECT COUNT(*) FROM artists WHERE sync_done=1").fetchone()[0]
+        a_synced = conn.execute("SELECT COUNT(*) FROM artists WHERE sync_done=1 AND active >= 0").fetchone()[0]
         p_total = conn.execute("SELECT COUNT(*) FROM playlists").fetchone()[0]
         p_active = conn.execute("SELECT COUNT(*) FROM playlists WHERE active=1").fetchone()[0]
         albums_total = conn.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
         albums_downloaded = conn.execute("SELECT COUNT(*) FROM albums WHERE downloaded_count >= track_count AND track_count > 0").fetchone()[0]
         cap = _aggregate_capped_song_stats(conn, active_only=True)
-        songs_downloaded = cap["songs_downloaded"]
         songs_pending = cap["songs_pending"]
         songs_target = cap["songs_target"]
         songs_catalog = cap["songs_catalog"]
@@ -389,19 +415,43 @@ def api_stats():
         songs_missing_lyrics = conn.execute(
             "SELECT COUNT(*) FROM songs WHERE status='downloaded' AND has_lyrics=0"
         ).fetchone()[0]
+
+        verified = downloaded_db = 0
+        rows = conn.execute("""
+            SELECT s.status, s.file_path
+            FROM songs s
+            JOIN artists a ON a.spotify_id = s.artist_id
+            WHERE a.active >= 0
+        """).fetchall()
+        for row in rows:
+            if row["status"] != "downloaded":
+                continue
+            downloaded_db += 1
+            rel = (row["file_path"] or "").replace("\\", "/")
+            if not rel:
+                continue
+            fp = music_dir / rel if not Path(rel).is_absolute() else Path(rel)
+            if fp.is_file():
+                verified += 1
+
+    files_on_disk = count_tracks()
     return {
         "artists_total": a_total, "artists_active": a_active, "artists_synced": a_synced,
         "artists_pending": a_active - a_synced,
         "playlists_total": p_total, "playlists_active": p_active,
         "albums_total": albums_total, "albums_downloaded": albums_downloaded,
-        "songs_downloaded": songs_downloaded,
+        "songs_verified": verified,
+        "songs_downloaded": verified,
+        "songs_downloaded_db": downloaded_db,
         "songs_pending": songs_pending,
         "songs_target": songs_target,
         "songs_catalog": songs_catalog,
         "songs_failed": songs_failed,
         "songs_missing_cover": songs_missing_cover,
         "songs_missing_lyrics": songs_missing_lyrics,
-        "tracks": count_tracks(), "running": bus.running_label,
+        "files_on_disk": files_on_disk,
+        "tracks": files_on_disk,
+        "running": bus.running_label,
         "music_dir": load_cfg().get("music_dir"),
     }
 
@@ -945,30 +995,63 @@ async def api_edit_artist(spotify_id: str, request: Request):
 
 def _purge_artist_data(spotify_id: str, artist_name: str, delete_files: bool) -> None:
     """Remove albums/songs (and optionally files) after artist is hidden from the HUD."""
-    import re
     import shutil
-    from pathlib import Path
 
+    file_paths: list[str] = []
     with db() as conn:
+        file_paths = [
+            (r["file_path"] or "").replace("\\", "/")
+            for r in conn.execute(
+                "SELECT file_path FROM songs WHERE artist_id=? AND file_path IS NOT NULL",
+                (spotify_id,),
+            ).fetchall()
+        ]
+        conn.execute("DELETE FROM playlist_artists WHERE artist_id=?", (spotify_id,))
         conn.execute("DELETE FROM songs WHERE artist_id=?", (spotify_id,))
         conn.execute("DELETE FROM albums WHERE artist_id=?", (spotify_id,))
-    if delete_files:
-        music_dir = Path(load_cfg()["music_dir"])
 
-        def clean_name(name: str) -> str:
+    if not delete_files:
+        return
+
+    music_dir = Path(load_cfg()["music_dir"])
+    removed_paths: set[str] = set()
+
+    try:
+        import custom_dl
+        clean = custom_dl._clean_filename
+    except ImportError:
+        import re
+        def clean(name: str) -> str:
             return re.sub(r'[\\/*?:"<>|]', "", str(name)).strip().strip(".")
 
-        artist_folder = music_dir / clean_name(artist_name)
-        if artist_folder.exists() and artist_folder.is_dir():
+    artist_folder = music_dir / clean(artist_name)
+    if artist_folder.exists() and artist_folder.is_dir():
+        try:
+            shutil.rmtree(str(artist_folder))
+            removed_paths.add(str(artist_folder))
+        except Exception:
+            pass
+
+    for rel in file_paths:
+        if not rel or rel in removed_paths:
+            continue
+        fp = music_dir / rel if not Path(rel).is_absolute() else Path(rel)
+        if fp.is_file():
             try:
-                shutil.rmtree(str(artist_folder))
-                _tracks_index_cache["ts"] = 0.0
+                fp.unlink()
+                parent = fp.parent
+                while parent != music_dir and parent.exists() and not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
             except Exception:
                 pass
 
+    _track_count_cache["ts"] = 0.0
+    _tracks_index_cache["ts"] = 0.0
+
 
 @app.delete("/api/artists/{spotify_id:path}")
-async def api_delete_artist(spotify_id: str, delete_files: bool = False):
+async def api_delete_artist(spotify_id: str, delete_files: bool = True):
     _db_ready()
     spotify_id = _decode_artist_id(spotify_id)
     with db_tx() as conn:
@@ -2403,11 +2486,105 @@ HTML = r"""<!doctype html>
     border-bottom: 1px solid var(--border);
   }
   .lib-artist-head:first-child { padding-top: 6px; }
-  tr.lib-artist-head-row td.lib-artist-head {
+  .lib-list { display: flex; flex-direction: column; gap: 2px; }
+  .lib-group { margin-bottom: 8px; }
+  .lib-group-head {
     font-size: 11px;
-    padding: 10px 14px 4px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    padding: 10px 4px 6px;
+  }
+  .lib-album {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-body);
+    overflow: hidden;
+  }
+  .lib-album + .lib-album { margin-top: 4px; }
+  .lib-album-btn {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 12px 14px;
     background: transparent;
-    border-bottom: none;
+    border: none;
+    color: var(--txt);
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+  }
+  .lib-album-btn:hover { background: var(--bg-table-hover); }
+  .lib-chev {
+    flex-shrink: 0;
+    width: 16px;
+    color: var(--muted);
+    transition: transform 0.18s ease;
+    font-size: 14px;
+    line-height: 1;
+  }
+  .lib-album.expanded .lib-chev { transform: rotate(90deg); }
+  .lib-album-name {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .lib-album-meta {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .lib-songs {
+    border-top: 1px solid var(--border);
+    background: rgba(0,0,0,0.15);
+    padding: 4px 0 6px;
+  }
+  .lib-song-line {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px 8px 40px;
+    font-size: 13px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .lib-song-line:last-child { border-bottom: none; }
+  .lib-song-num {
+    width: 22px;
+    flex-shrink: 0;
+    color: var(--muted);
+    font-size: 12px;
+    text-align: right;
+  }
+  .lib-song-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .lib-song-st { flex-shrink: 0; }
+  .lib-song-empty { padding: 10px 14px 10px 40px; font-size: 13px; }
+  .lib-loading { padding: 10px 14px 10px 40px; font-size: 13px; color: var(--muted); }
+  .settings-section {
+    margin-top: 24px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+  }
+  .settings-section h3 {
+    margin: 0 0 14px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-title);
   }
   .btn-yt {
     display: inline-flex;
@@ -2725,6 +2902,7 @@ HTML = r"""<!doctype html>
       <button type="button" data-tab="dashboard" class="active"><span class="nav-icon">◫</span><span class="nav-label">Dashboard</span></button>
       <button type="button" data-tab="library"><span class="nav-icon">♫</span><span class="nav-label">Library</span></button>
       <button type="button" data-tab="artists"><span class="nav-icon">◎</span><span class="nav-label">Artists</span></button>
+      <button type="button" data-tab="tracks"><span class="nav-icon">▦</span><span class="nav-label">Files</span></button>
     </nav>
     <div class="side-title">Administration</div>
     <nav aria-label="Admin">
@@ -2833,6 +3011,7 @@ HTML = r"""<!doctype html>
           <button type="button" class="btn ghost sm danger" onclick="if(confirm('Deduplicate library?'))action('deduplicate')">Deduplicate</button>
         </div>
         <div class="hint" style="padding-bottom:12px">Folder: <span id="musicDirHint" class="muted">—</span></div>
+        <div class="hint" id="audiomuseHint" style="padding-bottom:12px;display:none">AudioMuse sync runs on Refresh files / Full update.</div>
       </details>
     </div>
   </section>
@@ -2848,11 +3027,7 @@ HTML = r"""<!doctype html>
         </select>
         <button type="button" class="btn ghost sm" onclick="loadLibrary()">Refresh</button>
       </div>
-      <div id="libCards" class="lib-cards hide"></div>
-      <div class="table-scroll lib-table-wrap">
-      <table class="table lib-table"><thead><tr><th>Artist</th><th>Album</th><th>Progress</th><th>Action</th></tr></thead>
-      <tbody id="libRows"></tbody></table>
-      </div>
+      <div id="libList" class="lib-list"></div>
       <div class="pager">
         <button type="button" class="btn ghost sm" onclick="libPrev()">← Prev</button>
         <span id="libPageInfo" class="muted">Page 1</span>
@@ -3003,6 +3178,31 @@ HTML = r"""<!doctype html>
       </label>
       <button class="btn" onclick="saveSettings()" style="padding:12px 24px; font-size:14px;">Save settings</button>
       <div class="hint" style="margin-top:12px">Changing HUD port requires restarting the service.</div>
+      <div class="settings-section">
+        <h3>AudioMuse integration</h3>
+        <label style="display:flex; align-items:center; gap:12px; margin-bottom:16px; cursor:pointer;">
+          <div class="switch">
+            <input type="checkbox" id="cfgAmEnabled">
+            <span class="slider"></span>
+          </div>
+          <span style="font-size:14px; font-weight:500; color:var(--txt)">Sync score paths to AudioMuse Postgres</span>
+        </label>
+        <div class="row">
+          <div class="field" style="flex:1"><label>Docker container</label><input id="cfgAmContainer" placeholder="audiomuse-postgres"/></div>
+          <div class="field" style="flex:1"><label>Postgres DB</label><input id="cfgAmDb" placeholder="audiomusedb"/></div>
+        </div>
+        <div class="row">
+          <div class="field" style="flex:1"><label>Postgres user</label><input id="cfgAmUser" placeholder="audiomuse"/></div>
+          <div class="field" style="flex:1"><label>Music dir override</label><input id="cfgAmMusicDir" placeholder="(same as music folder)"/></div>
+        </div>
+        <label style="display:flex; align-items:center; gap:12px; margin-top:8px; cursor:pointer;">
+          <div class="switch">
+            <input type="checkbox" id="cfgAmPrune">
+            <span class="slider"></span>
+          </div>
+          <span style="font-size:13px; color:var(--muted)">Prune AudioMuse scores not in MusicaDet verified set</span>
+        </label>
+      </div>
     </div>
   </section>
 
@@ -3102,8 +3302,6 @@ function syncMobileLists(){
   const m=isMobile();
   $('#artistCards')?.classList.toggle('hide',!m);
   document.querySelector('.artist-table-wrap')?.classList.toggle('hide',m);
-  $('#libCards')?.classList.toggle('hide',!m);
-  document.querySelector('.lib-table-wrap')?.classList.toggle('hide',m);
 }
 mobileMq.addEventListener('change',()=>{syncMobileLists();renderArtists();renderLibrary();});
 const navMq=window.matchMedia('(max-width:768px)');
@@ -3241,13 +3439,19 @@ document.querySelectorAll('.sidebar nav button').forEach(b=>b.onclick=()=>{
 async function loadStats(){
   let s;
   try{s=await api('/api/stats');}catch(e){toastErr('Dashboard: '+(e.message||e));return;}
-  const target=s.songs_target??(s.songs_downloaded+s.songs_pending);
-  const songsSub=`${s.songs_downloaded} / ${target} downloaded`+
-    (s.songs_catalog&&s.songs_catalog>target?` · ${s.songs_pending} to fetch`:'');
+  const onDisk=s.files_on_disk??s.tracks??0;
+  const verified=s.songs_verified??s.songs_downloaded??0;
+  const dbMarked=s.songs_downloaded_db??verified;
+  const ghost=Math.max(0,onDisk-verified);
+  const stale=Math.max(0,dbMarked-verified);
+  const songsSub=`${verified.toLocaleString()} verified on disk`+
+    (stale?` · ${stale} DB stale`:``)+
+    (ghost?` · ${ghost} orphan file${ghost===1?'':'s'}`:``)+
+    (s.songs_pending?` · ${s.songs_pending} to fetch`:``);
   const cards = [
-    { title: 'Artists', main: s.artists_total, sub: `${s.artists_synced} / ${s.artists_total} synced` },
+    { title: 'Artists', main: s.artists_total, sub: `${s.artists_synced} / ${s.artists_total} synced · ${s.artists_active} active` },
     { title: 'Albums', main: s.albums_total, sub: `${s.albums_downloaded} / ${s.albums_total} fully downloaded` },
-    { title: 'Songs', main: target, sub: songsSub }
+    { title: 'Songs', main: onDisk, sub: songsSub }
   ];
   $('#statCards').innerHTML=cards.map(c=>`
     <div class="stat">
@@ -3264,6 +3468,11 @@ async function loadStats(){
   $('#statusText').textContent=busy?('running: '+s.running):'idle';
   $('#statusBadge').classList.toggle('busy',busy);
   $('#musicDirHint').textContent=s.music_dir||'—';
+  api('/api/config').then(c=>{
+    const am=c.audiomuse||{};
+    const hint=$('#audiomuseHint');
+    if(hint)hint.style.display=am.enabled?'block':'none';
+  }).catch(()=>{});
 }
 async function loadSettings(){
   const c=await api('/api/config');
@@ -3279,6 +3488,13 @@ async function loadSettings(){
   $('#cfgMaxDl').value=c.max_downloads_per_artist||0;
   $('#cfgLrc').checked=!!c.generate_lrc;
   $('#cfgThreads').value=c.threads||4;
+  const am=c.audiomuse||{};
+  $('#cfgAmEnabled').checked=!!am.enabled;
+  $('#cfgAmContainer').value=am.postgres_container||'audiomuse-postgres';
+  $('#cfgAmUser').value=am.postgres_user||'audiomuse';
+  $('#cfgAmDb').value=am.postgres_db||'audiomusedb';
+  $('#cfgAmMusicDir').value=am.music_dir||'';
+  $('#cfgAmPrune').checked=!!am.prune_unlisted_scores;
 }
 async function saveSettings(){
   try{
@@ -3294,7 +3510,15 @@ async function saveSettings(){
     playlist_save_timeout:parseInt($('#cfgPlTimeout').value)||600,
     playlist_save_retries:parseInt($('#cfgPlRetries').value)||3,
     max_downloads_per_artist:parseInt($('#cfgMaxDl').value)||0,
-    generate_lrc:$('#cfgLrc').checked
+    generate_lrc:$('#cfgLrc').checked,
+    audiomuse:{
+      enabled:$('#cfgAmEnabled').checked,
+      postgres_container:$('#cfgAmContainer').value.trim()||'audiomuse-postgres',
+      postgres_user:$('#cfgAmUser').value.trim()||'audiomuse',
+      postgres_db:$('#cfgAmDb').value.trim()||'audiomusedb',
+      music_dir:$('#cfgAmMusicDir').value.trim(),
+      prune_unlisted_scores:$('#cfgAmPrune').checked,
+    }
   };
   const r=await api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   if(r.error){toastErr(r.error);return;}
@@ -3310,6 +3534,8 @@ async function loadLibArtists(){
   if(cur)sel.value=cur;
 }
 let curLib = [], libPage = 0;
+const libExpanded = new Set();
+const libSongsCache = new Map();
 function libBaseUrl(){
   const aid=$('#libArtist').value,st=$('#libStatus').value;
   let url=`/api/albums?status=${st}`;
@@ -3317,10 +3543,9 @@ function libBaseUrl(){
   return url;
 }
 async function loadLibrary(reset=true){
-  if(reset)libPage=0;
+  if(reset){libPage=0;libExpanded.clear();libSongsCache.clear();}
   const gen=++libLoadGen;
-  if(isMobile())$('#libCards').innerHTML='<div class="muted" style="padding:12px">Loading…</div>';
-  else $('#libRows').innerHTML=skeletonRows(4);
+  $('#libList').innerHTML='<div class="muted" style="padding:12px">Loading…</div>';
   $('#libPageInfo').textContent='…';
   try{
     const off=libPage*LIB_PAGE;
@@ -3331,50 +3556,73 @@ async function loadLibrary(reset=true){
     renderLibrary();
   }catch(e){
     if(gen===libLoadGen){
-      $('#libRows').innerHTML='<tr><td colspan=4 class="muted">Load failed.</td></tr>';
-      $('#libCards').innerHTML='<div class="muted" style="padding:12px">Load failed.</div>';
+      $('#libList').innerHTML='<div class="muted" style="padding:12px">Load failed.</div>';
       toastErr('Library: '+(e.message||e));
     }
   }
 }
-function libPrev(){if(libPage>0){libPage--;loadLibrary(false);}}
-function libNext(){if((libPage+1)*LIB_PAGE<libTotal){libPage++;loadLibrary(false);}}
+function libPrev(){if(libPage>0){libPage--;libExpanded.clear();loadLibrary(false);}}
+function libNext(){if((libPage+1)*LIB_PAGE<libTotal){libPage++;libExpanded.clear();loadLibrary(false);}}
 function libRowData(r){
   const pct=r.track_count?Math.round(100*r.downloaded_count/r.track_count):0;
-  const bar=`<div style="height:4px;background:rgba(255,255,255,.08);border-radius:99px;overflow:hidden;flex:1;max-width:120px"><div style="height:100%;width:${pct}%;background:#ededed;border-radius:99px"></div></div>`;
   const pill=r.downloaded_count>=r.track_count&&r.track_count>0?'<span class="pill done">done</span>':'<span class="pill pend">'+pct+'%</span>';
   const prog=`${r.downloaded_count}/${r.track_count}`;
-  return {r,bar,pill,prog};
+  return {r,pill,prog};
+}
+function libSongLines(id, loading){
+  if(loading)return '<div class="lib-loading">Loading tracks…</div>';
+  const rows=libSongsCache.get(id)||[];
+  if(!rows.length)return '<div class="lib-song-empty muted">No tracks in catalog.</div>';
+  return rows.map(r=>{
+    const st=r.status==='downloaded'?'<span class="pill done">ok</span>':'<span class="pill pend">'+esc(r.status)+'</span>';
+    return `<div class="lib-song-line"><span class="lib-song-num">${r.track_number||'·'}</span><span class="lib-song-title">${esc(r.title)}</span><span class="lib-song-st">${st}</span></div>`;
+  }).join('');
+}
+async function toggleLibAlbum(id){
+  if(libExpanded.has(id)){libExpanded.delete(id);renderLibrary();return;}
+  libExpanded.add(id);
+  if(!libSongsCache.has(id)){
+    renderLibrary();
+    try{
+      const res=await api(`/api/songs?album_id=${encodeURIComponent(id)}`);
+      libSongsCache.set(id,Array.isArray(res)?res:(res.items||[]));
+    }catch(e){
+      libExpanded.delete(id);
+      libSongsCache.delete(id);
+      toastErr(e.message||'Failed to load tracks');
+    }
+  }
+  renderLibrary();
 }
 function renderLibrary(){
   const pages=Math.max(1,Math.ceil(libTotal/LIB_PAGE));
   $('#libPageInfo').textContent=`${libPage+1} / ${pages} · ${libTotal} albums`;
-  const empty='<tr><td colspan=4 class="muted">No albums yet — run Full update.</td></tr>';
-  const emptyCards='<div class="muted" style="padding:12px">No albums yet.</div>';
   const rows=curLib.map(libRowData);
+  if(!rows.length){
+    $('#libList').innerHTML='<div class="muted" style="padding:12px">No albums yet — run Full update.</div>';
+    return;
+  }
   const grouped=new Map();
   rows.forEach(row=>{const k=row.r.artist_name||'?';if(!grouped.has(k))grouped.set(k,[]);grouped.get(k).push(row);});
-  let tableHtml='';
+  let html='';
   grouped.forEach((items,artist)=>{
-    tableHtml+=`<tr class="lib-artist-head-row"><td colspan="4" class="lib-artist-head">${esc(artist)}</td></tr>`;
-    items.forEach(({r,bar,pill,prog})=>{
-      tableHtml+=`<tr><td class="muted" style="width:24px">·</td><td>${esc(r.name)}</td><td class="progress">${prog} ${bar} ${pill}</td>
-        <td><button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button></td></tr>`;
-    });
-  });
-  $('#libRows').innerHTML=rows.length?tableHtml:empty;
-  let cardsHtml='';
-  grouped.forEach((items,artist)=>{
-    cardsHtml+=`<div class="lib-artist-group"><div class="lib-artist-head">${esc(artist)}</div>`;
+    html+=`<div class="lib-group"><div class="lib-group-head">${esc(artist)}</div>`;
     items.forEach(({r,pill,prog})=>{
-      cardsHtml+=`<div class="lib-card"><div class="lib-card-title">${esc(r.name)}</div>
-        <div class="lib-card-foot"><span class="lib-card-progress">${prog} ${pill}</span>
-        <button type="button" class="btn ghost sm" data-album="${esc(r.spotify_id)}" data-album-name="${esc(r.name)}">Songs</button></div></div>`;
+      const id=r.spotify_id;
+      const exp=libExpanded.has(id);
+      const loading=exp&&!libSongsCache.has(id);
+      html+=`<div class="lib-album${exp?' expanded':''}" data-album="${esc(id)}">
+        <button type="button" class="lib-album-btn" aria-expanded="${exp}">
+          <span class="lib-chev">›</span>
+          <span class="lib-album-name">${esc(r.name)}</span>
+          <span class="lib-album-meta">${prog} ${pill}</span>
+        </button>
+        ${exp?`<div class="lib-songs">${libSongLines(id,loading)}</div>`:''}
+      </div>`;
     });
-    cardsHtml+='</div>';
+    html+='</div>';
   });
-  $('#libCards').innerHTML=rows.length?cardsHtml:emptyCards;
-  syncMobileLists();
+  $('#libList').innerHTML=html;
 }
 async function showSongs(albumId,albumName){
   $('#songModalTitle').textContent=albumName;
@@ -3511,7 +3759,7 @@ function artistRowHtml(r){
       ${artistYtButtonHtml(r)}
       ${dlBtn}
       <button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
-      <button type="button" class="btn danger sm" data-del title="Remove from database. Shift+click: delete files.">×</button></div></td></tr>`;
+      <button type="button" class="btn danger sm" data-del title="Remove artist and delete files. Shift+click: keep files on disk.">×</button></div></td></tr>`;
 }
 function artistCardHtml(r){
   const sync=r.sync_done?'<span class="pill done">synced</span>':'<span class="pill pend">pending</span>';
@@ -3528,7 +3776,7 @@ function artistCardHtml(r){
     <div class="artist-card-meta"><span>${r.album_count||0} albums</span><span>${prog} songs</span>${act}${sync} ${artistYtMusicStatusHtml(r)}</div>
     <div class="artist-card-actions">${artistLimitSelectHtml(r)}
       <div class="btn-row">${artistYtButtonHtml(r)}${dlBtn}<button type="button" class="btn ghost sm" data-toggle>${r.active?'Off':'On'}</button>
-      <button type="button" class="btn danger sm" data-del title="Remove. Shift+click: delete files.">Remove</button></div></div></div>`;
+      <button type="button" class="btn danger sm" data-del title="Remove and delete files. Shift+click: keep files.">Remove</button></div></div></div>`;
 }
 function renderArtists(){
   const pages=Math.max(1,Math.ceil(artistTotal/ART_PAGE));
@@ -3652,10 +3900,10 @@ async function fixArtistYtMusic(id){
 async function delArtist(id,ev){
   const a=artistById(id);
   if(!a)return;
-  const delFiles=!!(ev&&ev.shiftKey);
-  const msg=delFiles
-    ?`Remove “${a.name}” and delete their music folder on disk?`
-    :`Remove “${a.name}” from the database? (albums/songs cleaned up in background)`;
+  const keepFiles=!!(ev&&ev.shiftKey);
+  const msg=keepFiles
+    ?`Remove “${a.name}” from library but keep music files on disk?`
+    :`Remove “${a.name}” permanently? Their music folder and DB entries will be deleted.`;
   if(!confirm(msg))return;
   const idx=curArt.findIndex(x=>x.spotify_id===id);
   const backup=idx>=0?curArt[idx]:null;
@@ -3665,9 +3913,10 @@ async function delArtist(id,ev){
     renderArtists();
   }
   try{
-    await api(`/api/artists/${encodeURIComponent(id)}?delete_files=${delFiles}`,{method:'DELETE'});
-    toast(delFiles?'Removed (+ files deleting)':'Removed');
+    await api(`/api/artists/${encodeURIComponent(id)}?delete_files=${!keepFiles}`,{method:'DELETE'});
+    toast(keepFiles?'Removed (files kept)':'Removed (+ files deleting)');
     loadDbSummary();
+    loadStats();
   }catch(e){
     if(backup&&idx>=0){
       curArt.splice(idx,0,backup);
@@ -3892,13 +4141,14 @@ document.getElementById('artistRows')?.addEventListener('click',onArtistListClic
 document.getElementById('artistCards')?.addEventListener('click',onArtistListClick);
 document.getElementById('artistRows')?.addEventListener('change',onArtistListChange);
 document.getElementById('artistCards')?.addEventListener('change',onArtistListChange);
-function onLibSongsClick(e){
-  const b=e.target.closest('button[data-album]');
-  if(!b)return;
-  showSongs(b.dataset.album,b.dataset.albumName||'').catch(err=>toastErr(err.message||'Songs failed'));
+function onLibListClick(e){
+  const btn=e.target.closest('.lib-album-btn');
+  if(!btn)return;
+  const wrap=btn.closest('[data-album]');
+  if(!wrap)return;
+  toggleLibAlbum(wrap.dataset.album);
 }
-document.getElementById('libRows')?.addEventListener('click',onLibSongsClick);
-document.getElementById('libCards')?.addEventListener('click',onLibSongsClick);
+document.getElementById('libList')?.addEventListener('click',onLibListClick);
 document.getElementById('playlistRows')?.addEventListener('click',e=>{
   const sync=e.target.closest('[data-pl-sync]');
   if(sync){syncPl(sync.dataset.url).catch(err=>toastErr(err.message||'Sync failed'));return;}

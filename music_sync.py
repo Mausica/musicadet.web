@@ -81,6 +81,14 @@ DEFAULTS: dict = {
     "max_downloads_per_artist": 0,      # 0 = unlimited (per-artist override in DB)
     "youtube_cookies_file": "",         # path to Netscape cookies.txt (optional)
     "youtube_cookies_from_browser": "", # e.g. chrome, firefox, edge (optional)
+    "audiomuse": {
+        "enabled": False,
+        "postgres_container": "audiomuse-postgres",
+        "postgres_user": "audiomuse",
+        "postgres_db": "audiomusedb",
+        "music_dir": "",                # defaults to music_dir
+        "prune_unlisted_scores": False, # drop AudioMuse rows not in MusicaDet verified set
+    },
     "playlists": [
         {"name": "Today's Top Hits", "url": "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"},
         {"name": "Top 50 Romania", "url": "https://open.spotify.com/playlist/37i9dQZEVXbNZbJ6TZelCq"},
@@ -1230,7 +1238,7 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
         by_full, by_album_title = file_index
     else:
         by_full, by_album_title = _build_file_index(music_dir)
-    stats = {"downloaded": 0, "cover": 0, "lyrics": 0, "pending": 0}
+    stats = {"downloaded": 0, "cover": 0, "lyrics": 0, "pending": 0, "moved_paths": []}
 
     with db_connect() as db:
         row = db.execute("SELECT name FROM artists WHERE spotify_id=?", (artist_id,)).fetchone()
@@ -1279,8 +1287,9 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
                 found = by_album_title.get((resolved_album_key, title_key))
 
             now = datetime.now().isoformat(timespec="seconds")
+            old_rel = str(song["file_path"]).replace("\\", "/") if song["file_path"] else ""
             if found:
-                rel = str(found.relative_to(music_dir))
+                rel = str(found.relative_to(music_dir)).replace("\\", "/")
                 expected_artist = display_name if custom_dl is None else custom_dl._clean_filename(display_name)
                 
                 # Auto-rename / move if it's in the wrong folder structure
@@ -1323,9 +1332,14 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
                                 except Exception as e:
                                     log.debug("Failed to remove empty folder %s: %s", old_parent, e)
 
-                                rel = str(found.relative_to(music_dir))
+                                rel = str(found.relative_to(music_dir)).replace("\\", "/")
                             except Exception as e:
                                 log.warning("Could not auto-move %s: %s", found, e)
+
+                if old_rel and old_rel != rel:
+                    stats["moved_paths"].append((old_rel, rel))
+                elif not old_rel and rel:
+                    pass
 
                 meta = verify_song_metadata(found)
                 db.execute("""
@@ -1535,6 +1549,12 @@ def cmd_add(args):
     if not sid.startswith("q:") and name.startswith("artist:"):
         name = _resolve_artist_display_name(sid, _artist_target(sid, name), name)
     with db_connect() as db:
+        blocked = db.execute(
+            "SELECT active FROM artists WHERE spotify_id=?", (sid,)
+        ).fetchone()
+        if blocked and blocked["active"] == -1:
+            log.error("Artist %s was permanently removed — cannot re-add", name)
+            return
         cur = db.execute("""
             INSERT INTO artists (spotify_id, name, source) VALUES (?,?,'manual')
             ON CONFLICT(spotify_id) DO UPDATE SET active=1, name=excluded.name
@@ -1692,6 +1712,11 @@ def cmd_scan(args):
                 if not result:
                     continue
                 sid, name = result
+                blocked = db.execute(
+                    "SELECT active FROM artists WHERE spotify_id=?", (sid,)
+                ).fetchone()
+                if blocked and blocked["active"] == -1:
+                    continue
                 cur = db.execute("""
                     INSERT INTO artists (spotify_id, name, source) VALUES (?,?,?)
                     ON CONFLICT DO NOTHING
@@ -2918,9 +2943,329 @@ def cmd_migrate_structure(args):
     cmd_reconcile(args)
 
 
-def cmd_reconcile(args):
-    remove_track_number_prefixes(Path(CFG["music_dir"]))
-    artist_filter = getattr(args, "artist", None)
+# ─────────────────────────────────────────────────────────────────────────────
+# Library integrity — disk ↔ DB truth, orphan cleanup, AudioMuse sync
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def count_files_on_disk(music_dir: Optional[Path] = None) -> int:
+    root = music_dir or Path(CFG["music_dir"])
+    if not root.exists():
+        return 0
+    n = 0
+    for _r, _d, files in os.walk(root):
+        for fname in files:
+            if Path(fname).suffix.lower() in AUDIO_EXTS:
+                n += 1
+    return n
+
+
+def collect_library_truth() -> dict:
+    """Real counts: disk files vs DB rows with existing files."""
+    music_dir = Path(CFG["music_dir"])
+    with db_connect() as db:
+        rows = db.execute("""
+            SELECT s.status, s.file_path
+            FROM songs s
+            JOIN artists a ON a.spotify_id = s.artist_id
+            WHERE a.active >= 0
+        """).fetchall()
+        artists_visible = db.execute(
+            "SELECT COUNT(*) FROM artists WHERE active >= 0"
+        ).fetchone()[0]
+        artists_active = db.execute(
+            "SELECT COUNT(*) FROM artists WHERE active = 1"
+        ).fetchone()[0]
+        albums_total = db.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
+        songs_db = db.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
+
+    verified = downloaded = pending = failed = 0
+    kept_paths: set[str] = set()
+    for row in rows:
+        st = row["status"]
+        rel = (row["file_path"] or "").replace("\\", "/")
+        fp = music_dir / rel if rel and not Path(rel).is_absolute() else (Path(rel) if rel else None)
+        exists = bool(fp and fp.is_file())
+        if st == "downloaded":
+            downloaded += 1
+            if exists:
+                verified += 1
+                kept_paths.add(rel)
+        elif st == "pending":
+            pending += 1
+        elif st == "failed":
+            failed += 1
+
+    return {
+        "files_on_disk": count_files_on_disk(music_dir),
+        "songs_verified": verified,
+        "songs_downloaded_db": downloaded,
+        "songs_pending": pending,
+        "songs_failed": failed,
+        "songs_db_total": songs_db,
+        "kept_paths": kept_paths,
+        "artists_visible": artists_visible,
+        "artists_active": artists_active,
+        "albums_total": albums_total,
+    }
+
+
+def log_library_truth(prefix: str = "") -> dict:
+    truth = collect_library_truth()
+    tag = f"{prefix} " if prefix else ""
+    log.info(
+        "%sLibrary truth — %d files on disk | %d verified in DB | "
+        "%d marked downloaded (missing file: %d) | %d pending | %d DB rows total",
+        tag,
+        truth["files_on_disk"],
+        truth["songs_verified"],
+        truth["songs_downloaded_db"],
+        max(0, truth["songs_downloaded_db"] - truth["songs_verified"]),
+        truth["songs_pending"],
+        truth["songs_db_total"],
+    )
+    ghost = truth["files_on_disk"] - truth["songs_verified"]
+    if ghost > 0:
+        log.info(
+            "%s  → %d file(s) on disk not verified in DB (orphans or inactive artists)",
+            tag, ghost,
+        )
+    return truth
+
+
+def _collect_kept_paths_from_index(
+    by_full: dict, by_album_title: dict, db: sqlite3.Connection
+) -> set[str]:
+    """Paths that reconcile would match — used to avoid deleting valid but unlinked files."""
+    kept: set[str] = set()
+    music_dir = Path(CFG["music_dir"])
+    songs = db.execute("""
+        SELECT s.file_path, s.title, s.status, a.name AS artist_name, al.name AS album_name
+        FROM songs s
+        JOIN artists a ON a.spotify_id = s.artist_id
+        JOIN albums al ON al.spotify_id = s.album_id
+        WHERE a.active >= 0
+    """).fetchall()
+    for song in songs:
+        rel = (song["file_path"] or "").replace("\\", "/")
+        if rel:
+            fp = music_dir / rel
+            if fp.is_file():
+                kept.add(rel)
+        title_key = song["title"].strip().lower()
+        album_key = (song["album_name"] or "").lower()
+        artist_key = song["artist_name"].lower()
+        for key in [
+            (artist_key, album_key, title_key),
+            (artist_key, "", title_key),
+        ]:
+            hit = by_full.get(key)
+            if hit:
+                kept.add(str(hit.relative_to(music_dir)).replace("\\", "/"))
+        if album_key:
+            hit = by_album_title.get((album_key, title_key))
+            if hit:
+                kept.add(str(hit.relative_to(music_dir)).replace("\\", "/"))
+    return kept
+
+
+def sweep_global_orphan_files(
+    *,
+    kept_paths: Optional[set[str]] = None,
+    dry_run: bool = False,
+) -> int:
+    """Delete audio files on disk that are not referenced or matchable in the DB."""
+    music_dir = Path(CFG["music_dir"])
+    if not music_dir.exists():
+        return 0
+
+    if kept_paths is None:
+        file_index = _build_file_index(music_dir)
+        with db_connect() as db:
+            kept_paths = _collect_kept_paths_from_index(*file_index, db)
+            for rel in db.execute(
+                """
+                SELECT s.file_path FROM songs s
+                JOIN artists a ON a.spotify_id = s.artist_id
+                WHERE a.active >= 0 AND s.status = 'downloaded' AND s.file_path IS NOT NULL
+                """
+            ).fetchall():
+                r = (rel["file_path"] or "").replace("\\", "/")
+                if r:
+                    kept_paths.add(r)
+
+    removed = 0
+    for root, _dirs, files in os.walk(music_dir):
+        for fname in files:
+            if Path(fname).suffix.lower() not in AUDIO_EXTS:
+                continue
+            full = Path(root) / fname
+            try:
+                rel = str(full.relative_to(music_dir)).replace("\\", "/")
+            except ValueError:
+                continue
+            if rel in kept_paths:
+                continue
+            if dry_run:
+                log.info("  [dry-run] Would remove orphan: %s", rel)
+                removed += 1
+                continue
+            try:
+                full.unlink()
+                removed += 1
+                log.info("  Removed orphan file: %s", rel)
+                parent = full.parent
+                while parent != music_dir and parent.exists() and not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
+            except OSError as e:
+                log.warning("Could not remove orphan %s: %s", full, e)
+    if removed:
+        log.info("Orphan sweep — %d file(s) %s", removed, "would be removed" if dry_run else "removed")
+    return removed
+
+
+def _audiomuse_cfg() -> Optional[dict]:
+    am = CFG.get("audiomuse") or {}
+    if not am.get("enabled"):
+        return None
+    return am
+
+
+def _audiomuse_psql(am: dict, sql: str) -> tuple[int, str, str]:
+    container = am.get("postgres_container", "audiomuse-postgres")
+    user = am.get("postgres_user", "audiomuse")
+    dbname = am.get("postgres_db", "audiomusedb")
+    cmd = [
+        "docker", "exec", "-i", container,
+        "psql", "-U", user, "-d", dbname,
+        "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", sql,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+
+
+def sync_audiomuse_scores(
+    moved_paths: Optional[list[tuple[str, str]]] = None,
+    *,
+    verified_paths: Optional[set[str]] = None,
+) -> dict:
+    """
+    Align AudioMuse score rows with files on disk.
+    - UPDATE file_path when MusicaDet moved a file
+    - DELETE rows whose file_path no longer exists
+    - Optionally DELETE rows not in MusicaDet verified set
+    """
+    am = _audiomuse_cfg()
+    stats = {"updated": 0, "removed_missing": 0, "removed_unlisted": 0, "skipped": False}
+    if not am:
+        stats["skipped"] = True
+        return stats
+
+    music_dir = Path(am.get("music_dir") or CFG["music_dir"])
+    moved_paths = moved_paths or []
+
+    for old_rel, new_rel in moved_paths:
+        old_sql = old_rel.replace("'", "''")
+        new_sql = new_rel.replace("'", "''")
+        rc, _, err = _audiomuse_psql(
+            am,
+            f"UPDATE score SET file_path = '{new_sql}' WHERE file_path = '{old_sql}';",
+        )
+        if rc == 0:
+            stats["updated"] += 1
+            log.info("AudioMuse path updated: %s → %s", old_rel, new_rel)
+        else:
+            log.warning("AudioMuse path update failed (%s → %s): %s", old_rel, new_rel, err)
+
+    rc, out, err = _audiomuse_psql(am, "SELECT item_id, file_path FROM score WHERE file_path IS NOT NULL AND file_path != '';")
+    if rc != 0:
+        log.warning("AudioMuse sync skipped — cannot read score table: %s", err or out)
+        return stats
+
+    missing_ids: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|", 1)
+        if len(parts) != 2:
+            continue
+        item_id, rel = parts[0], parts[1].replace("\\", "/")
+        fp = music_dir / rel if not Path(rel).is_absolute() else Path(rel)
+        if not fp.is_file():
+            missing_ids.append(item_id.replace("'", "''"))
+
+    if missing_ids:
+        chunk = 200
+        for i in range(0, len(missing_ids), chunk):
+            batch = missing_ids[i:i + chunk]
+            ids_sql = ",".join(f"'{x}'" for x in batch)
+            rc, out, err = _audiomuse_psql(am, f"DELETE FROM score WHERE item_id IN ({ids_sql});")
+            if rc == 0:
+                stats["removed_missing"] += len(batch)
+            else:
+                log.warning("AudioMuse delete missing failed: %s", err or out)
+        log.info("AudioMuse — removed %d score(s) with missing files", stats["removed_missing"])
+
+    if am.get("prune_unlisted_scores") and verified_paths is not None:
+        rc, out, err = _audiomuse_psql(
+            am, "SELECT item_id, file_path FROM score WHERE file_path IS NOT NULL AND file_path != '';"
+        )
+        if rc == 0:
+            unlisted: list[str] = []
+            for line in out.splitlines():
+                line = line.strip()
+                if not line or "|" not in line:
+                    continue
+                item_id, rel = line.split("|", 1)
+                rel = rel.replace("\\", "/")
+                if rel not in verified_paths:
+                    unlisted.append(item_id.replace("'", "''"))
+            if unlisted:
+                chunk = 200
+                for i in range(0, len(unlisted), chunk):
+                    batch = unlisted[i:i + chunk]
+                    ids_sql = ",".join(f"'{x}'" for x in batch)
+                    rc, _, err = _audiomuse_psql(am, f"DELETE FROM score WHERE item_id IN ({ids_sql});")
+                    if rc == 0:
+                        stats["removed_unlisted"] += len(batch)
+                    else:
+                        log.warning("AudioMuse prune unlisted failed: %s", err)
+                log.info(
+                    "AudioMuse — pruned %d score(s) not in MusicaDet verified set",
+                    stats["removed_unlisted"],
+                )
+
+    rc, out, err = _audiomuse_psql(am, "SELECT COUNT(*) FROM score;")
+    if rc == 0 and out.strip():
+        try:
+            total = int(out.strip().split("\n")[-1])
+            log.info("AudioMuse score table now has %d row(s)", total)
+        except ValueError:
+            pass
+    return stats
+
+
+def run_library_refresh(artist_filter: Optional[str] = None, *, skip_prefix_cleanup: bool = False) -> dict:
+    """
+    Full disk ↔ DB refresh: reconcile, album cleanup, orphan sweep, AudioMuse sync.
+    """
+    summary = {
+        "artists": 0,
+        "downloaded": 0,
+        "pending": 0,
+        "orphans_removed": 0,
+        "moved_paths": [],
+        "audiomuse": {},
+    }
+    if not skip_prefix_cleanup:
+        remove_track_number_prefixes(Path(CFG["music_dir"]))
+
+    log.info("▶ File matching — reconcile DB with disk")
     with db_connect() as db:
         if artist_filter:
             artists = db.execute(
@@ -2931,15 +3276,22 @@ def cmd_reconcile(args):
             artists = db.execute("SELECT * FROM artists WHERE active=1").fetchall()
 
     file_index = _build_file_index(Path(CFG["music_dir"]))
+    all_moved: list[tuple[str, str]] = []
     for a in artists:
         log.info("Reconciling: %s", a["name"])
         stats = reconcile_artist_downloads(a["spotify_id"], a["name"], file_index=file_index)
         log.info("  → %d downloaded, %d pending", stats["downloaded"], stats["pending"])
+        summary["artists"] += 1
+        summary["downloaded"] += stats["downloaded"]
+        summary["pending"] += stats["pending"]
+        all_moved.extend(stats.get("moved_paths") or [])
 
-    log.info("▶ Final album cleanup after reconcile")
+    summary["moved_paths"] = all_moved
+
+    log.info("▶ Album cleanup after reconcile")
     with db_connect() as db:
         db.execute("""
-            UPDATE albums SET 
+            UPDATE albums SET
                 track_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id),
                 downloaded_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id AND status='downloaded')
         """)
@@ -2954,8 +3306,29 @@ def cmd_reconcile(args):
                 track_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id),
                 downloaded_count = (SELECT COUNT(*) FROM songs WHERE album_id=albums.spotify_id AND status='downloaded')
         """)
-    log.info("▶ Enforcing caps after reconcile (delete non–top-viewed over limit)")
+
+    log.info("▶ Orphan file sweep (disk files with no DB match)")
+    file_index = _build_file_index(Path(CFG["music_dir"]))
+    with db_connect() as db:
+        kept_paths = _collect_kept_paths_from_index(*file_index, db)
+    summary["orphans_removed"] = sweep_global_orphan_files(kept_paths=kept_paths)
+
+    log.info("▶ Enforcing caps after reconcile")
     enforce_all_download_caps(artist_filter, quiet_if_none=True)
+
+    truth = collect_library_truth()
+    log_library_truth("After refresh —")
+
+    log.info("▶ AudioMuse sync")
+    summary["audiomuse"] = sync_audiomuse_scores(
+        all_moved, verified_paths=truth["kept_paths"],
+    )
+    return summary
+
+
+def cmd_reconcile(args):
+    artist_filter = getattr(args, "artist", None)
+    run_library_refresh(artist_filter, skip_prefix_cleanup=False)
 
 
 def cmd_repair_albums(args):
@@ -3102,30 +3475,41 @@ def cmd_full_sync(args):
     log.info("━" * 60)
     log.info("  FULL SYNC  —  %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
     log.info("━" * 60)
-    remove_track_number_prefixes(Path(CFG["music_dir"]))
+    log_library_truth("Before sync —")
 
-    log.info("\n▶ Step 1 / 3 — Scanning playlists")
+    log.info("\n▶ Step 1 / 6 — Scanning playlists")
     cmd_scan(argparse.Namespace())
 
-    log.info("\n▶ Step 2 / 4 — Scanning artist albums")
+    log.info("\n▶ Step 2 / 6 — Scanning artist albums")
     cmd_scan_artists(argparse.Namespace(new_only=False))
 
-    log.info("\n▶ Step 3 / 4 — Enforcing top-viewed caps (trim library)")
+    log.info("\n▶ Step 3 / 6 — File matching (reconcile disk ↔ DB)")
+    run_library_refresh(skip_prefix_cleanup=True)
+
+    log.info("\n▶ Step 4 / 6 — Enforcing top-viewed caps (trim library)")
     enforce_all_download_caps(quiet_if_none=True)
 
-    log.info("\n▶ Step 4 / 4 — Downloading top tracks only (respects per-artist limits)")
+    log.info("\n▶ Step 5 / 6 — Downloading top tracks only (respects per-artist limits)")
     cmd_download_pending(argparse.Namespace(_nested=True))
 
+    log.info("\n▶ Step 6 / 6 — Final refresh (orphans + AudioMuse)")
+    run_library_refresh(skip_prefix_cleanup=True)
+
+    truth = log_library_truth("Sync complete —")
     with db_connect() as db:
         albums = db.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
-        dl = db.execute("SELECT COUNT(*) FROM songs WHERE status='downloaded'").fetchone()[0]
-        pending = db.execute("SELECT COUNT(*) FROM songs WHERE status='pending'").fetchone()[0]
         no_cover = db.execute(
             "SELECT COUNT(*) FROM songs WHERE status='downloaded' AND has_cover=0"
         ).fetchone()[0]
 
     log.info("\n━" * 60)
-    log.info("  SYNC COMPLETE — %d albums, %d songs downloaded, %d pending", albums, dl, pending)
+    log.info(
+        "  SYNC COMPLETE — %d albums | %d files on disk | %d verified in DB | %d pending",
+        albums,
+        truth["files_on_disk"],
+        truth["songs_verified"],
+        truth["songs_pending"],
+    )
     if no_cover:
         log.info("  %d songs missing cover — run: musicadet fix-metadata", no_cover)
     log.info("━" * 60)
