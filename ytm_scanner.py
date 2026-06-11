@@ -26,6 +26,14 @@ def _normalize_for_compare(name: str) -> str:
     return re.sub(r'[^a-z0-9]', '', name.lower())
 
 
+def _clean_exception_msg(e: Exception) -> str:
+    """Truncate exceptionally long exception messages (e.g. from ytmusicapi parsing failures)."""
+    msg = str(e)
+    if len(msg) > 150:
+        return msg[:150] + "..."
+    return msg
+
+
 def _artist_matches(expected: str, actual: str) -> bool:
     """Check if YTM artist result is the same as what we searched for."""
     e = _normalize_for_compare(expected)
@@ -102,7 +110,7 @@ def _search_artists_safe(artist_name: str, ytm) -> list[dict]:
                 if args.get("filter") == "artists":
                     return results
         except Exception as e:
-            log.info("YTMusic search fallback failed for %s (%s): %s", artist_name, args, e)
+            log.info("YTMusic search fallback failed for %s (%s): %s", artist_name, args, _clean_exception_msg(e))
             continue
 
     # Unfiltered search — parse mixed shelf (avoids musicShelfRenderer filter paths)
@@ -112,7 +120,7 @@ def _search_artists_safe(artist_name: str, ytm) -> list[dict]:
         if artists:
             return artists
     except Exception as e:
-        log.info("YTMusic unfiltered search failed for %s: %s", artist_name, e)
+        log.info("YTMusic unfiltered search failed for %s: %s", artist_name, _clean_exception_msg(e))
     return []
 
 
@@ -123,14 +131,14 @@ def _get_artist_page_safe(ytm, browse_id: str) -> Optional[dict]:
     try:
         return ytm.get_artist(browse_id)
     except Exception as e:
-        log.warning("get_artist failed for %s: %s", browse_id, e)
+        log.debug("get_artist failed for %s: %s", browse_id, _clean_exception_msg(e))
     if browse_id.startswith("UC"):
         try:
             channel = ytm.get_channel(browse_id)
             if channel:
                 return channel
         except Exception as e:
-            log.warning("get_channel failed for %s: %s", browse_id, e)
+            log.debug("get_channel failed for %s: %s", browse_id, _clean_exception_msg(e))
     return None
 
 
@@ -150,7 +158,7 @@ def _direct_song_search_catalog(ytm, artist_name: str, browse_id: Optional[str])
             if search_songs:
                 break
         except Exception as e:
-            log.warning("Direct song search (%s) failed for %s: %s", args, artist_name, e)
+            log.warning("Direct song search (%s) failed for %s: %s", args, artist_name, _clean_exception_msg(e))
             continue
 
     if not search_songs:
@@ -232,7 +240,7 @@ def _fetch_playlist_tracks(ytm, playlist_id: str, limit: int) -> List[Dict]:
         playlist = ytm.get_playlist(playlist_id, limit=limit)
         return playlist.get("tracks") or []
     except Exception as e:
-        log.warning("get_playlist failed for %s: %s", playlist_id, e)
+        log.warning("get_playlist failed for %s: %s", playlist_id, _clean_exception_msg(e))
         return []
 
 
@@ -333,7 +341,7 @@ def scan_artist_with_metadata(
                 full_list = ytm.get_artist_albums(cat_browse_id, params)
                 releases = full_list if full_list else []
             except Exception as e:
-                log.warning("Failed to get %s for %s: %s", category_key, artist_name, e)
+                log.warning("Failed to get %s for %s: %s", category_key, artist_name, _clean_exception_msg(e))
                 releases = cat.get("results", [])
         else:
             releases = cat.get("results", [])
@@ -361,7 +369,7 @@ def scan_artist_with_metadata(
             try:
                 album_data = ytm.get_album(rel_id)
             except Exception as e:
-                log.warning("  Failed to get album %s: %s", rel_title, e)
+                log.warning("  Failed to get album %s: %s", rel_title, _clean_exception_msg(e))
                 continue
 
             tracks = album_data.get("tracks", [])

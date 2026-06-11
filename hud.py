@@ -515,6 +515,12 @@ def _artist_filters(q: str, status: str) -> tuple[list[str], list]:
         where.append("a.active=0")
     elif status == "pending":
         where.append("a.active=1 AND a.sync_done=0")
+    elif status == "discovered":
+        where.append("a.active=0 AND a.source != 'manual'")
+    elif status == "focus":
+        global_max = int(load_cfg().get("max_downloads_per_artist", 0))
+        limit_expr = f"COALESCE(a.max_downloads, {global_max if global_max > 0 else 'sc.songs_total'})"
+        where.append(f"a.active=1 AND (a.sync_done=0 OR sc.songs_dl < {limit_expr})")
     elif status == "synced":
         where.append("a.sync_done=1")
     elif status == "ytok":
@@ -540,13 +546,13 @@ def _aggregate_capped_song_stats(conn, *, active_only: bool = True) -> dict:
     clause = "WHERE a.active=1" if active_only else ""
     rows = conn.execute(
         f"""
-        SELECT a.max_downloads,
+        SELECT a.max_downloads, a.sync_done,
                COALESCE(SUM(CASE WHEN s.status='downloaded' THEN 1 ELSE 0 END), 0) AS dl,
                COALESCE(COUNT(s.spotify_id), 0) AS catalog
         FROM artists a
         LEFT JOIN songs s ON s.artist_id = a.spotify_id
         {clause}
-        GROUP BY a.spotify_id, a.max_downloads
+        GROUP BY a.spotify_id, a.max_downloads, a.sync_done
         """
     ).fetchall()
 
@@ -554,12 +560,14 @@ def _aggregate_capped_song_stats(conn, *, active_only: bool = True) -> dict:
     for r in rows:
         dl = int(r["dl"])
         cat = int(r["catalog"])
+        sync_done = int(r.get("sync_done", 0))
         cap = _effective_artist_limit(r["max_downloads"], global_max)
         catalog += cat
         if cap > 0:
-            target += cap
-            downloaded += min(dl, cap)
-            pending += min(max(0, cap - dl), max(0, cat - dl))
+            actual_target = min(cap, cat) if sync_done else cap
+            target += actual_target
+            downloaded += min(dl, actual_target)
+            pending += min(max(0, actual_target - dl), max(0, cat - dl))
         else:
             target += cat
             downloaded += dl
@@ -3050,6 +3058,7 @@ HTML = r"""<!doctype html>
         <input id="artistSearch" placeholder="Search artists…" oninput="debouncedLoadArtists()"/>
         <div class="filter-chips" id="artistFilterChips" role="group" aria-label="Filter artists">
           <button type="button" class="chip active" data-value="all">All</button>
+          <button type="button" class="chip" data-value="focus">Focus</button>
           <button type="button" class="chip chip-ro" data-value="romanian">Romanian</button>
           <button type="button" class="chip" data-value="international">International</button>
           <button type="button" class="chip" data-value="ytok">YT OK</button>
@@ -3057,6 +3066,7 @@ HTML = r"""<!doctype html>
           <button type="button" class="chip" data-value="ytmissing">YT missing</button>
           <button type="button" class="chip" data-value="active">Active</button>
           <button type="button" class="chip" data-value="pending">Pending</button>
+          <button type="button" class="chip" data-value="discovered">Discovered</button>
           <button type="button" class="chip" data-value="synced">Synced</button>
           <button type="button" class="chip" data-value="disabled">Disabled</button>
         </div>

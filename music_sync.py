@@ -1210,7 +1210,7 @@ def remove_track_number_prefixes(music_dir: Path):
 def _build_file_index(music_dir: Path) -> tuple[dict, dict]:
     """Index by (artist, album, title) and (album, title) keys."""
     by_full: dict[tuple[str, str, str], Path] = {}
-    by_album_title: dict[tuple[str, str], Path] = {}
+    by_album_title: dict[tuple[str, str], list[Path]] = {}
     if not music_dir.exists():
         return by_full, by_album_title
     for root, _dirs, files in os.walk(music_dir):
@@ -1227,8 +1227,43 @@ def _build_file_index(music_dir: Path) -> tuple[dict, dict]:
             title = _parse_title_from_filename(fname)
             by_full[(artist, album, title)] = full
             if album:
-                by_album_title[(album, title)] = full
+                key = (album, title)
+                if key not in by_album_title:
+                    by_album_title[key] = []
+                by_album_title[key].append(full)
     return by_full, by_album_title
+
+
+def _is_matching_artist(disk_artist: str, artist_name: str, artist_id: str) -> bool:
+    """Check if the artist name on disk is case-insensitively/fuzzily matching the artist we want."""
+    def normalize(s: str) -> str:
+        import unicodedata
+        s_norm = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('utf-8').lower()
+        return re.sub(r'[^a-z0-9]', '', s_norm)
+
+    disk_norm = normalize(disk_artist)
+    name_norm = normalize(artist_name)
+    if disk_norm == name_norm:
+        return True
+    
+    # Check for substring match (e.g. "Trinix & Friends" vs "Trinix")
+    if len(disk_norm) >= 3 and len(name_norm) >= 3:
+        if disk_norm in name_norm or name_norm in disk_norm:
+            return True
+
+    # Check against clean artist_id
+    clean_id = artist_id
+    for prefix in ["spotify:artist:", "local:", "q:"]:
+        if clean_id.lower().startswith(prefix):
+            clean_id = clean_id[len(prefix):]
+    id_norm = normalize(clean_id)
+    if disk_norm == id_norm:
+        return True
+    if len(disk_norm) >= 3 and len(id_norm) >= 3:
+        if disk_norm in id_norm or id_norm in disk_norm:
+            return True
+
+    return False
 
 
 def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=None) -> dict:
@@ -1282,9 +1317,22 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
                         break
 
             if not found and album_key:
-                found = by_album_title.get((album_key, title_key))
+                candidates = by_album_title.get((album_key, title_key)) or []
+                for cand in candidates:
+                    disk_artist = cand.relative_to(music_dir).parts[0]
+                    if _is_matching_artist(disk_artist, display_name, artist_id):
+                        found = cand
+                        break
             if not found and resolved_album_key:
-                found = by_album_title.get((resolved_album_key, title_key))
+                candidates = by_album_title.get((resolved_album_key, title_key)) or []
+                for cand in candidates:
+                    disk_artist = cand.relative_to(music_dir).parts[0]
+                    if _is_matching_artist(disk_artist, display_name, artist_id):
+                        found = cand
+                        break
+
+            if found and not found.exists():
+                found = None
 
             now = datetime.now().isoformat(timespec="seconds")
             old_rel = str(song["file_path"]).replace("\\", "/") if song["file_path"] else ""
@@ -1299,13 +1347,13 @@ def reconcile_artist_downloads(artist_id: str, artist_name: str, *, file_index=N
                     expected_folder = music_dir / expected_artist / safe_album
                     old_parent = found.parent
                     
-                    if old_parent.resolve() != expected_folder.resolve():
+                    if str(old_parent.resolve()).lower() != str(expected_folder.resolve()).lower():
                         expected_folder.mkdir(parents=True, exist_ok=True)
                         new_path = expected_folder / found.name
-                        if found.resolve() != new_path.resolve():
+                        if str(found.resolve()).lower() != str(new_path.resolve()).lower():
                             import shutil
                             try:
-                                if new_path.exists() and new_path.resolve() != found.resolve():
+                                if new_path.exists() and str(new_path.resolve()).lower() != str(found.resolve()).lower():
                                     if found.stat().st_size <= new_path.stat().st_size:
                                         found.unlink()
                                         log.info("  [Auto-Clean] Duplicate found at destination: unlinked smaller %s", found.name)
@@ -2657,10 +2705,9 @@ def cmd_sync_playlist(args):
             sid, name = result
             db.execute(
                 """
-                INSERT INTO artists (spotify_id, name, source) VALUES (?,?,'playlist')
+                INSERT INTO artists (spotify_id, name, source, active, max_downloads) VALUES (?,?,'playlist', 0, 0)
                 ON CONFLICT(spotify_id) DO UPDATE SET
-                    name = excluded.name,
-                    active = 1
+                    name = excluded.name
                 """,
                 (sid, name),
             )
@@ -2894,7 +2941,7 @@ def cmd_migrate_structure(args):
                     artist_id = ar_row["spotify_id"]
                 else:
                     artist_id = f"local:ar:{artist_dir.name}"
-                    db.execute("INSERT INTO artists (spotify_id, name, source, active) VALUES (?, ?, 'local', 1)", (artist_id, artist_dir.name))
+                    db.execute("INSERT INTO artists (spotify_id, name, source, active) VALUES (?, ?, 'local', 0)", (artist_id, artist_dir.name))
                     log.info("Auto-added local artist: %s", artist_dir.name)
 
                 # Iterate albums
@@ -3063,9 +3110,11 @@ def _collect_kept_paths_from_index(
             if hit:
                 kept.add(str(hit.relative_to(music_dir)).replace("\\", "/"))
         if album_key:
-            hit = by_album_title.get((album_key, title_key))
-            if hit:
-                kept.add(str(hit.relative_to(music_dir)).replace("\\", "/"))
+            candidates = by_album_title.get((album_key, title_key)) or []
+            for hit in candidates:
+                disk_artist = hit.relative_to(music_dir).parts[0]
+                if _is_matching_artist(disk_artist, song["artist_name"], song["artist_id"]):
+                    kept.add(str(hit.relative_to(music_dir)).replace("\\", "/"))
     return kept
 
 
